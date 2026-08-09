@@ -779,7 +779,7 @@ namespace dsp56k
 			m_budgetedAtomicBoundary = true;
 
 		const auto lcBackup = reg.lc;
-		reg.lc.var = _loopCount;
+		reg.lc.var = normalizeRepCount(_loopCount);
 
 		++m_instructions;
 

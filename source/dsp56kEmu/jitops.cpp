@@ -837,6 +837,8 @@ namespace dsp56k
 
 	void JitOps::rep_exec(const TWord _lc)
 	{
+		const auto loopCount = normalizeRepCount(_lc);
+
 		// detect div loops and use custom code to speed them up
 
 		TWord opA;
@@ -848,7 +850,7 @@ namespace dsp56k
 			const auto* oi = m_block.dsp().opcodes().findNonParallelOpcodeInfo(opA);
 			if(oi && oi->getInstruction() == Div)
 			{
-				op_Rep_Div(opA, _lc);
+				op_Rep_Div(opA, loopCount);
 				m_opSize++;
 				return;
 			}
@@ -856,16 +858,16 @@ namespace dsp56k
 		else if(!opA)
 		{
 			// rep nop => do nothing
-			m_blockRuntimeData.getEncodedInstructionCount() += _lc;
+			m_blockRuntimeData.getEncodedInstructionCount() += loopCount;
 
 			// Note: We use _lc minus one because the operation itself was already counted once in JitBlock.cpp, where it just counts every translated op already
-			m_blockRuntimeData.getEncodedCycleCount() += (_lc-1) * dsp56k::calcCycles(Nop, m_pcCurrentOp, 0, 0, 0);
+			m_blockRuntimeData.getEncodedCycleCount() += (loopCount-1) * dsp56k::calcCycles(Nop, m_pcCurrentOp, 0, 0, 0);
 			m_opSize++;
 			return;
 		}
 
 		// regular processing
-		DspValue lc(m_block, _lc, DspValue::Immediate24);
+		DspValue lc(m_block, loopCount, DspValue::Immediate24);
 		rep_exec(lc);
 	}
 
@@ -879,9 +881,17 @@ namespace dsp56k
 		m_asm.movd(lcBackup, r32(m_dspRegs.getLC(JitDspRegs::Read)));
 
 		if(hasImmediateOperand)
-			m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), asmjit::Imm(_lc.imm24()));
+			m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), asmjit::Imm(normalizeRepCount(_lc.imm24())));
 		else
-			m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), r32(_lc.get()));
+		{
+			const auto lc = r32(m_dspRegs.getLC(JitDspRegs::Write));
+			m_asm.mov(lc, r32(_lc.get()));
+			const auto nonzero = m_asm.newLabel();
+			m_asm.test_(lc);
+			m_asm.jnz(nonzero);
+			m_asm.mov(lc, asmjit::Imm(normalizeRepCount(0)));
+			m_asm.bind(nonzero);
+		}
 
 		_lc.release();
 
@@ -965,9 +975,6 @@ namespace dsp56k
 
 		if(hasImmediateOperand)
 		{
-			if(lcImmediateOperand == 0)
-				lcImmediateOperand = 65536;
-
 			// unrool up to a size of 4
 			if(lcImmediateOperand <= 4)
 			{

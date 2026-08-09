@@ -335,16 +335,6 @@ namespace
 			"WAIT source successor did not remain an ordinary JIT boundary");
 	}
 
-	void reportDynamicRepZeroJ2Hold()
-	{
-		// DSP56300 Family Manual Rev. 5, §13 REP (p. 13-160) defines raw zero
-		// as 65,536 repetitions with LC restored. All raw-zero REP forms are held:
-		// the interpreter underflows its 24-bit LC, dynamic JIT branches around
-		// zero, and immediate JIT needs LC/accounting adjudication. Keep this out
-		// of J0's green nonzero matrix: J2 must add a bounded 65,536-repeat oracle.
-		std::fputs("DSP56300 J0 diagnostic: all REP zero forms must repeat 65536 times (J2 hold)\n", stderr);
-	}
-
 }
 
 int main()
@@ -358,7 +348,6 @@ int main()
 			repNormalAndDivMatch();
 			fastAndLongVectorsStayJitRegressions();
 			waitWakeStaysJitRegression();
-			reportDynamicRepZeroJ2Hold();
 		}
 		else
 		{

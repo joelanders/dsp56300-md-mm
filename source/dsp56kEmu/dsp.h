@@ -30,6 +30,13 @@ namespace dsp56k
 	class DSP;
 	
 	using TInstructionFunc = void (DSP::*)(TWord _op);
+
+	// DSP56300 Family Manual Rev. 5, §13 REP (p. 13-160): a raw zero
+	// repetition count denotes 65,536 body executions.
+	constexpr TWord normalizeRepCount(const TWord rawCount)
+	{
+		return rawCount ? rawCount : 0x10000;
+	}
 	
 	template<typename Ta, typename Tb> void dspExecPeripherals(DSP* _dsp) noexcept;
 
