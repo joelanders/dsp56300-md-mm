@@ -105,6 +105,26 @@ namespace
 		require(!memory.canWrite(MemArea_P, 2), "rejecting validator was bypassed");
 	}
 
+	void testMappedTinyExternalAreaProbeIsBounded()
+	{
+		DefaultMemoryValidator validator;
+		for(const auto bridgedAddress : {TWord{7}, TWord{6}})
+		{
+			Memory memory{validator, 8, 8, bridgedAddress};
+			if(!memory.hasMmuSupport())
+				continue;
+
+			for(const auto area : {MemArea_X, MemArea_Y, MemArea_P})
+			{
+				require(memory.get(area, bridgedAddress - 1) == 0,
+					"tiny-area probe changed bridge-minus-one");
+				for(auto offset = bridgedAddress; offset < 8; ++offset)
+					require(memory.get(area, offset) == 0,
+						"tiny-area probe changed a shared word");
+			}
+		}
+	}
+
 	void testRejectingValidatorLeavesBootUntouched()
 	{
 		RejectingValidator validator;
@@ -158,6 +178,7 @@ int main()
 		testValidUploadAndSingleCompletionEdge();
 		testMalformedRangesAreRejectedWithoutPartialWrites();
 		testMemoryValidationWithoutMmu();
+		testMappedTinyExternalAreaProbeIsBounded();
 		testRejectingValidatorLeavesBootUntouched();
 		testResetRestartsProtocolWithoutErasingMemory();
 	}

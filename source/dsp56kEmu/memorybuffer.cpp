@@ -3,6 +3,7 @@
 #ifndef __ANDROID__
 
 #include <algorithm>
+#include <array>
 
 #include "types.h"
 #include "memory.h"
@@ -140,13 +141,39 @@ namespace dsp56k
 			actualDspAddress += invalidDspMemoryBlockSize;
 		}
 
-		// test if its working
+		// Test the aliases without changing the caller-visible contents.
+		// Preserve every caller-visible word touched by the diagnostic before
+		// probing the aliases.
+		const auto probeCount = std::min<TWord>(3, externalAreaSize);
+		std::array<TWord*, 12> probePointers{};
+		std::array<TWord, 12> probeValues{};
+		size_t probeWordCount = 0;
+		const auto captureProbe = [&](TWord* _pointer)
+		{
+			probePointers[probeWordCount] = _pointer;
+			probeValues[probeWordCount] = *_pointer;
+			++probeWordCount;
+		};
+		captureProbe(m_x + _externalMemAddress - 1);
+		captureProbe(m_y + _externalMemAddress - 1);
+		captureProbe(m_p + _externalMemAddress - 1);
+		for(TWord i = 0; i < probeCount; ++i)
+		{
+			captureProbe(m_x + _externalMemAddress + i);
+			captureProbe(m_y + _externalMemAddress + i);
+			captureProbe(m_p + _externalMemAddress + i);
+		}
+		const auto restoreProbe = [&]() noexcept
+		{
+			for(size_t i = probeWordCount; i-- > 0;)
+				*probePointers[i] = probeValues[i];
+		};
 
 		m_x[_externalMemAddress-1] = 0x111111;
 		m_y[_externalMemAddress-1] = 0x222222;
 		m_p[_externalMemAddress-1] = 0x333333;
 
-		for(auto i=0; i<3; ++i)
+		for(TWord i = 0; i < probeCount; ++i)
 		{
 			m_x[_externalMemAddress+i] = 0xabcdef;
 			m_y[_externalMemAddress+i] = 0xabcdef;
@@ -154,20 +181,22 @@ namespace dsp56k
 		}
 
 		m_x[_externalMemAddress+0] = 0x444444;
-		m_y[_externalMemAddress+1] = 0x555555;
-		m_p[_externalMemAddress+2] = 0x666666;
+		if(probeCount > 1)
+			m_y[_externalMemAddress+1] = 0x555555;
+		if(probeCount > 2)
+			m_p[_externalMemAddress+2] = 0x666666;
 
-		if( m_x[_externalMemAddress-1] == 0x111111 &&
+		const bool aliasesValid = m_x[_externalMemAddress-1] == 0x111111 &&
 			m_y[_externalMemAddress-1] == 0x222222 &&
 			m_p[_externalMemAddress-1] == 0x333333 &&
 
 			m_x[_externalMemAddress+0] == 0x444444 && m_y[_externalMemAddress+0] == 0x444444 && m_p[_externalMemAddress+0] == 0x444444 &&
-			m_x[_externalMemAddress+1] == 0x555555 && m_y[_externalMemAddress+1] == 0x555555 && m_p[_externalMemAddress+1] == 0x555555 &&
-			m_x[_externalMemAddress+2] == 0x666666 && m_y[_externalMemAddress+2] == 0x666666 && m_p[_externalMemAddress+2] == 0x666666
-			)
+			(probeCount <= 1 || (m_x[_externalMemAddress+1] == 0x555555 && m_y[_externalMemAddress+1] == 0x555555 && m_p[_externalMemAddress+1] == 0x555555)) &&
+			(probeCount <= 2 || (m_x[_externalMemAddress+2] == 0x666666 && m_y[_externalMemAddress+2] == 0x666666 && m_p[_externalMemAddress+2] == 0x666666));
+
+		if(aliasesValid)
 		{
 			LOG("MMU based DSP memory setup successful");
-			m_isValid = true;
 		}
 		else
 		{
@@ -180,12 +209,18 @@ namespace dsp56k
 			LOG("m_x[_externalMemAddress+0] == 0x444444 ? = " << HEX(m_x[_externalMemAddress+0]));
 			LOG("m_y[_externalMemAddress+0] == 0x444444 ? = " << HEX(m_y[_externalMemAddress+0]));
 			LOG("m_p[_externalMemAddress+0] == 0x444444 ? = " << HEX(m_p[_externalMemAddress+0]));
-			LOG("m_x[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_x[_externalMemAddress+1]));
-			LOG("m_y[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_y[_externalMemAddress+1]));
-			LOG("m_p[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_p[_externalMemAddress+1]));
-			LOG("m_x[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_x[_externalMemAddress+2]));
-			LOG("m_y[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_y[_externalMemAddress+2]));
-			LOG("m_p[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_p[_externalMemAddress+2]));
+			if(probeCount > 1)
+			{
+				LOG("m_x[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_x[_externalMemAddress+1]));
+				LOG("m_y[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_y[_externalMemAddress+1]));
+				LOG("m_p[_externalMemAddress+1] == 0x555555 ? = " << HEX(m_p[_externalMemAddress+1]));
+			}
+			if(probeCount > 2)
+			{
+				LOG("m_x[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_x[_externalMemAddress+2]));
+				LOG("m_y[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_y[_externalMemAddress+2]));
+				LOG("m_p[_externalMemAddress+2] == 0x666666 ? = " << HEX(m_p[_externalMemAddress+2]));
+			}
 
 			void* last = nullptr;
 			for (const auto& [ptr, size] : m_mmu.getMappedRegions())
@@ -194,6 +229,9 @@ namespace dsp56k
 				last = ptr;
 			}
 		}
+		restoreProbe();
+		if(aliasesValid)
+			m_isValid = true;
 	}
 }
 
