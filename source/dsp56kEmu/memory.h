@@ -98,6 +98,11 @@ namespace dsp56k
 
 		bool				set					( EMemArea _area, TWord _offset, TWord _value )	{ return dspWrite(_area, _offset, _value); }
 
+		// Validate a write without changing memory.  Unlike dspWrite(), this
+		// query always performs address translation, bounds, and validator checks
+		// so uploaders can reject a complete range before mutating DSP state.
+		bool				canWrite				( EMemArea _area, TWord _offset ) const;
+
 		bool				dspWrite			( EMemArea& _area, TWord& _offset, TWord _value );
 		TWord				get					( EMemArea _area, TWord _offset ) const;
 		void				getOpcode			( TWord _offset, TWord& _wordA, TWord& _wordB ) const;

@@ -14,7 +14,8 @@ namespace dsp56k
 			Length,
 			Address,
 			Data,
-			Finished
+			Finished,
+			Error
 		};
 
 		explicit DspBoot(DSP& _dsp);
@@ -22,6 +23,12 @@ namespace dsp56k
 		bool hdiWriteTX(const TWord& _val);
 
 		bool finished() const { return m_state == State::Finished; }
+		bool failed() const { return m_state == State::Error; }
+
+		// Reset the upload protocol without changing DSP memory.  The caller is
+		// responsible for resetting the DSP/peripherals when a hardware reset is
+		// intended; this method only makes the boot stream accept a new length.
+		void reset();
 
 		auto getLength() const { return m_length; }
 		auto getInitialPC() const { return m_initialPC; }

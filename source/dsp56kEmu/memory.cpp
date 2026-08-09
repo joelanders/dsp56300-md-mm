@@ -102,6 +102,18 @@ namespace dsp56k
 	// _____________________________________________________________________________
 	// set
 	//
+	bool Memory::canWrite(EMemArea _area, const TWord _offset) const
+	{
+		memTranslateAddress(_area, _offset);
+
+		if(_area < MemArea_P || _area >= MemArea_COUNT)
+			return false;
+		if(_offset >= size(_area))
+			return false;
+
+		return m_memoryMap.memValidateAccess(_area, _offset, true);
+	}
+
 	bool Memory::dspWrite( EMemArea& _area, TWord& _offset, TWord _value )
 	{
 #if MEMORY_HEAT_MAP
@@ -381,7 +393,7 @@ namespace dsp56k
 
 	void Memory::memTranslateAddress(EMemArea& _area, const TWord& _addr) const
 	{
-		if(m_mmuBuffer->isValid())
+		if(m_mmuBuffer && m_mmuBuffer->isValid())
 			return;
 
 //		if(_addr >= m_bridgedMemoryAddress)
