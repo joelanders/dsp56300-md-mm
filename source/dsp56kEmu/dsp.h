@@ -43,6 +43,7 @@ namespace dsp56k
 		friend class UnitTests;
 		friend class JitDspRegs;
 		friend class JitOps;
+		friend class JitBlock;
 		friend class Jit;
 		friend class AotRuntime;
 		friend class DebuggerInterface;

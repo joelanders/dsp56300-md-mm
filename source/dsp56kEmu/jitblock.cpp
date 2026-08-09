@@ -275,8 +275,28 @@ namespace dsp56k
 		{
 			if(info.branchTarget == g_invalidAddress || info.branchIsConditional)
 			{
-				DspValue pc(*this, pcNext, DspValue::Immediate24);
-				m_dspRegPool.write(PoolReg::DspPC, pc);
+				// A dynamic fast-interrupt block executes both as normal flow and as a fast
+				// interrupt. Write the fallthrough PC only in normal flow: when servicing a
+				// fast interrupt this would clobber the interrupted PC, which a JSR inside
+				// the block pushes as its return address - a "jsset #n,x:pp,handler" style
+				// vector would then return INTO the following vector slot instead of into
+				// the interrupted code.
+				const auto pcReg = m_dspRegPool.get(PoolReg::DspPC, true, true);
+
+				const SkipLabel skip(m_asm);
+
+				if(fastInterruptMode == JitOps::FastInterruptMode::Dynamic)
+				{
+					const RegScratch s(*this);
+					if constexpr (sizeof(m_dsp.m_processingMode) == sizeof(uint32_t))
+						mem().mov(r64(s), reinterpret_cast<uint32_t&>(m_dsp.m_processingMode));
+					else
+						mem().mov(r32(s), reinterpret_cast<uint64_t&>(m_dsp.m_processingMode));
+					m_asm.cmp(r32(s), asmjit::Imm(DSP::ProcessingMode::FastInterrupt));
+					m_asm.jz(skip);
+				}
+
+				m_asm.mov(r32(pcReg), asmjit::Imm(pcNext));
 			}
 		}
 
