@@ -48,6 +48,10 @@ namespace dsp56k
 		}
 
 		static Jit* toJitPtr(DspRegs* _regs);
+		// Ensure that an executable PC has a populated dispatch-table entry. This
+		// is deliberately distinct from notifyProgramMemWrite(): executing an
+		// unchanged default-zero P-memory word must not invalidate existing code.
+		void ensureProgramAddress(const TWord _offset);
 		void notifyProgramMemWrite(const TWord _offset);
 
 		void run(TWord _pc) noexcept;

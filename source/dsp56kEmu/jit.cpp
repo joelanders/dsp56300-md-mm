@@ -211,12 +211,22 @@ namespace dsp56k
 		return reinterpret_cast<Jit*>(reinterpret_cast<uint8_t*>(_regs) + offsetJit - offsetRegs);
 	}
 
+	void Jit::ensureProgramAddress(const TWord _offset)
+	{
+		if(m_currentChain && _offset < m_currentChain->getFuncSize())
+			return;
+
+		m_maxUsedPAddress = std::max(m_maxUsedPAddress, static_cast<size_t>(_offset));
+		if(m_currentChain)
+			m_currentChain->setMaxUsedPAddress(m_maxUsedPAddress);
+	}
+
 	void Jit::notifyProgramMemWrite(const TWord _offset)
 	{
 		for (auto& it : m_chains)
 			it.second->notifyPMemWrite(_offset, it.second.get() == m_currentChain);
 
-		m_maxUsedPAddress = std::max(m_maxUsedPAddress, static_cast<size_t>(_offset));
+		ensureProgramAddress(_offset);
 	}
 
 	void Jit::run(const TWord _pc) noexcept

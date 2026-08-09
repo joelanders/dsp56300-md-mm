@@ -87,6 +87,37 @@ namespace
 		require(fixture.dsp.regs().sp.toWord() == 0,
 			"fast-interrupt RTI left the hardware stack unbalanced");
 	}
+
+	void unchangedZeroSuccessorHasAJitDispatchEntry()
+	{
+		Fixture fixture;
+		constexpr TWord entry = 0x100;
+		fixture.install(entry, "move #$1,r0");
+		require(fixture.memory.get(MemArea_P, entry + 1) == 0,
+			"zero-successor regression requires untouched default P memory");
+		fixture.dsp.setPC(entry);
+		fixture.dsp.execJit();
+		const auto compiledEntry = fixture.dsp.getJitEntries()[entry];
+		require(compiledEntry != nullptr, "first JIT instruction did not publish a compiled entry");
+		fixture.dsp.execJit();
+		require(fixture.dsp.getPC().toWord() == entry + 2 && fixture.dsp.regs().r[0].toWord() == 1,
+			"unchanged zero successor was not dispatched as a JIT instruction");
+		require(fixture.dsp.getJitEntries()[entry] == compiledEntry,
+			"dispatch-capacity growth invalidated the already compiled predecessor entry");
+	}
+
+	void unchangedZeroFastVectorHasAJitDispatchEntry()
+	{
+		Fixture fixture;
+		constexpr TWord interruptedPc = 0x400;
+		fixture.install(interruptedPc, "move #$1,r0");
+		require(fixture.memory.get(MemArea_P, Vba_NMI) == 0 && fixture.memory.get(MemArea_P, Vba_NMI + 1) == 0,
+			"zero-vector regression requires untouched default P memory");
+		fixture.dsp.setPC(interruptedPc);
+		require(fixture.dsp.injectInterruptImmediate(Vba_NMI), "unchanged zero NMI was rejected");
+		require(fixture.dsp.getPC().toWord() == interruptedPc + 1 && fixture.dsp.regs().r[0].toWord() == 1,
+			"unchanged zero fast vector did not dispatch and resume its interrupted source");
+	}
 }
 
 int main()
@@ -97,6 +128,8 @@ int main()
 		{
 			normalFlowInVectorAreaUsesOrdinaryJsrReturnAddress();
 			fastInterruptJsrPreservesInterruptedProgramCounter();
+			unchangedZeroSuccessorHasAJitDispatchEntry();
+			unchangedZeroFastVectorHasAJitDispatchEntry();
 		}
 	}
 	catch(const std::exception& _error)

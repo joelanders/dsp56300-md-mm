@@ -216,6 +216,7 @@ namespace dsp56k
 
 		if(g_useJIT && !m_budgetedExecutionActive)
 		{
+			m_jit.ensureProgramAddress(vba);
 			LOGJITPC(vba);
 			const auto pc = getPC();
 			m_jitEntries[vba](&reg, vba);

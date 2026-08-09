@@ -224,6 +224,7 @@ namespace dsp56k
 			m_interruptFunc(this);
 
 			const auto pc = getPC().toWord();
+			m_jit.ensureProgramAddress(pc);
 			LOGJITPC(pc);
 			m_jitEntries[pc](&reg, pc);
 		}
