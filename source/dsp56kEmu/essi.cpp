@@ -11,6 +11,39 @@
 
 namespace dsp56k
 {
+	namespace
+	{
+		uint32_t essiWordBits(const TWord _cra)
+		{
+			switch((_cra & Essi::RegCRAbits::CRA_WL) >> Essi::RegCRAbits::CRA_WL0)
+			{
+			case 0: return 8;
+			case 1: return 12;
+			case 2: return 16;
+			case 3: return 24;
+			case 4:
+			case 5: return 32;
+			default: return 24;
+			}
+		}
+
+		uint32_t essiSlotCycles(const TWord _cra)
+		{
+			const auto prescaler = (_cra & Essi::RegCRAbits::CRA_PM) + 1;
+			const auto range = _cra & (TWord(1) << Essi::RegCRAbits::CRA_PSR) ? 1u : 8u;
+			return 2u * prescaler * range * essiWordBits(_cra);
+		}
+
+		TWord essiBaseDivider(const TWord _cra, const uint32_t _basePeriod)
+		{
+			const auto slotPeriod = essiSlotCycles(_cra);
+			if(!slotPeriod || slotPeriod <= _basePeriod)
+				return 0;
+			const auto baseTicks = (slotPeriod + _basePeriod / 2) / _basePeriod;
+			return baseTicks > 1 ? baseTicks - 1 : 0;
+		}
+	}
+
 	Essi::Essi(Peripherals56303& _peripheral, const uint32_t _essiIndex)
 		: m_periph(_peripheral)
 		, m_index(_essiIndex)
@@ -28,6 +61,31 @@ namespace dsp56k
 		direction control register, thus configuring all the ESSI signals as GPIO. The ESSI is in the reset
 		state while all ESSI signals are programmed as GPIO; it is active only if at least one of the ESSI
 		I/O signals is programmed as an ESSI signal. */
+		m_fastLinkRx = false;
+		m_fastLinkRxStarted = false;
+		if(m_fineLinkMode)
+			m_periph.getEssiClock().setEsaiFinePeriod(this, 0);
+	}
+
+	void Essi::terminate()
+	{
+		m_rxDataAvailable = {};
+		m_rxConsumeCallback = {};
+		m_fastLinkRx = false;
+		m_fastLinkRxStarted = false;
+		m_periph.getEssiClock().setEsaiFinePeriod(this, 0);
+		Audio::terminate();
+	}
+
+	void Essi::setFineLinkMode(const bool _enabled)
+	{
+		m_fineLinkMode = _enabled;
+		if(!_enabled)
+		{
+			m_fastLinkRx = false;
+			m_fastLinkRxStarted = false;
+			m_periph.getEssiClock().setEsaiFinePeriod(this, 0);
+		}
 	}
 
 	void Essi::execTX()
@@ -80,7 +138,21 @@ namespace dsp56k
 		if(!rem)
 			return;
 
+		bool bootstrapRx = false;
+		if(m_fastLinkRx && m_rxDataAvailable)
+		{
+			const auto hasData = m_rxDataAvailable();
+			if(hasData)
+				m_fastLinkRxStarted = true;
+			else if(m_fastLinkRxStarted)
+				return;
+			else
+				bootstrapRx = true;
+		}
+
 		readSlotFromFrame();
+		if(bootstrapRx)
+			m_fastLinkRxStarted = true;
 
 		if (0 == m_rxSlotCounter)
 			m_sr.set(SSISR_RFS);
@@ -289,6 +361,9 @@ namespace dsp56k
 		if(!m_readRX)
 			m_sr.clear(RegSSISRbits::SSISR_RDF, RegSSISRbits::SSISR_ROE);
 
+		if(m_rxConsumeCallback)
+			m_rxConsumeCallback();
+
 		return m_rx[0];
 	}
 
@@ -370,6 +445,18 @@ namespace dsp56k
 	{
 		LOGESSI("Write CRA " << "= " << HEX(_val));
 		m_cra = _val;
+
+		if(!m_fineLinkMode)
+			return;
+
+		auto& clock = m_periph.getEssiClock();
+		const auto basePeriod = clock.getCyclesPerSample();
+		const auto slotPeriod = essiSlotCycles(_val);
+		clock.setEsaiDivider(this, essiBaseDivider(_val, basePeriod));
+		const auto finePeriod = slotPeriod && basePeriod && slotPeriod < basePeriod ? slotPeriod : 0;
+		clock.setEsaiFinePeriod(this, finePeriod);
+		m_fastLinkRx = finePeriod != 0;
+		m_fastLinkRxStarted = false;
 	}
 
 	void Essi::writeCRB(TWord _val)

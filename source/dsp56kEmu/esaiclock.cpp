@@ -1,5 +1,6 @@
 #include "esaiclock.h"
 
+#include <algorithm>
 #include <ios>
 
 #include "dsp.h"
@@ -16,10 +17,38 @@ namespace dsp56k
 
 	uint32_t EsxiClock::exec() noexcept
 	{
-		const auto diff = *m_dspInstructionCounter - m_lastClock;
+		const auto now = *m_dspInstructionCounter;
+		const auto diff = now - m_lastClock;
+		uint32_t fineDelay = m_cyclesPerSample;
+
+		if(m_hasFineEsais)
+		{
+			for(auto& entry : m_esais)
+			{
+				if(!entry.finePeriod)
+					continue;
+				uint32_t ticks = 0;
+				while(ticks < MaxFineTicksPerExec && now - entry.fineLastClock >= entry.finePeriod)
+				{
+					++ticks;
+					entry.fineLastClock += entry.finePeriod;
+					if(entry.esai->hasEnabledTransmitters())
+						entry.esai->execTX();
+					if(entry.esai->hasEnabledReceivers())
+						entry.esai->execRX();
+				}
+				if(now - entry.fineLastClock >= entry.finePeriod)
+					fineDelay = 0;
+				else
+				{
+					const auto remaining = static_cast<uint32_t>(entry.finePeriod - (now - entry.fineLastClock));
+					fineDelay = std::min(fineDelay, remaining);
+				}
+			}
+		}
 
 		if(diff < m_cyclesPerSample)
-			return (static_cast<uint32_t>(m_cyclesPerSample - diff)) >> static_cast<uint32_t>(m_clockSource);	// see explanation at end of this func
+			return std::min(fineDelay, static_cast<uint32_t>(m_cyclesPerSample - diff)) >> static_cast<uint32_t>(m_clockSource);	// see explanation at end of this func
 
 		m_lastClock += m_cyclesPerSample;
 
@@ -40,6 +69,8 @@ namespace dsp56k
 
 		for (auto& e : m_esais)
 		{
+			if(e.finePeriod)
+				continue;
 			if(e.esai->hasEnabledTransmitters() && advanceClock(e.tx))
 				processTx[txCount++] = e.esai;
 
@@ -59,7 +90,7 @@ namespace dsp56k
 		// peripherals are processed via instruction counts. Return only half of the cycles in this case
 		static_assert(static_cast<uint32_t>(ClockSource::Instructions) == 0);
 		static_assert(static_cast<uint32_t>(ClockSource::Cycles) == 1);
-		return delay >> static_cast<uint32_t>(m_clockSource);
+		return std::min(fineDelay, delay) >> static_cast<uint32_t>(m_clockSource);
 	}
 
 	void EsxiClock::setPCTL(const TWord _val)
@@ -212,6 +243,32 @@ namespace dsp56k
 			m_esais.emplace_back(EsaiEntry{ _esai, {_dividerTX}, {_dividerRX} });
 		}
 
+		if(m_periph.hasDSP())
+			m_periph.setDelayCycles(0);
+	}
+
+	void EsxiClock::setEsaiFinePeriod(Esxi* _esai, const uint32_t _finePeriod)
+	{
+		// Fine periods share the selected counter with the base clock. exec() is
+		// called at instruction boundaries, so this only provides advisory timing.
+		const auto now = m_dspInstructionCounter ? *m_dspInstructionCounter : 0;
+		bool found = false;
+		for(auto& entry : m_esais)
+		{
+			if(entry.esai != _esai)
+				continue;
+			entry.finePeriod = _finePeriod;
+			entry.fineLastClock = now;
+			found = true;
+			break;
+		}
+		if(!found)
+		{
+			m_esais.emplace_back(EsaiEntry{_esai, {}, {}, _finePeriod, now});
+		}
+		m_hasFineEsais = false;
+		for(const auto& entry : m_esais)
+			m_hasFineEsais = m_hasFineEsais || entry.finePeriod != 0;
 		if(m_periph.hasDSP())
 			m_periph.setDelayCycles(0);
 	}

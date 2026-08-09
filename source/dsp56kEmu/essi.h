@@ -5,6 +5,7 @@
 #include "esxi.h"
 #include "types.h"
 
+#include <functional>
 #include <string>
 
 namespace dsp56k
@@ -164,6 +165,7 @@ namespace dsp56k
 		explicit Essi(Peripherals56303& _peripheral, uint32_t _essiIndex);
 
 		void reset();
+		void terminate();
 
 		void execTX() override;
 		void execRX() override;
@@ -175,6 +177,14 @@ namespace dsp56k
 		bool getTransmitFrameSync() const				{ return m_sr.test(SSISR_TFS); }
 
 		void setDSP(DSP* _dsp);
+
+		// Transport callbacks are owned by this ESSI and run synchronously on the
+		// emulation thread. They must not call back into this ESSI or change either
+		// callback registration. reset() preserves host wiring; terminate() detaches it.
+		// Fine-link mode derives an advisory serial period from CRA when CRA is written.
+		void setFineLinkMode(bool _enabled);
+		void setRxDataAvailableCallback(std::function<bool()> _callback) { m_rxDataAvailable = std::move(_callback); }
+		void setRxConsumeCallback(std::function<void()> _callback) { m_rxConsumeCallback = std::move(_callback); }
 
 		void setSymbols(Disassembler& _disasm) const;
 
@@ -242,5 +252,11 @@ namespace dsp56k
 
 		TxFrame m_txFrame;
 		RxFrame m_rxFrame;
+
+		bool m_fineLinkMode = false;
+		bool m_fastLinkRx = false;
+		bool m_fastLinkRxStarted = false;
+		std::function<bool()> m_rxDataAvailable;
+		std::function<void()> m_rxConsumeCallback;
 	};
 }

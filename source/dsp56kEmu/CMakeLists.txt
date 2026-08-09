@@ -134,3 +134,10 @@ endif()
 # This should use ${PROJECT_SOURCE_DIR}/source if the top level of the repo
 # has the top level cmakelists.txt file.
 target_include_directories(dsp56kEmu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+if(BUILD_TESTING)
+	add_executable(dsp56kEssiTransportTest essi_transport_test.cpp)
+	target_link_libraries(dsp56kEssiTransportTest PRIVATE dsp56kEmu)
+	add_test(NAME dsp56300_essi_transport COMMAND dsp56kEssiTransportTest)
+	set_tests_properties(dsp56300_essi_transport PROPERTIES TIMEOUT 10)
+endif()

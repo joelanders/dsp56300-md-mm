@@ -38,6 +38,11 @@ namespace dsp56k
 			setEsaiDivider(_esai, _divider, _divider);
 		}
 		void setEsaiDivider(Esxi* _esai, TWord _dividerTX, TWord _dividerRX);
+		// A non-zero period schedules this serial interface independently of the
+		// audio base period, measured against the selected clock counter. Setting
+		// zero restores base-period scheduling. Returned delays are advisory
+		// instruction-boundary deadlines, not exact-cycle guarantees.
+		void setEsaiFinePeriod(Esxi* _esai, uint32_t _finePeriod);
 		bool setEsaiCounter(const Esxi* _esai, int _counter)
 		{
 			return setEsaiCounter(_esai, _counter, _counter);
@@ -55,11 +60,11 @@ namespace dsp56k
 		void restartClock();
 
 		TWord getRemainingInstructionsForFrameSync() const;
+		uint32_t getCyclesPerSample() const { return m_cyclesPerSample; }
 
 	protected:
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }
 		auto getLastClock() const { return m_lastClock; }
-		auto getCyclesPerSample() const { return m_cyclesPerSample; }
 		const auto& getEsais() const { return m_esais; }
 		const auto& getPeripherals() const { return m_periph; }
 
@@ -96,9 +101,13 @@ namespace dsp56k
 
 			Clock tx;
 			Clock rx;
+			uint32_t finePeriod = 0;
+			uint64_t fineLastClock = 0;
 		};
 
 		std::vector<EsaiEntry> m_esais;
+		bool m_hasFineEsais = false;
+		static constexpr uint32_t MaxFineTicksPerExec = 64;
 	};
 
 	class EsaiClock : public EsxiClock
