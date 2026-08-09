@@ -178,7 +178,13 @@ namespace dsp56k
 		const auto vba = interrupt;
 
 		if(isInterruptMasked(vba))
+		{
+			// A pending interrupt must not stall the peripherals that may produce
+			// the state the program is waiting for. Keep the request queued and
+			// recheck its priority at the next instruction boundary.
+			m_execPeripheralsFunc(this);
 			return;
+		}
 
 		// it is important that the processing mode is switched first before popping the vector to prevent a possible race condition in hasPendingInterrupt()
 		{
