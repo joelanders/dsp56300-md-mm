@@ -182,6 +182,8 @@ namespace dsp56k
 		Essi& getEssi1()				{ return m_essi1; }
 		HDI08& getHI08()				{ return m_hi08; }
 		const Timers& getTimers() const	{ return m_timers; }
+		EssiPort& getPortC()			{ return m_portC; }
+		EssiPort& getPortD()			{ return m_portD; }
 
 		void setSymbols(Disassembler& _disasm) const override;
 
@@ -194,6 +196,8 @@ namespace dsp56k
 		Essi m_essi1;
 		HDI08 m_hi08;
 		Timers m_timers;
+		EssiPort m_portC;
+		EssiPort m_portD;
 	};
 
 	class Peripherals56367;

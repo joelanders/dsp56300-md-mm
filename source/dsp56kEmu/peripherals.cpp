@@ -175,6 +175,13 @@ namespace dsp56k
 		case Essi::ESSI1_RSMA:		return m_essi1.readRSMA();
 		case Essi::ESSI1_RSMB:		return m_essi1.readRSMB();
 
+		case Essi::ESSI_PDRC:		return m_portC.dspRead();
+		case Essi::ESSI_PRRC:		return m_portC.getDirection();
+		case Essi::ESSI_PCRC:		return m_portC.getControl();
+		case Essi::ESSI_PDRD:		return m_portD.dspRead();
+		case Essi::ESSI_PRRD:		return m_portD.getDirection();
+		case Essi::ESSI_PCRD:		return m_portD.getControl();
+
 		case XIO_PCTL:				return m_essiClock.getPCTL();
 
 		case Timers::M_TCSR0:		return m_timers.readTCSR(0);	// TIMER0 Control/Status Register
@@ -284,6 +291,13 @@ namespace dsp56k
 		case Essi::ESSI1_RSMA:		m_essi1.writeRSMA(_val);				return;
 		case Essi::ESSI1_RSMB:		m_essi1.writeRSMB(_val);				return;
 
+		case Essi::ESSI_PDRC:		m_portC.dspWrite(_val);					return;
+		case Essi::ESSI_PRRC:		m_portC.setDirection(_val);				return;
+		case Essi::ESSI_PCRC:		m_portC.setControl(_val);				return;
+		case Essi::ESSI_PDRD:		m_portD.dspWrite(_val);					return;
+		case Essi::ESSI_PRRD:		m_portD.setDirection(_val);				return;
+		case Essi::ESSI_PCRD:		m_portD.setControl(_val);				return;
+
 		case XIO_PCTL:				m_essiClock.setPCTL(_val);				return;
 
 		case Timers::M_TCSR0:		m_timers.writeTCSR	(0, _val);	return;		// TIMER0 Control/Status Register
@@ -359,6 +373,8 @@ namespace dsp56k
 		m_essi0.reset();
 		m_essi1.reset();
 		m_hi08.reset();
+		m_portC.reset();
+		m_portD.reset();
 	}
 
 	void Peripherals56303::setSymbols(Disassembler& _disasm) const

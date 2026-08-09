@@ -30,8 +30,8 @@ namespace dsp56k
 
 		TWord dspRead() const
 		{
-			// DSP will only get a bit if is configued as an input
-			return (m_hostWrite & ~m_direction) & m_control;
+			const auto hostInput = m_hostInputSource ? m_hostInputSource() : m_hostWrite;
+			return ((hostInput & ~m_direction) | (m_dspWrite & m_direction)) & m_control;
 		}
 
 		TWord hostRead() const
@@ -43,6 +43,11 @@ namespace dsp56k
 		void setCallbackDspWrite(CallbackDspWrite&& _callback)
 		{
 			m_callbackDspWrite = std::move(_callback);
+		}
+
+		void setHostInputSource(std::function<TWord()>&& _source)
+		{
+			m_hostInputSource = std::move(_source);
 		}
 
 		void setCallbackDirChanged(CallbackConfigChanged&& _callback)
@@ -86,6 +91,44 @@ namespace dsp56k
 
 		CallbackDspWrite m_callbackDspWrite = []{};
 		CallbackConfigChanged m_callbackConfigChanged = []{};
+		std::function<TWord()> m_hostInputSource;
+	};
+
+	class EssiPort final : public Gpio
+	{
+	public:
+		static constexpr TWord PinMask = 0x3f;
+
+		EssiPort()
+		{
+			reset();
+		}
+
+		void reset()
+		{
+			setDirection(0);
+			dspWrite(0);
+			setControl(0);
+		}
+
+		void setDirection(const TWord _direction) override
+		{
+			Gpio::setDirection(_direction & PinMask);
+		}
+
+		void setControl(const TWord _control) override
+		{
+			m_essiControl = _control & PinMask;
+			Gpio::setControl(~m_essiControl & PinMask);
+		}
+
+		const TWord& getControl() const override
+		{
+			return m_essiControl;
+		}
+
+	private:
+		TWord m_essiControl = 0;
 	};
 
 	class EsaiPortC final : public Gpio
