@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <type_traits>
+#include <utility>
 
 #include "types.h"
 
@@ -61,7 +63,19 @@ namespace dsp56k
 
 		const JitConfig& getConfig() const { return m_config; }
 		JitConfig getConfig(TWord _pc) const;
-		void setConfig(const JitConfig& _config) { m_config = _config; }
+		void setConfig(const JitConfig& _config)
+		{
+			m_config = _config;
+			++m_configGeneration;
+		}
+		void setConfig(JitConfig&& _config) noexcept
+		{
+			static_assert(std::is_nothrow_move_assignable<JitConfig>::value,
+				"paced teardown requires non-throwing JIT configuration restoration");
+			m_config = std::move(_config);
+			++m_configGeneration;
+		}
+		uint64_t getConfigGeneration() const { return m_configGeneration; }
 		void resetHW();
 		const std::map<TWord, TWord>& getLoops() const { return m_loops; }
 		const std::set< TWord>& getLoopEnds() const { return m_loopEnds; }
@@ -130,6 +144,7 @@ namespace dsp56k
 		std::vector<JitBlockRuntimeData*> m_blockRuntimeDatas;
 
 		JitConfig m_config;
+		uint64_t m_configGeneration = 0;
 
 		size_t m_maxUsedPAddress = 0;
 

@@ -108,6 +108,39 @@ namespace dsp56k
 			BudgetedExecutionStop stop = BudgetedExecutionStop::BudgetExhausted;
 		};
 
+		// The paced JIT is an explicit, single-owner session. Its only accepted
+		// budgets are zero and one instruction. Generated code is configured for
+		// one-op blocks, but the measured counter deltas remain authoritative:
+		// REP and a fast vector may complete atomically, and any other overrun
+		// invalidates the session instead of being presented as scheduler-safe.
+		enum class PacedJitActivation
+		{
+			Activated,
+			Unsupported,
+			AlreadyActive,
+			InterpreterStateOwned,
+		};
+
+		enum class PacedJitExecutionStop
+		{
+			BudgetExhausted,
+			AtomicBudgetOverrun,
+			Waiting,
+			Halted,
+			Inactive,
+			InvalidBudget,
+			OwnershipLost,
+			BoundaryViolation,
+			ReentryDenied,
+		};
+
+		struct PacedJitExecutionResult
+		{
+			uint64_t instructionDelta = 0;
+			uint64_t cycleCounterDelta = 0;
+			PacedJitExecutionStop stop = PacedJitExecutionStop::BudgetExhausted;
+		};
+
 		typedef void (*TInterruptFunc)(DSP*) noexcept;
 
 		static constexpr uint32_t PeripheralsProcessingStepSize = 32;
@@ -147,6 +180,15 @@ namespace dsp56k
 		bool							m_budgetedStartedDo = false;
 		bool							m_budgetedOpAlreadyCounted = false;
 		uint32_t						m_budgetedWaitCycleCost = 0;
+
+		bool							m_pacedJitActive = false;
+		bool							m_pacedJitExecuting = false;
+		bool							m_pacedJitAtomicBoundary = false;
+		bool							m_pacedJitExpectedAtomic = false;
+		bool							m_pacedJitOwnershipLost = false;
+		bool							m_pacedJitTeardownPending = false;
+		uint64_t						m_pacedJitConfigGeneration = 0;
+		JitConfig						m_pacedJitSavedConfig;
 
 		// The lock-free ring buffer's counters are now atomic (release/acquire), so it is correct on ARM too -
 		// the old #ifdef HAVE_ARM64 workaround that forced the blocking (Lock=true) variant here is gone.
@@ -214,7 +256,7 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void exec() noexcept
 		{
-			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted || m_pacedJitActive)
 				return;
 
 			if(g_useJIT)
@@ -225,7 +267,7 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void execJit() noexcept
 		{
-			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted || m_pacedJitActive)
 				return;
 
 			m_interruptFunc(this);
@@ -238,7 +280,7 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void execInterpreter() noexcept
 		{
-			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted || m_pacedJitActive)
 				return;
 
 			m_interruptFunc(this);
@@ -267,6 +309,21 @@ namespace dsp56k
 		// re-enter, reset, or otherwise mutate this DSP while it is executing.
 		// ReentryDenied only protects recursive executeBudgetedSlice calls.
 		BudgetedExecutionResult executeBudgetedSlice(uint64_t _instructionBudget) noexcept;
+
+		// Enters/exits the opt-in paced-JIT ownership boundary. Activation replaces
+		// any cached ordinary blocks with blocks generated from a fixed one-op
+		// configuration; exit or reset destroys those blocks and restores the exact
+		// prior configuration. These methods and Jit::setConfig are single-owner:
+		// they must not be called concurrently. Callback reentry is denied and a
+		// callback JIT-configuration change is detected before further dispatch.
+		// Callbacks must not reset or otherwise mutate core execution state; their
+		// wall time is unbounded. The RESET instruction is supported: its teardown
+		// is deferred until the current generated block returns. No peripheral or
+		// scheduler timing parity is claimed by the measured counter deltas.
+		PacedJitActivation beginPacedJitExecution();
+		bool endPacedJitExecution();
+		PacedJitExecutionResult executePacedJitSlice(uint32_t _instructionBudget);
+		bool isPacedJitExecutionActive() const { return m_pacedJitActive; }
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
 		{
@@ -330,6 +387,8 @@ namespace dsp56k
 
 		TWord			registerInterruptFunc			(std::function<void()>&& _func);
 		bool			injectInterrupt					(uint32_t _interruptVectorAddress);
+		// Immediate completion owns the core and is rejected without mutation
+		// while an opt-in paced-JIT session owns execution.
 		bool			injectInterruptImmediate		(uint32_t _interruptVectorAddress);
 		bool			isInterruptMasked				(const TWord _vba) const;
 
@@ -442,9 +501,14 @@ namespace dsp56k
 		bool	do_exec							( TWord _loopcount, TWord _addr );
 		void	finishBudgetedDoBoundary			();
 		bool	executeBudgetedBoundary			(uint64_t _remainingBudget) noexcept;
+		bool	executePacedJitBoundary			(uint64_t _configGeneration) noexcept;
 		bool	advanceBudgetedWait				(uint64_t _remainingBudget) noexcept;
 		void	completeBudgetedWait				() noexcept;
 		bool	hasServiceablePendingInterrupt		() const;
+		bool	isPacedJitConfigurationOwned		() const;
+		void	requestPacedJitTeardownForReset	();
+		void	finalizePacedJitTeardown			();
+		void	haltPacedJit					(TWord _pc) noexcept;
 		bool	do_end							();
 
 		bool	rep_exec						(TWord _loopCount);

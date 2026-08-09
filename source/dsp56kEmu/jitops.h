@@ -339,6 +339,7 @@ namespace dsp56k
 
 		void callDSPFunc(void(* _func)(DSP*, TWord), TWord _arg) const;
 		void callDSPFunc(void(* _func)(DSP*, TWord), const JitRegGP& _arg) const;
+		static void callDSPPacedStop(DSP* _dsp, TWord _pc) noexcept;
 
 		void setDspProcessingMode(uint32_t _mode) const;
 		void getDspProcessingMode(const JitRegGP& _dst) const;

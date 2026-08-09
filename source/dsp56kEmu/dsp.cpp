@@ -157,6 +157,7 @@ namespace dsp56k
 		m_budgetedHalted = false;
 		m_budgetedExecutionActive = false;
 		m_budgetedWaitCycleCost = 0;
+		requestPacedJitTeardownForReset();
 		m_jit.resetHW();
 	}
 
@@ -205,6 +206,8 @@ namespace dsp56k
 	{
 		if(m_budgetedExecutionActive)
 			m_budgetedAtomicBoundary = true;
+		if(m_pacedJitExecuting)
+			m_pacedJitAtomicBoundary = true;
 
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
@@ -351,7 +354,225 @@ namespace dsp56k
 		}
 
 		m_budgetedAtomicBoundary = true;
+		if(m_pacedJitExecuting)
+			m_pacedJitAtomicBoundary = true;
 		m_interruptFunc = &dspExecInterrupts;
+	}
+
+	bool DSP::isPacedJitConfigurationOwned() const
+	{
+		const auto& config = m_jit.getConfig();
+		return m_jit.getConfigGeneration() == m_pacedJitConfigGeneration
+			&& !config.linkJitBlocks
+			&& config.maxInstructionsPerBlock == 1
+			&& config.maxDoIterations == 1
+			&& config.dynamicFastInterrupts
+			&& !config.getBlockConfig;
+	}
+
+	DSP::PacedJitActivation DSP::beginPacedJitExecution()
+	{
+		if constexpr(!g_useJIT)
+			return PacedJitActivation::Unsupported;
+
+		if(m_pacedJitActive)
+			return PacedJitActivation::AlreadyActive;
+		if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+			return PacedJitActivation::InterpreterStateOwned;
+
+		// Copy both values before changing anything so a throwing std::function
+		// copy cannot leave the ordinary JIT configuration half-owned.
+		JitConfig savedConfig = m_jit.getConfig();
+		JitConfig pacedConfig = savedConfig;
+		pacedConfig.linkJitBlocks = false;
+		pacedConfig.maxInstructionsPerBlock = 1;
+		pacedConfig.maxDoIterations = 1;
+		pacedConfig.dynamicFastInterrupts = true;
+		pacedConfig.getBlockConfig = {};
+
+		// Configuration must precede every paced entry. Existing ordinary blocks
+		// are destroyed first, then the fixed configuration is installed before
+		// the session is made visible.
+		m_jit.destroyAllBlocks();
+		m_pacedJitSavedConfig = std::move(savedConfig);
+		m_jit.setConfig(std::move(pacedConfig));
+		m_pacedJitConfigGeneration = m_jit.getConfigGeneration();
+		m_pacedJitOwnershipLost = false;
+		m_pacedJitTeardownPending = false;
+		m_pacedJitActive = true;
+		return PacedJitActivation::Activated;
+	}
+
+	void DSP::finalizePacedJitTeardown()
+	{
+		if(!m_pacedJitActive)
+			return;
+
+		// Restore first so even an allocation failure while rebuilding the empty
+		// mode chain cannot leave the public configuration in paced mode.
+		m_jit.setConfig(std::move(m_pacedJitSavedConfig));
+		m_pacedJitActive = false;
+		m_pacedJitExecuting = false;
+		m_pacedJitAtomicBoundary = false;
+		m_pacedJitExpectedAtomic = false;
+		m_pacedJitOwnershipLost = false;
+		m_pacedJitTeardownPending = false;
+		m_pacedJitConfigGeneration = 0;
+		m_jit.destroyAllBlocks();
+	}
+
+	bool DSP::endPacedJitExecution()
+	{
+		if(!m_pacedJitActive || m_pacedJitExecuting)
+			return false;
+		finalizePacedJitTeardown();
+		return true;
+	}
+
+	void DSP::requestPacedJitTeardownForReset()
+	{
+		if(!m_pacedJitActive)
+			return;
+		if(m_pacedJitExecuting)
+		{
+			m_pacedJitOwnershipLost = true;
+			m_pacedJitTeardownPending = true;
+			return;
+		}
+		finalizePacedJitTeardown();
+	}
+
+	bool DSP::executePacedJitBoundary(const uint64_t _configGeneration) noexcept
+	{
+		m_pacedJitAtomicBoundary = false;
+		m_pacedJitExpectedAtomic = false;
+
+		if(m_budgetedWait)
+		{
+			if(advanceBudgetedWait(1))
+				return false;
+			if(m_pacedJitAtomicBoundary)
+				return true;
+		}
+
+		m_interruptFunc(this);
+		// Custom/peripheral callbacks are outside the paced owner's control. A
+		// detected configuration change or RESET-instruction teardown must stop
+		// this visit before it fetches or dispatches any program opcode.
+		if(m_pacedJitOwnershipLost || m_pacedJitTeardownPending
+			|| m_jit.getConfigGeneration() != _configGeneration)
+			return false;
+		if(m_pacedJitAtomicBoundary)
+		{
+			m_pacedJitExpectedAtomic = true;
+			return true;
+		}
+
+		const auto pc = getPC().toWord();
+		TWord opA, opB;
+		mem.getOpcode(pc, opA, opB);
+		Instruction instA, instB;
+		m_opcodes.getInstructionTypes(opA, instA, instB);
+		m_pacedJitExpectedAtomic = (Opcodes::getFlags(instA, instB)
+			& (OpFlagRepDynamic | OpFlagRepImmediate)) != 0;
+
+		m_jit.ensureProgramAddress(pc);
+		LOGJITPC(pc);
+		m_jitEntries[pc](&reg, pc);
+		return true;
+	}
+
+	DSP::PacedJitExecutionResult DSP::executePacedJitSlice(const uint32_t _instructionBudget)
+	{
+		PacedJitExecutionResult result;
+		if(m_pacedJitExecuting)
+		{
+			result.stop = PacedJitExecutionStop::ReentryDenied;
+			return result;
+		}
+		if(!m_pacedJitActive)
+		{
+			result.stop = PacedJitExecutionStop::Inactive;
+			return result;
+		}
+		if(_instructionBudget > 1)
+		{
+			result.stop = PacedJitExecutionStop::InvalidBudget;
+			return result;
+		}
+		if(m_pacedJitOwnershipLost || !isPacedJitConfigurationOwned())
+		{
+			m_pacedJitOwnershipLost = true;
+			result.stop = PacedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(m_budgetedHalted)
+		{
+			result.stop = PacedJitExecutionStop::Halted;
+			return result;
+		}
+		if(m_budgetedWait && !_instructionBudget)
+		{
+			result.stop = PacedJitExecutionStop::Waiting;
+			return result;
+		}
+		if(!_instructionBudget)
+			return result;
+
+		const auto instructionsBefore = m_instructions;
+		const auto cyclesBefore = m_cycles;
+		const auto configGeneration = m_pacedJitConfigGeneration;
+		m_pacedJitExecuting = true;
+		const auto completedBoundary = executePacedJitBoundary(configGeneration);
+		m_pacedJitExecuting = false;
+
+		result.instructionDelta = m_instructions - instructionsBefore;
+		result.cycleCounterDelta = m_cycles - cyclesBefore;
+
+		if(m_pacedJitTeardownPending)
+		{
+			finalizePacedJitTeardown();
+			result.stop = PacedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(m_jit.getConfigGeneration() != configGeneration || !isPacedJitConfigurationOwned())
+			m_pacedJitOwnershipLost = true;
+		if(m_pacedJitOwnershipLost)
+		{
+			result.stop = PacedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(!completedBoundary)
+		{
+			result.stop = m_budgetedWait ? PacedJitExecutionStop::Waiting
+				: PacedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+
+		if(result.instructionDelta > 1)
+		{
+			if(m_pacedJitExpectedAtomic)
+				result.stop = PacedJitExecutionStop::AtomicBudgetOverrun;
+			else
+			{
+				m_pacedJitOwnershipLost = true;
+				result.stop = PacedJitExecutionStop::BoundaryViolation;
+			}
+			return result;
+		}
+		const auto waitWakeBoundary = result.instructionDelta == 0
+			&& m_pacedJitAtomicBoundary && !m_pacedJitExpectedAtomic;
+		if(result.instructionDelta != 1 && !waitWakeBoundary)
+		{
+			m_pacedJitOwnershipLost = true;
+			result.stop = PacedJitExecutionStop::BoundaryViolation;
+			return result;
+		}
+		if(m_budgetedWait)
+			result.stop = PacedJitExecutionStop::Waiting;
+		else if(m_budgetedHalted)
+			result.stop = PacedJitExecutionStop::Halted;
+		return result;
 	}
 
 	bool DSP::executeBudgetedBoundary(const uint64_t _remainingBudget) noexcept
@@ -393,7 +614,7 @@ namespace dsp56k
 	DSP::BudgetedExecutionResult DSP::executeBudgetedSlice(const uint64_t _instructionBudget) noexcept
 	{
 		BudgetedExecutionResult result;
-		if(m_budgetedExecutionActive)
+		if(m_budgetedExecutionActive || m_pacedJitActive)
 		{
 			result.stop = BudgetedExecutionStop::ReentryDenied;
 			return result;
@@ -601,6 +822,13 @@ namespace dsp56k
 		m_budgetedWaitCompletionPending = false;
 		m_budgetedHalted = false;
 		m_budgetedWaitCycleCost = 0;
+		requestPacedJitTeardownForReset();
+	}
+
+	void DSP::haltPacedJit(const TWord _pc) noexcept
+	{
+		reg.pc.var = _pc;
+		m_budgetedHalted = true;
 	}
 
 	void DSP::jsr(const TReg24& _val)
@@ -1476,6 +1704,13 @@ namespace dsp56k
 
 	bool DSP::injectInterruptImmediate(const uint32_t _interruptVectorAddress)
 	{
+		// This API owns the core until an interrupt has run back to Default. It
+		// cannot coexist with paced ownership: exec() deliberately does no work
+		// during a paced session, so accepting the vector would mutate state and
+		// strand the completion loop. Reject before masking checks or mutation.
+		if(m_pacedJitActive || m_pacedJitExecuting)
+			return false;
+
 		if(isInterruptMasked(_interruptVectorAddress))
 			return false;
 
@@ -1693,6 +1928,15 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 
 	void DSP::op_Wait(const TWord)
 	{
+		if(m_pacedJitExecuting)
+		{
+			// The JIT block has already retired WAIT into both counters. Keep only
+			// the no-successor latch; wake servicing remains bounded per API visit.
+			m_budgetedWait = true;
+			m_budgetedWaitCompletionPending = false;
+			m_budgetedWaitCycleCost = 0;
+			return;
+		}
 		if(m_budgetedExecutionActive)
 		{
 			m_budgetedWait = true;

@@ -517,11 +517,23 @@ namespace dsp56k
 
 	void JitOps::op_Stop(TWord op)
 	{
+		if(m_block.dsp().m_pacedJitActive)
+		{
+			const DspValue pc(m_block, m_pcCurrentOp, DspValue::Immediate24);
+			m_dspRegs.setPC(pc);
+			callDSPFunc(&callDSPPacedStop, m_pcCurrentOp);
+			return;
+		}
 #ifdef HAVE_X86_64
 		m_block.asm_().int3();
 #else
 		m_block.asm_().brk(asmjit::Imm(m_pcCurrentOp & 0xffff));
 #endif
+	}
+
+	void JitOps::callDSPPacedStop(DSP* const _dsp, const TWord _pc) noexcept
+	{
+		_dsp->haltPacedJit(_pc);
 	}
 
 	void callDSPDebug(DSP* const _dsp, const TWord op)
