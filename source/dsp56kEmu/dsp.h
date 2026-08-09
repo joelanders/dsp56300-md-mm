@@ -94,9 +94,9 @@ namespace dsp56k
 		struct BudgetedExecutionResult
 		{
 			uint64_t instructionDelta = 0;
-			// Measured delta of the existing m_cycles counter. It is not an
-			// instruction-cycle prediction: ordinary operations, idle WAIT advance,
-			// and fastForward update that legacy counter differently.
+			// Measured delta of the existing m_cycles counter. Interpreter operations
+			// retire through calcCycles; idle WAIT advance and fastForward remain
+			// legacy counter updates, so this is not yet a scheduler/JIT parity API.
 			uint64_t cycleCounterDelta = 0;
 			BudgetedExecutionStop stop = BudgetedExecutionStop::BudgetExhausted;
 		};
@@ -139,6 +139,7 @@ namespace dsp56k
 		bool							m_budgetedAtomicBoundary = false;
 		bool							m_budgetedStartedDo = false;
 		bool							m_budgetedOpAlreadyCounted = false;
+		uint32_t						m_budgetedWaitCycleCost = 0;
 
 		// The lock-free ring buffer's counters are now atomic (release/acquire), so it is correct on ARM too -
 		// the old #ifdef HAVE_ARM64 workaround that forced the blocking (Lock=true) variant here is gone.
@@ -405,6 +406,7 @@ namespace dsp56k
 	private:
 
 		std::string getSSindent() const;
+		uint32_t getInterpreterOpCycles(TWord _pc, TWord _op) const;
 
 		TWord	fetchOpWordB()
 		{

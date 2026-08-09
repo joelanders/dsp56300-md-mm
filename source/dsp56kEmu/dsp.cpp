@@ -13,6 +13,7 @@
 #include "debuggerinterface.h"
 #include "dspconfig.h"
 #include "interrupts.h"
+#include "opcodecycles.h"
 
 #include "dsp_decode.inl"
 
@@ -155,6 +156,7 @@ namespace dsp56k
 		m_budgetedWaitCompletionPending = false;
 		m_budgetedHalted = false;
 		m_budgetedExecutionActive = false;
+		m_budgetedWaitCycleCost = 0;
 		m_jit.resetHW();
 	}
 
@@ -338,6 +340,8 @@ namespace dsp56k
 		m_budgetedWait = false;
 		if(m_budgetedWaitCompletionPending)
 		{
+			m_cycles += m_budgetedWaitCycleCost;
+			m_budgetedWaitCycleCost = 0;
 			++m_instructions;
 			if(g_traceSupported)
 				traceOp();
@@ -490,6 +494,17 @@ namespace dsp56k
 		m_currentOpLen = 1;
 
 		const TWord currentOp = pcCurrentInstruction;
+		const auto cycleCost = getInterpreterOpCycles(currentOp, op);
+		Instruction instA, instB;
+		m_opcodes.getInstructionTypes(op, instA, instB);
+		const auto deferWaitRetirement = instA == Wait;
+
+		// Normal and parallel forms use the same table and max(A, B) rule as
+		// JIT block accounting. Retire before an operation can enter a nested DO
+		// body; WAIT is the one exception because its architectural retirement is
+		// delayed until a wake request returns control to the core.
+		if(!deferWaitRetirement)
+			m_cycles += cycleCost;
 		const auto& opCache = m_opcodeCache[currentOp];
 
 		m_budgetedOpAlreadyCounted = false;
@@ -502,6 +517,21 @@ namespace dsp56k
 			if(g_traceSupported && pcCurrentInstruction == currentOp)
 				traceOp();
 		}
+
+		if(deferWaitRetirement)
+		{
+			if(m_budgetedWait)
+				m_budgetedWaitCycleCost = cycleCost;
+			else
+				m_cycles += cycleCost;
+		}
+	}
+
+	uint32_t DSP::getInterpreterOpCycles(const TWord _pc, const TWord _op) const
+	{
+		Instruction instA, instB;
+		m_opcodes.getInstructionTypes(_op, instA, instB);
+		return calcCycles(instA, instB, _pc, _op, mem.getBridgedMemoryAddress(), 1);
 	}
 
 	void DSP::exec_jump(const TInstructionFunc& _func, TWord _op)
@@ -569,6 +599,7 @@ namespace dsp56k
 		m_budgetedWait = false;
 		m_budgetedWaitCompletionPending = false;
 		m_budgetedHalted = false;
+		m_budgetedWaitCycleCost = 0;
 	}
 
 	void DSP::jsr(const TReg24& _val)
@@ -766,6 +797,7 @@ namespace dsp56k
 		while( reg.lc.var > 0 )
 		{
 			--reg.lc.var;
+			m_cycles += getInterpreterOpCycles(pcCurrentInstruction, op);
 			(this->*func)(op);
 			++m_instructions;
 //			traceOp();

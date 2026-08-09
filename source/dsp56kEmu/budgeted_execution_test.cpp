@@ -4,10 +4,13 @@
 #include "esxi.h"
 #include "interrupts.h"
 #include "memory.h"
+#include "opcodecycles.h"
+#include "opcodes.h"
 #include "peripherals.h"
 
 #include <cstdio>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
@@ -43,6 +46,17 @@ namespace
 		DSP dsp;
 		Assembler assembler;
 	};
+
+	uint32_t independentCycleCost(const Fixture& _fixture, const TWord _pc)
+	{
+		TWord opA, opB;
+		_fixture.memory.getOpcode(_pc, opA, opB);
+		Opcodes opcodes;
+		Instruction instA, instB;
+		opcodes.getInstructionTypes(opA, instA, instB);
+		return calcCycles(instA, instB, _pc, opA,
+			_fixture.memory.getBridgedMemoryAddress(), 1);
+	}
 
 	class SerialProbe final : public Esxi
 	{
@@ -99,6 +113,11 @@ namespace
 		fixture.dsp.regs().b.var = 0x00000001000000ull;
 		fixture.install(0, "rep #$4");
 		fixture.install(1, "add b,a");
+		const auto expectedCycles = independentCycleCost(fixture, 0)
+			+ 4 * independentCycleCost(fixture, 1);
+		require(independentCycleCost(fixture, 0) == 5 && independentCycleCost(fixture, 1) == 1
+			&& expectedCycles == 9,
+			"REP fixed timing vector no longer matches the DSP56300 cycle table");
 
 		const auto result = fixture.dsp.executeBudgetedSlice(1);
 		require(result.stop == DSP::BudgetedExecutionStop::AtomicBudgetOverrun,
@@ -107,6 +126,71 @@ namespace
 		require(fixture.dsp.regs().a.var == 0x00000004000000ull,
 			"REP did not execute its complete repetition count");
 		require(fixture.dsp.getPC().toWord() == 2, "REP did not consume exactly its repeated operation");
+		require(fixture.dsp.getCycles() == expectedCycles,
+			"REP did not retire its setup and every repeated body through calcCycles");
+	}
+
+	void interpreterRetiresIndependentNormalAndParallelCycleCosts()
+	{
+		Fixture fixture;
+		fixture.install(0, "add #$1,a");
+		fixture.install(1, "nop");
+		const auto normalCycles = independentCycleCost(fixture, 0);
+		const auto nopCycles = independentCycleCost(fixture, 1);
+		require(normalCycles == 1 && nopCycles == 1,
+			"normal fixed timing vectors no longer match the DSP56300 cycle table");
+
+		fixture.dsp.execInterpreter();
+		require(fixture.dsp.getCycles() == normalCycles,
+			"normal interpreter operation did not retire its independent calcCycles cost");
+		fixture.dsp.execInterpreter();
+		require(fixture.dsp.getCycles() == normalCycles + nopCycles,
+			"interpreter cycle retirement did not preserve normal operation chronology");
+
+		Fixture parallel;
+		// CLR B || MOVE #>$128,X0. The parallel decoder resolves this as
+		// Clr + Movex_ea. Its MMM=110/RRR=100 is immediate data, so the
+		// documented table cost is Movex_ea base 1 + lab 1 + lim 1 = 3;
+		// CLR's unspecified entry defaults to 1 and the parallel max is 3.
+		constexpr TWord parallelOp = 0x44f41b;
+		constexpr TWord parallelExtension = 0x000128;
+		require(parallel.dsp.memWriteP(0, parallelOp), "failed to install parallel timing opcode");
+		require(parallel.dsp.memWriteP(1, parallelExtension), "failed to install parallel timing extension");
+		Opcodes parallelOpcodes;
+		Instruction parallelA, parallelB;
+		parallelOpcodes.getInstructionTypes(parallelOp, parallelA, parallelB);
+		require(parallelA == Clr && parallelB == Movex_ea,
+			"parallel fixed timing vector no longer decodes as CLR plus MOVEX immediate");
+		const auto parallelCycles = independentCycleCost(parallel, 0);
+		require(parallelCycles == 3,
+			"parallel fixed timing vector no longer matches the DSP56300 cycle table");
+		parallel.dsp.execInterpreter();
+		require(parallel.dsp.getCycles() == parallelCycles,
+			"parallel interpreter operation did not use calcCycles max(A, B)");
+	}
+
+	void finiteNestedDoHasTheSameRetiredCyclesWhenSliced()
+	{
+		Fixture continuous;
+		Fixture sliced;
+		for(auto* fixture : {&continuous, &sliced})
+		{
+			fixture->dsp.regs().a.var = 0;
+			fixture->dsp.regs().b.var = 0x00000001000000ull;
+			TWord pc = 0;
+			pc = fixture->install(pc, "do #$2,>$6");
+			pc = fixture->install(pc, "do #$2,>$5");
+			pc = fixture->install(pc, "add b,a");
+			fixture->install(pc, "nop");
+		}
+
+		continuous.dsp.execInterpreter();
+		for(unsigned guard = 0; guard < 16 && sliced.dsp.getPC().toWord() != 6; ++guard)
+			sliced.dsp.executeBudgetedSlice(1);
+		require(sliced.dsp.getPC().toWord() == 6
+			&& sliced.dsp.getCycles() == continuous.dsp.getCycles()
+			&& sliced.dsp.getInstructionCounter() == continuous.dsp.getInstructionCounter(),
+			"finite nested DO did not retire identically in sliced and unbounded interpreter paths");
 	}
 
 	void zeroCountDoAndContinuousInterpreterStayConsistent()
@@ -140,7 +224,8 @@ namespace
 		sliced.dsp.executeBudgetedSlice(1);
 		require(continuous.dsp.regs().a.var == sliced.dsp.regs().a.var
 			&& continuous.dsp.getPC() == sliced.dsp.getPC()
-			&& continuous.dsp.getInstructionCounter() == sliced.dsp.getInstructionCounter(),
+			&& continuous.dsp.getInstructionCounter() == sliced.dsp.getInstructionCounter()
+			&& continuous.dsp.getCycles() == sliced.dsp.getCycles(),
 			"two ordinary interpreter boundaries diverged from sliced execution");
 	}
 
@@ -177,10 +262,14 @@ namespace
 			fixture.install(0x100, "move #$1,r0");
 			fixture.dsp.setPC(0x100);
 			require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue NMI");
+			const auto vectorCycles = independentCycleCost(fixture, Vba_NMI)
+				+ independentCycleCost(fixture, Vba_NMI + 1);
 
 			const auto vector = fixture.dsp.executeBudgetedSlice(1);
 			require(vector.stop == DSP::BudgetedExecutionStop::AtomicBudgetOverrun && vector.instructionDelta == 2,
 				"fast vector was not kept as one atomic two-word transaction");
+			require(vector.cycleCounterDelta == vectorCycles,
+				"fast vector did not retire both vector words through calcCycles");
 			require(fixture.dsp.regs().r[0].toWord() == 0 && fixture.dsp.getPC().toWord() == 0x100,
 				"fast vector executed an interrupted-program successor");
 
@@ -197,12 +286,16 @@ namespace
 			fixture.dsp.setPC(0x400);
 			require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue long NMI");
 
-			fixture.dsp.executeBudgetedSlice(1);
+			const auto vector = fixture.dsp.executeBudgetedSlice(1);
 			require(fixture.dsp.getProcessingMode() == DSP::LongInterrupt,
 				"long vector did not enter long interrupt mode");
-			fixture.dsp.executeBudgetedSlice(1);
+			require(vector.cycleCounterDelta == independentCycleCost(fixture, Vba_NMI),
+				"long vector did not retire its vector operation through calcCycles");
+			const auto rti = fixture.dsp.executeBudgetedSlice(1);
 			require(fixture.dsp.getProcessingMode() == DSP::DefaultPreventInterrupt,
 				"long interrupt RTI did not restore the regular dispatch boundary");
+			require(rti.cycleCounterDelta == independentCycleCost(fixture, 0x300),
+				"RTI did not retire through calcCycles after a long vector");
 			fixture.dsp.executeBudgetedSlice(1);
 			require(fixture.dsp.regs().r[0].toWord() == 1 && fixture.dsp.regs().sp.toWord() == 0,
 				"long interrupt RTI did not resume with a balanced stack");
@@ -217,9 +310,12 @@ namespace
 			fixture.dsp.setPC(0x400);
 			require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue slot-two long NMI");
 
-			fixture.dsp.executeBudgetedSlice(2);
+			const auto vector = fixture.dsp.executeBudgetedSlice(2);
 			require(fixture.dsp.getProcessingMode() == DSP::LongInterrupt,
 				"slot-two vector JSR did not enter long interrupt mode");
+			require(vector.cycleCounterDelta == independentCycleCost(fixture, Vba_NMI)
+				+ independentCycleCost(fixture, Vba_NMI + 1),
+				"slot-two long vector did not retire both vector words through calcCycles");
 			fixture.dsp.executeBudgetedSlice(1);
 			fixture.dsp.executeBudgetedSlice(1);
 			require(fixture.dsp.regs().r[0].toWord() == 1 && fixture.dsp.regs().sp.toWord() == 0,
@@ -274,7 +370,8 @@ namespace
 
 		require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue WAIT wake interrupt");
 		const auto wake = fixture.dsp.executeBudgetedSlice(1);
-		require(wake.instructionDelta == 1 && fixture.dsp.regs().r[0].toWord() == 0,
+		require(wake.instructionDelta == 1 && wake.cycleCounterDelta == independentCycleCost(fixture, 0)
+			&& fixture.dsp.regs().r[0].toWord() == 0,
 			"WAIT wake did not complete WAIT before interrupt dispatch");
 		fixture.dsp.executeBudgetedSlice(1);
 		require(fixture.dsp.regs().r[0].toWord() == 0, "WAIT wake executed a successor in the vector boundary");
@@ -293,6 +390,9 @@ namespace
 
 		fixture.dsp.executeBudgetedSlice(1);
 		const auto beforeWait = fixture.dsp.getInstructionCounter();
+		constexpr uint32_t waitCycles = 10;
+		require(independentCycleCost(fixture, 2) == waitCycles,
+			"WAIT fixed timing vector no longer matches the DSP56300 cycle table");
 		const auto waiting = fixture.dsp.executeBudgetedSlice(1);
 		require(waiting.instructionDelta == 0 && waiting.cycleCounterDelta == 0
 			&& fixture.dsp.regs().sp.toWord() != 0,
@@ -300,10 +400,11 @@ namespace
 
 		require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue DO WAIT wake interrupt");
 		const auto wake = fixture.dsp.executeBudgetedSlice(1);
-		require(wake.instructionDelta == 1 && wake.cycleCounterDelta == 0
+		require(wake.instructionDelta == 1 && wake.cycleCounterDelta == waitCycles
 			&& fixture.dsp.getInstructionCounter() == beforeWait + 1 && fixture.dsp.getPC().toWord() == 3,
 			"WAIT wake did not perform deferred DO-end bookkeeping");
-		require(fixture.dsp.regs().sp.toWord() == 0 && fixture.dsp.regs().r[0].toWord() == 0,
+		require(fixture.dsp.regs().sp.toWord() == 0 && fixture.dsp.regs().lc.toWord() == 0
+			&& (fixture.dsp.regs().sr.toWord() & SR_LF) == 0 && fixture.dsp.regs().r[0].toWord() == 0,
 			"WAIT wake left DO stack state or executed its successor early");
 	}
 
@@ -442,6 +543,34 @@ namespace
 		require(fixture.dsp.getPC().toWord() == returnPc && fixture.dsp.regs().sp.toWord() == 0,
 			"ordinary default JIT execution did not retain RTS state progression");
 	}
+
+	void cycleClockObservesOnlyRetiredInterpreterCycles()
+	{
+		Fixture continuous;
+		Fixture sliced;
+		SerialProbe continuousSerial;
+		SerialProbe slicedSerial;
+		for(auto [fixture, serial] : {std::pair{&continuous, &continuousSerial}, std::pair{&sliced, &slicedSerial}})
+		{
+			fixture->install(0, "add #$1,a");
+			fixture->install(1, "nop");
+			auto& clock = fixture->peripherals.getEssiClock();
+			clock.setClockSource(EsxiClock::ClockSource::Cycles);
+			clock.setCyclesPerSample(1);
+			clock.setEsaiFinePeriod(serial, 1);
+		}
+
+		continuous.dsp.execInterpreter();
+		sliced.dsp.executeBudgetedSlice(1);
+		require(continuousSerial.transmitTicks == 0 && slicedSerial.transmitTicks == 0,
+			"cycle-clock callback observed an instruction before retirement");
+		continuous.dsp.execInterpreter();
+		sliced.dsp.executeBudgetedSlice(1);
+		require(continuousSerial.transmitTicks == 1 && continuousSerial.receiveTicks == 1
+			&& slicedSerial.transmitTicks == 1 && slicedSerial.receiveTicks == 1
+			&& continuous.dsp.getCycles() == sliced.dsp.getCycles(),
+			"cycle-clock callback order diverged between unbounded and sliced interpreter execution");
+	}
 }
 
 int main()
@@ -451,6 +580,8 @@ int main()
 		zeroBudgetDoesNoWork();
 		finiteAndNestedDoResumeAtInstructionBoundaries();
 		repCompletesAtomicallyAndReportsOverrun();
+		interpreterRetiresIndependentNormalAndParallelCycleCosts();
+		finiteNestedDoHasTheSameRetiredCyclesWhenSliced();
 		zeroCountDoAndContinuousInterpreterStayConsistent();
 		longInterruptCanReturnIntoAnActiveFiniteDo();
 		fastAndLongInterruptsKeepTheirArchitecturalBoundaries();
@@ -462,6 +593,7 @@ int main()
 		stopIsExplicitlyHaltedUntilReset();
 		ordinaryDefaultInterpreterRemainsAvailableOutsideBudgetedMode();
 		ordinaryDefaultJitRetainsProgressAndCountersOutsideBudgetedMode();
+		cycleClockObservesOnlyRetiredInterpreterCycles();
 		std::puts("DSP56300 budgeted execution tests passed");
 		return 0;
 	}
