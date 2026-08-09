@@ -14,5 +14,6 @@ namespace dsp56k
 
 		virtual TWord hasEnabledTransmitters() const = 0;
 		virtual TWord hasEnabledReceivers() const = 0;
+		virtual bool clockTickEnabled() const { return true; }
 	};
 }

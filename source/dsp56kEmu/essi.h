@@ -175,6 +175,11 @@ namespace dsp56k
 
 		bool getReceiveFrameSync() const				{ return m_sr.test(SSISR_RFS); }
 		bool getTransmitFrameSync() const				{ return m_sr.test(SSISR_TFS); }
+		bool clockTickEnabled() const override			{ return !m_clockGate || m_clockGate(); }
+		// The emulation owner installs this wiring once and must not mutate or
+		// re-enter the DSP from the callback. It is polled once per scheduled
+		// serial tick, survives peripheral reset, and is detached by terminate().
+		void setClockGate(std::function<bool()> _gate)	{ m_clockGate = std::move(_gate); }
 
 		void setDSP(DSP* _dsp);
 
@@ -258,5 +263,6 @@ namespace dsp56k
 		bool m_fastLinkRxStarted = false;
 		std::function<bool()> m_rxDataAvailable;
 		std::function<void()> m_rxConsumeCallback;
+		std::function<bool()> m_clockGate;
 	};
 }

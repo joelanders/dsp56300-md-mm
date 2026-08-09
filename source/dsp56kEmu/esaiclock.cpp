@@ -32,9 +32,13 @@ namespace dsp56k
 				{
 					++ticks;
 					entry.fineLastClock += entry.finePeriod;
-					if(entry.esai->hasEnabledTransmitters())
+					const auto transmitEnabled = entry.esai->hasEnabledTransmitters();
+					const auto receiveEnabled = entry.esai->hasEnabledReceivers();
+					if(!(transmitEnabled || receiveEnabled) || !entry.esai->clockTickEnabled())
+						continue;
+					if(transmitEnabled)
 						entry.esai->execTX();
-					if(entry.esai->hasEnabledReceivers())
+					if(receiveEnabled)
 						entry.esai->execRX();
 				}
 				if(now - entry.fineLastClock >= entry.finePeriod)
@@ -71,10 +75,14 @@ namespace dsp56k
 		{
 			if(e.finePeriod)
 				continue;
-			if(e.esai->hasEnabledTransmitters() && advanceClock(e.tx))
+			const auto transmitEnabled = e.esai->hasEnabledTransmitters();
+			const auto receiveEnabled = e.esai->hasEnabledReceivers();
+			if(!(transmitEnabled || receiveEnabled) || !e.esai->clockTickEnabled())
+				continue;
+			if(transmitEnabled && advanceClock(e.tx))
 				processTx[txCount++] = e.esai;
 
-			if (e.esai->hasEnabledReceivers() && advanceClock(e.rx))
+			if(receiveEnabled && advanceClock(e.rx))
 				processRx[rxCount++] = e.esai;
 		}
 

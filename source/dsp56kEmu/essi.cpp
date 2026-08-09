@@ -73,6 +73,7 @@ namespace dsp56k
 		m_rxConsumeCallback = {};
 		m_fastLinkRx = false;
 		m_fastLinkRxStarted = false;
+		m_clockGate = {};
 		m_periph.getEssiClock().setEsaiFinePeriod(this, 0);
 		Audio::terminate();
 	}
