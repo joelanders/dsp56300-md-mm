@@ -121,7 +121,23 @@ namespace dsp56k
 		void terminate();
 
 		void setReadRxCallback(ReadRxCallback _callback) { m_readRxCallback = std::move(_callback); }
-		void setWriteTxCallback(WriteTxCallback _callback) { m_writeTxCallback = std::move(_callback); }
+		// Replacing the default TX sink also transfers admission responsibility to
+		// the owner. Callback registration and transport execution are single-owner
+		// operations and must not race.
+		void setWriteTxCallback(WriteTxCallback _callback)
+		{
+			m_writeTxCallback = std::move(_callback);
+			m_writeTxUsesRingBuffer = false;
+		}
+
+		// Side-effect-free producer admission for the default ring-backed TX sink.
+		// A custom sink is responsible for providing its own non-blocking contract.
+		bool canAcceptTxFrame() const
+		{
+			return m_terminated.load(std::memory_order_acquire)
+				|| !m_writeTxUsesRingBuffer
+				|| !m_audioOutputs.full();
+		}
 
 		bool hasRingBuffers() const { return m_useRingBuffers; }
 
@@ -284,6 +300,7 @@ namespace dsp56k
 		};
 
 		bool m_useRingBuffers;
+		bool m_writeTxUsesRingBuffer = false;
 
 		RingBuffer<RxFrame, RingBufferSize, true, false> m_audioInputs;
 		RingBuffer<TxFrame, RingBufferSize, true, false> m_audioOutputs;

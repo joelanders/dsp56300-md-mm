@@ -95,6 +95,10 @@ namespace dsp56k
 
 		if(!tem)
 			return;
+		// Scheduled ticks are preflighted by clockTickEnabled() so TX and RX
+		// remain atomic. This second check covers direct priming through writeCRB().
+		if(txTickWouldCompleteFrame() && !canAcceptTxFrame())
+			return;
 
 		// note that this transfers the data in TX that has been written to it before
 		writeSlotToFrame();
@@ -130,6 +134,18 @@ namespace dsp56k
 		{
 			injectInterrupt(Vba_ESSI0transmitdata);
 		}
+	}
+
+	bool Essi::txTickWouldCompleteFrame() const
+	{
+		return hasEnabledTransmitters() && m_txSlotCounter >= getTxWordCount();
+	}
+
+	bool Essi::clockTickEnabled() const
+	{
+		if(m_clockGate && !m_clockGate())
+			return false;
+		return !txTickWouldCompleteFrame() || canAcceptTxFrame();
 	}
 
 	void Essi::execRX()

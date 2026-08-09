@@ -175,7 +175,7 @@ namespace dsp56k
 
 		bool getReceiveFrameSync() const				{ return m_sr.test(SSISR_RFS); }
 		bool getTransmitFrameSync() const				{ return m_sr.test(SSISR_TFS); }
-		bool clockTickEnabled() const override			{ return !m_clockGate || m_clockGate(); }
+		bool clockTickEnabled() const override;
 		// The emulation owner installs this wiring once and must not mutate or
 		// re-enter the DSP from the callback. It is polled once per scheduled
 		// serial tick, survives peripheral reset, and is detached by terminate().
@@ -231,6 +231,7 @@ namespace dsp56k
 		void writeSlotToFrame();
 
 		void dmaTrigger(uint32_t _trigger) const;
+		bool txTickWouldCompleteFrame() const;
 
 		Peripherals56303& m_periph;
 		const uint32_t m_index;

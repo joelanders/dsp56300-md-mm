@@ -5,6 +5,7 @@ namespace dsp56k
 	Audio::Audio(const bool _useRingBuffers/* = true*/)
 		: m_callback([](Audio*) {})
 		, m_useRingBuffers(_useRingBuffers)
+		, m_writeTxUsesRingBuffer(_useRingBuffers)
 	{
 		if(_useRingBuffers)
 		{
