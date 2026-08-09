@@ -498,9 +498,12 @@ namespace dsp56k
 	inline void DSP::op_Stop(const TWord op)
 	{
 		LOG("STOP instruction at PC " << HEX(pcCurrentInstruction));
-		// STOP halts the processor clock until a hardware reset or external interrupt
-		// For emulation purposes, treat as a wait/halt
+		// Legacy execution retains its historical self-loop. The opt-in budgeted
+		// V1 exposes a reset-only halt instead: an external request stays queued
+		// until an explicit reset clears the latch.
 		reg.pc.var = pcCurrentInstruction;
+		if(m_budgetedExecutionActive)
+			m_budgetedHalted = true;
 	}
 	inline void DSP::op_Tcc_S1D1(const TWord op)
 	{

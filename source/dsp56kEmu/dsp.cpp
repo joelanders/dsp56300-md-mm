@@ -151,6 +151,10 @@ namespace dsp56k
 		
 		m_instructions = 0;
 		m_cycles = 0;
+		m_budgetedWait = false;
+		m_budgetedWaitCompletionPending = false;
+		m_budgetedHalted = false;
+		m_budgetedExecutionActive = false;
 		m_jit.resetHW();
 	}
 
@@ -197,6 +201,9 @@ namespace dsp56k
 
 	void DSP::execInterrupt(const TWord vba)
 	{
+		if(m_budgetedExecutionActive)
+			m_budgetedAtomicBoundary = true;
+
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
 
@@ -205,7 +212,7 @@ namespace dsp56k
 			m_debugger->onExec(vba);
 #endif
 
-		if(g_useJIT)
+		if(g_useJIT && !m_budgetedExecutionActive)
 		{
 			LOGJITPC(vba);
 			const auto pc = getPC();
@@ -233,20 +240,20 @@ namespace dsp56k
 
 			execOp(op0);
 
-			const auto jumped = reg.sp.var - oldSP;
+			auto jumped = reg.sp.var - oldSP;
 
-			// only exec the second op if the first one was a one-word op and we did not jump into a long interrupt
+			// Only execute the second vector word when the first one was a one-word
+			// fast instruction. A JSR in either word turns the vector into a long
+			// interrupt, so test the stack after both possible slots.
 			if(m_currentOpLen == 1 && !jumped)
 			{
 				pcCurrentInstruction = vba+1;
 				m_opWordB = 0;
 				execOp(op1);
-
-				// fast interrupt done
-				m_processingMode = DefaultPreventInterrupt;
-				m_interruptFunc = &dspExecDefaultPreventInterrupt;
+				jumped = reg.sp.var - oldSP;
 			}
-			else if(jumped)
+
+			if(jumped)
 			{
 				// Long Interrupt
 
@@ -282,6 +289,163 @@ namespace dsp56k
 			m_interruptFunc = m_execPeripheralsFunc;
 		else
 			m_interruptFunc = &dspExecInterrupts;
+	}
+
+	bool DSP::hasServiceablePendingInterrupt() const
+	{
+		if(m_pendingInterrupts.empty())
+			return false;
+
+		const auto interrupt = m_pendingInterrupts.front();
+		return interrupt >= Vba_End || !isInterruptMasked(interrupt);
+	}
+
+	bool DSP::advanceBudgetedWait(const uint64_t _remainingBudget) noexcept
+	{
+		if(hasServiceablePendingInterrupt())
+		{
+			completeBudgetedWait();
+			return false;
+		}
+
+		auto delay = perif[0]->getTargetClock();
+		if(delay > m_instructions)
+			delay = std::max(delay - m_instructions, static_cast<uint64_t>(PeripheralsProcessingStepSize));
+		else
+			delay = PeripheralsProcessingStepSize;
+
+		const auto advance = std::min(delay, _remainingBudget);
+		m_instructions += advance;
+		m_cycles += advance;
+
+		// Use the normal specialized dispatcher. A budgeted wait visit makes one
+		// bounded peripheral callback attempt before returning control.
+		m_execPeripheralsFunc(this);
+
+		if(!hasServiceablePendingInterrupt())
+			return true;
+
+		completeBudgetedWait();
+		return false;
+	}
+
+	void DSP::completeBudgetedWait() noexcept
+	{
+		// The ordinary interpreter keeps op_Wait on its host stack until a
+		// request exists.  Its execOp accounting and the enclosing DO tail run
+		// only afterwards.  Retain that ordering when the budgeted executor
+		// yields the host instead of blocking it.
+		m_budgetedWait = false;
+		if(m_budgetedWaitCompletionPending)
+		{
+			++m_instructions;
+			if(g_traceSupported)
+				traceOp();
+			finishBudgetedDoBoundary();
+			m_budgetedWaitCompletionPending = false;
+		}
+
+		m_budgetedAtomicBoundary = true;
+		m_interruptFunc = &dspExecInterrupts;
+	}
+
+	bool DSP::executeBudgetedBoundary(const uint64_t _remainingBudget) noexcept
+	{
+		m_budgetedStartedDo = false;
+		m_budgetedAtomicBoundary = false;
+
+		if(m_budgetedWait)
+		{
+			if(advanceBudgetedWait(_remainingBudget))
+				return false;
+
+			// WAIT's delayed execOp completion and any finite-DO tail occur before
+			// the pending request is dispatched, just as in the blocking path.
+			if(m_budgetedAtomicBoundary)
+				return true;
+		}
+
+		m_interruptFunc(this);
+
+		// A hardware vector contains one or two interpreter operations which form
+		// one architectural transaction. Do not fetch interrupted code here.
+		if(m_budgetedAtomicBoundary)
+			return true;
+
+#if DSP56300_DEBUGGER
+		if(m_debugger)
+			m_debugger->onExec(getPC().var);
+#endif
+
+		pcCurrentInstruction = reg.pc.toWord();
+		const auto op = fetchPC();
+		execOp(op);
+		if(!m_budgetedWait)
+			finishBudgetedDoBoundary();
+		return true;
+	}
+
+	DSP::BudgetedExecutionResult DSP::executeBudgetedSlice(const uint64_t _instructionBudget) noexcept
+	{
+		BudgetedExecutionResult result;
+		if(m_budgetedExecutionActive)
+		{
+			result.stop = BudgetedExecutionStop::ReentryDenied;
+			return result;
+		}
+
+		if(m_budgetedHalted)
+		{
+			result.stop = BudgetedExecutionStop::Halted;
+			return result;
+		}
+
+		if(m_budgetedWait && !_instructionBudget)
+		{
+			result.stop = BudgetedExecutionStop::Waiting;
+			return result;
+		}
+
+		if(!_instructionBudget)
+			return result;
+
+		const auto instructionsBefore = m_instructions;
+		const auto cyclesBefore = m_cycles;
+		m_budgetedExecutionActive = true;
+
+		while(m_instructions - instructionsBefore < _instructionBudget)
+		{
+			const auto remaining = _instructionBudget - (m_instructions - instructionsBefore);
+			if(!executeBudgetedBoundary(remaining))
+			{
+				result.stop = m_budgetedWait ? BudgetedExecutionStop::Waiting : BudgetedExecutionStop::BudgetExhausted;
+				break;
+			}
+
+			const auto instructionDelta = m_instructions - instructionsBefore;
+			if(instructionDelta > _instructionBudget && m_budgetedAtomicBoundary)
+			{
+				result.stop = BudgetedExecutionStop::AtomicBudgetOverrun;
+				break;
+			}
+
+			if(m_budgetedWait)
+			{
+				result.stop = BudgetedExecutionStop::Waiting;
+				break;
+			}
+
+			if(m_budgetedHalted)
+			{
+				result.stop = BudgetedExecutionStop::Halted;
+				break;
+			}
+		}
+
+		m_budgetedExecutionActive = false;
+		result.instructionDelta = m_instructions - instructionsBefore;
+		result.cycleCounterDelta = m_cycles - cyclesBefore;
+		return result;
 	}
 
 	void DSP::terminate()
@@ -328,9 +492,10 @@ namespace dsp56k
 		const TWord currentOp = pcCurrentInstruction;
 		const auto& opCache = m_opcodeCache[currentOp];
 
+		m_budgetedOpAlreadyCounted = false;
 		exec_jump(opCache.op, op);
 
-		if(pcCurrentInstruction == currentOp)
+		if(pcCurrentInstruction == currentOp && !m_budgetedOpAlreadyCounted)
 		{
 			++m_instructions;
 
@@ -400,6 +565,10 @@ namespace dsp56k
 		perif[0]->reset();
 		if(perif[1] != perif[0])
 			perif[1]->reset();
+
+		m_budgetedWait = false;
+		m_budgetedWaitCompletionPending = false;
+		m_budgetedHalted = false;
 	}
 
 	void DSP::jsr(const TReg24& _val)
@@ -502,6 +671,13 @@ namespace dsp56k
 
 		traceOp();
 
+		if(m_budgetedExecutionActive)
+		{
+			m_budgetedStartedDo = true;
+			m_budgetedOpAlreadyCounted = true;
+			return true;
+		}
+
 		// __________________
 		//
 
@@ -530,6 +706,22 @@ namespace dsp56k
 		return true;
 	}
 
+	void DSP::finishBudgetedDoBoundary()
+	{
+		if(m_budgetedStartedDo || reg.pc.var != reg.la.var + 1 || !sr_test_noCache(SR_LF))
+			return;
+
+		if(reg.lc.var <= 1)
+		{
+			setPC(reg.la.var + 1);
+			do_end();
+			return;
+		}
+
+		--reg.lc.var;
+		setPC(hiword(reg.ss[ssIndex()]));
+	}
+
 	// _____________________________________________________________________________
 	// exec_do_end
 	//
@@ -551,6 +743,9 @@ namespace dsp56k
 
 	bool DSP::rep_exec(const TWord _loopCount)
 	{
+		if(m_budgetedExecutionActive)
+			m_budgetedAtomicBoundary = true;
+
 		const auto lcBackup = reg.lc;
 		reg.lc.var = _loopCount;
 
@@ -1465,6 +1660,14 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 
 	void DSP::op_Wait(const TWord)
 	{
+		if(m_budgetedExecutionActive)
+		{
+			m_budgetedWait = true;
+			m_budgetedWaitCompletionPending = true;
+			m_budgetedOpAlreadyCounted = true;
+			return;
+		}
+
 		while(m_pendingInterrupts.empty())
 		{
 			auto delay = perif[0]->getTargetClock();

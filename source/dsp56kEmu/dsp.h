@@ -78,6 +78,29 @@ namespace dsp56k
 			StackIndent	= 0x04,
 		};
 
+		// Result of the opt-in interpreter-only executor.  The budget is measured
+		// against the existing instruction counter, not against host calls or DSP
+		// clock cycles: some architectural units (REP and a fast interrupt vector)
+		// deliberately complete atomically and may therefore exceed it.
+		enum class BudgetedExecutionStop
+		{
+			BudgetExhausted,
+			AtomicBudgetOverrun,
+			Waiting,
+			Halted,
+			ReentryDenied,
+		};
+
+		struct BudgetedExecutionResult
+		{
+			uint64_t instructionDelta = 0;
+			// Measured delta of the existing m_cycles counter. It is not an
+			// instruction-cycle prediction: ordinary operations, idle WAIT advance,
+			// and fastForward update that legacy counter differently.
+			uint64_t cycleCounterDelta = 0;
+			BudgetedExecutionStop stop = BudgetedExecutionStop::BudgetExhausted;
+		};
+
 		typedef void (*TInterruptFunc)(DSP*) noexcept;
 
 		static constexpr uint32_t PeripheralsProcessingStepSize = 32;
@@ -105,6 +128,17 @@ namespace dsp56k
 
 		const TJitFunc*					m_jitEntries = nullptr;
 		CCRCache						ccrCache;
+
+		// These are executor control state, deliberately after the complete JIT
+		// member cluster. A finite DO resumes exclusively from PC/LA/LC/SS/SR_LF;
+		// WAIT and STOP are explicit no-successor latches.
+		bool							m_budgetedExecutionActive = false;
+		bool							m_budgetedWait = false;
+		bool							m_budgetedWaitCompletionPending = false;
+		bool							m_budgetedHalted = false;
+		bool							m_budgetedAtomicBoundary = false;
+		bool							m_budgetedStartedDo = false;
+		bool							m_budgetedOpAlreadyCounted = false;
 
 		// The lock-free ring buffer's counters are now atomic (release/acquire), so it is correct on ARM too -
 		// the old #ifdef HAVE_ARM64 workaround that forced the blocking (Lock=true) variant here is gone.
@@ -172,6 +206,9 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void exec() noexcept
 		{
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+				return;
+
 			if(g_useJIT)
 				execJit();
 			else
@@ -180,6 +217,9 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void execJit() noexcept
 		{
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+				return;
+
 			m_interruptFunc(this);
 
 			const auto pc = getPC().toWord();
@@ -189,6 +229,9 @@ namespace dsp56k
 
 		ASMJIT_FORCE_INLINE void execInterpreter() noexcept
 		{
+			if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+				return;
+
 			m_interruptFunc(this);
 
 #if DSP56300_DEBUGGER
@@ -202,6 +245,19 @@ namespace dsp56k
 
 			execOp(op);
 		}
+
+		// Executes up to _instructionBudget worth of normal interpreter boundaries.
+		// It never selects JIT. REP and a hardware interrupt vector remain atomic;
+		// a result can report their honest counter overrun rather than interrupting
+		// them. STOP is an explicit reset-only V1 halt (external requests do not
+		// wake it). A parked WAIT reports Waiting even for a zero budget; otherwise
+		// a zero budget performs no work.
+		//
+		// This is a single-owner API: callers must not invoke it concurrently.
+		// Peripheral/custom callbacks may consume unbounded wall time and must not
+		// re-enter, reset, or otherwise mutate this DSP while it is executing.
+		// ReentryDenied only protects recursive executeBudgetedSlice calls.
+		BudgetedExecutionResult executeBudgetedSlice(uint64_t _instructionBudget) noexcept;
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
 		{
@@ -374,6 +430,11 @@ namespace dsp56k
 		bool	exec_parallel					(const TInstructionFunc& _instMove, const TInstructionFunc& _instAlu, TWord _op);
 
 		bool	do_exec							( TWord _loopcount, TWord _addr );
+		void	finishBudgetedDoBoundary			();
+		bool	executeBudgetedBoundary			(uint64_t _remainingBudget) noexcept;
+		bool	advanceBudgetedWait				(uint64_t _remainingBudget) noexcept;
+		void	completeBudgetedWait				() noexcept;
+		bool	hasServiceablePendingInterrupt		() const;
 		bool	do_end							();
 
 		bool	rep_exec						(TWord _loopCount);
