@@ -11,6 +11,7 @@
 #include "types.h"
 #include <array>
 #include <atomic>
+#include <limits>
 
 namespace dsp56k
 {
@@ -108,6 +109,7 @@ namespace dsp56k
 		virtual const TWord* readAsPtr(TWord _addr, Instruction _inst) = 0;
 		virtual void write(TWord _addr, TWord _value) = 0;
 		virtual void reset() = 0;
+		virtual void rebaseScheduler();
 		virtual void setSymbols(Disassembler& _disasm) const = 0;
 		virtual void terminate() = 0;
 
@@ -122,12 +124,48 @@ namespace dsp56k
 		uint32_t getDelayCycles() const { return m_delayCycles.load(std::memory_order_relaxed); }
 		auto getTargetClock() const { return m_targetClock.load(std::memory_order_relaxed); }
 
+		void resetCycleDelay(const uint64_t _cycleCount, const uint32_t _delayCycles) noexcept
+		{
+			m_targetCycleClock.store(_cycleCount + _delayCycles, std::memory_order_relaxed);
+			m_hasCycleDelay.store(true, std::memory_order_relaxed);
+		}
+
+		void disableCycleDelay() noexcept
+		{
+			m_hasCycleDelay.store(false, std::memory_order_relaxed);
+		}
+
+		bool hasCycleDelay() const noexcept { return m_hasCycleDelay.load(std::memory_order_relaxed); }
+		uint64_t getTargetCycleClock() const noexcept { return m_targetCycleClock.load(std::memory_order_relaxed); }
+		bool isDue(const uint64_t _instructions, const uint64_t _cycles) const noexcept
+		{
+			return remainingToDeadline(_instructions, getTargetClock()) == 0
+				|| (hasCycleDelay() && remainingToDeadline(_cycles, getTargetCycleClock()) == 0);
+		}
+
+		// Published delays are uint32, hence strictly below the uint64 half range.
+		// Unsigned subtraction therefore gives an unambiguous modular-wrap test
+		// without relying on implementation-defined unsigned-to-signed conversion.
+		static uint32_t remainingToDeadline(const uint64_t _clock, const uint64_t _target) noexcept
+		{
+			static_assert(std::numeric_limits<uint32_t>::max() < (uint64_t{1} << 63));
+			const auto elapsed = _clock - _target;
+			if(elapsed < (uint64_t{1} << 63))
+				return 0;
+			return static_cast<uint32_t>(_target - _clock);
+		}
+
 		auto getType() const { return m_type; }
 
 	private:
 		DSP* m_dsp = nullptr;
 		std::atomic<uint32_t> m_delayCycles{0};		// advisory pacing hint, read cross-thread by DSP exec
 		std::atomic<uint64_t> m_targetClock{0};
+		// Exact-cycle configuration and publication are single-owner with DSP
+		// execution. Relaxed atomics only keep incidental reads torn-free; they do
+		// not make clock reconfiguration concurrent or callback-safe.
+		std::atomic<uint64_t> m_targetCycleClock{0};
+		std::atomic<bool> m_hasCycleDelay{false};
 		PeripheralType m_type;
 	};
 
@@ -165,6 +203,7 @@ namespace dsp56k
 
 		uint32_t exec() noexcept;
 		void reset() override;
+		void rebaseScheduler() override { m_essiClock.restartClock(); }
 
 		void setDSP(DSP* _dsp) override
 		{
@@ -221,6 +260,7 @@ namespace dsp56k
 
 		uint32_t exec() noexcept;
 		void reset() override;
+		void rebaseScheduler() override { m_esaiClock.restartClock(); }
 
 		EsaiClock& getEsaiClock()		{ return m_esaiClock; }
 		Esai& getEsai()					{ return m_esai; }

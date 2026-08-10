@@ -152,6 +152,9 @@ namespace dsp56k
 		
 		m_instructions = 0;
 		m_cycles = 0;
+		perif[0]->rebaseScheduler();
+		if(perif[1] != perif[0])
+			perif[1]->rebaseScheduler();
 		m_budgetedWait = false;
 		m_budgetedWaitCompletionPending = false;
 		m_budgetedHalted = false;
@@ -314,11 +317,16 @@ namespace dsp56k
 			return false;
 		}
 
-		auto delay = perif[0]->getTargetClock();
-		if(delay > m_instructions)
-			delay = std::max(delay - m_instructions, static_cast<uint64_t>(PeripheralsProcessingStepSize));
-		else
-			delay = PeripheralsProcessingStepSize;
+		const auto delay = getWaitPeripheralAdvance();
+		if(!delay)
+		{
+			// In exact cycle mode a due deadline is serviced before idle time moves.
+			m_execPeripheralsFunc(this);
+			if(!hasServiceablePendingInterrupt())
+				return true;
+			completeBudgetedWait();
+			return false;
+		}
 
 		const auto advance = std::min(delay, _remainingBudget);
 		m_instructions += advance;
@@ -333,6 +341,24 @@ namespace dsp56k
 
 		completeBudgetedWait();
 		return false;
+	}
+
+	uint64_t DSP::getWaitPeripheralAdvance() const noexcept
+	{
+		const auto instructionTarget = perif[0]->getTargetClock();
+		if(!perif[0]->hasCycleDelay())
+		{
+			const auto remaining = IPeripherals::remainingToDeadline(m_instructions, instructionTarget);
+			if(remaining)
+				return std::max(static_cast<uint64_t>(remaining),
+					static_cast<uint64_t>(PeripheralsProcessingStepSize));
+			return PeripheralsProcessingStepSize;
+		}
+
+		const auto instructionRemaining = IPeripherals::remainingToDeadline(m_instructions, instructionTarget);
+		const auto cycleTarget = perif[0]->getTargetCycleClock();
+		const auto cycleRemaining = IPeripherals::remainingToDeadline(m_cycles, cycleTarget);
+		return std::min(instructionRemaining, cycleRemaining);
 	}
 
 	void DSP::completeBudgetedWait() noexcept
@@ -817,6 +843,9 @@ namespace dsp56k
 		perif[0]->reset();
 		if(perif[1] != perif[0])
 			perif[1]->reset();
+		perif[0]->rebaseScheduler();
+		if(perif[1] != perif[0])
+			perif[1]->rebaseScheduler();
 
 		m_budgetedWait = false;
 		m_budgetedWaitCompletionPending = false;
@@ -1947,12 +1976,12 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 
 		while(m_pendingInterrupts.empty())
 		{
-			auto delay = perif[0]->getTargetClock();
-
-			if (delay > m_instructions)
-				delay = std::max(delay - m_instructions, static_cast<uint64_t>(PeripheralsProcessingStepSize));
-			else
-				delay = PeripheralsProcessingStepSize;
+			const auto delay = getWaitPeripheralAdvance();
+			if(!delay)
+			{
+				m_execPeripheralsFunc(this);
+				continue;
+			}
 
 //			LOG("Delay " << delay);
 			m_instructions += delay;

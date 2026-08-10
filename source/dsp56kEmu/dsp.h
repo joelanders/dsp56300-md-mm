@@ -329,7 +329,7 @@ namespace dsp56k
 		{
 			// this is a super hot function and for some reason the compiler insists of doing all the stack frame work
 			// before this early out. To fix this, we move the remaining code into a helper func below, marked as noinline
-			if (ASMJIT_LIKELY(perif[0]->getTargetClock() > m_instructions))
+			if (ASMJIT_LIKELY(!perif[0]->isDue(m_instructions, m_cycles)))
 				return;
 
 			execPeripherals<Ta, Tb>();
@@ -349,10 +349,7 @@ namespace dsp56k
 
 		uint32_t getRemainingPeripheralsCycles() const
 		{
-			const auto targetCycles = perif[0]->getTargetClock();
-			if(m_instructions > targetCycles)
-				return 0;
-			return static_cast<uint32_t>(targetCycles - m_instructions);
+			return IPeripherals::remainingToDeadline(m_instructions, perif[0]->getTargetClock());
 		}
 
 		void	execInterrupts					();
@@ -503,6 +500,7 @@ namespace dsp56k
 		bool	executeBudgetedBoundary			(uint64_t _remainingBudget) noexcept;
 		bool	executePacedJitBoundary			(uint64_t _configGeneration) noexcept;
 		bool	advanceBudgetedWait				(uint64_t _remainingBudget) noexcept;
+		uint64_t getWaitPeripheralAdvance		() const noexcept;
 		void	completeBudgetedWait				() noexcept;
 		bool	hasServiceablePendingInterrupt		() const;
 		bool	isPacedJitConfigurationOwned		() const;

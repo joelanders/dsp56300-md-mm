@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <vector>
 
 #include "types.h"
@@ -40,8 +41,12 @@ namespace dsp56k
 		void setEsaiDivider(Esxi* _esai, TWord _dividerTX, TWord _dividerRX);
 		// A non-zero period schedules this serial interface independently of the
 		// audio base period, measured against the selected clock counter. Setting
-		// zero restores base-period scheduling. Returned delays are advisory
-		// instruction-boundary deadlines, not exact-cycle guarantees.
+		// zero restores base-period scheduling. When exact cycle scheduling is
+		// explicitly enabled, its deadline is kept separate from the instruction-
+		// domain HDI/timer/DMA pacing deadline. The bounded interpreter and paced
+		// JIT observe it at architectural boundaries; ordinary performance JIT
+		// observes it only at its existing block boundaries. Without this opt-in,
+		// ClockSource::Cycles retains its legacy advisory heuristic.
 		void setEsaiFinePeriod(Esxi* _esai, uint32_t _finePeriod);
 		bool setEsaiCounter(const Esxi* _esai, int _counter)
 		{
@@ -55,12 +60,26 @@ namespace dsp56k
 		auto getSpeedPercent() const		{ return m_speedPercent; }
 
 		void setDSP(const DSP* _dsp);
+		// Clock configuration is single-owner. Do not change it concurrently with
+		// DSP execution or from a serial/peripheral callback. It does not alter JIT
+		// configuration or claim callback-order parity for ordinary multi-op JIT.
 		void setClockSource(ClockSource _clockSource);
+		void setExactCycleScheduling(bool _enabled);
+		bool usesExactCycleScheduling() const
+		{
+			return m_exactCycleScheduling && m_clockSource == ClockSource::Cycles;
+		}
 
 		void restartClock();
+		void refreshExactCycleDeadline();
 
 		TWord getRemainingInstructionsForFrameSync() const;
 		uint32_t getCyclesPerSample() const { return m_cyclesPerSample; }
+		uint32_t getEffectiveCyclesPerSample() const
+		{
+			return usesExactCycleScheduling() ? std::max(m_cyclesPerSample, 1u) : m_cyclesPerSample;
+		}
+		ClockSource getClockSource() const { return m_clockSource; }
 
 	protected:
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }
@@ -70,14 +89,17 @@ namespace dsp56k
 
 	private:
 		void setClockSource(const DSP* _dsp, ClockSource _clockSource);
+		void requestProcessing();
 
 		void updateCyclesPerSample();
 
 		const uint64_t* m_dspInstructionCounter = nullptr;
 		uint64_t m_lastClock = 0;
 		uint32_t m_cyclesPerSample = 2133;				// estimated cycles per sample before calculated
+		uint32_t m_nextCycleDelay = 0;
 
 		ClockSource m_clockSource = ClockSource::Instructions;
+		bool m_exactCycleScheduling = false;
 
 		IPeripherals& m_periph;
 

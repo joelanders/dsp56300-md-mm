@@ -7,6 +7,12 @@
 
 namespace dsp56k
 {
+	void IPeripherals::rebaseScheduler()
+	{
+		resetDelayCycles(m_dsp->getInstructionCounter(), 0);
+		disableCycleDelay();
+	}
+
 	namespace
 	{
 		void setSymbolsX(Disassembler& _disasm)
@@ -365,6 +371,7 @@ namespace dsp56k
 		delay = std::min(delay, m_hi08.exec());
 		delay = std::min(delay, m_timers.exec());
 		delay = std::min(delay, m_dma.exec());
+		m_essiClock.refreshExactCycleDeadline();
 		return delay;
 	}
 
@@ -691,6 +698,7 @@ namespace dsp56k
 		if (!m_disableTimers)
 			delay = std::min(delay, m_timers.exec());
 		delay = std::min(delay, m_dma.exec());
+		m_esaiClock.refreshExactCycleDeadline();
 		return delay;
 	}
 

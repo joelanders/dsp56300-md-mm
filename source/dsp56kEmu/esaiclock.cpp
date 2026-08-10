@@ -18,8 +18,19 @@ namespace dsp56k
 	uint32_t EsxiClock::exec() noexcept
 	{
 		const auto now = *m_dspInstructionCounter;
+		const auto period = getEffectiveCyclesPerSample();
+		auto finish = [this](const uint32_t _delay)
+		{
+			if(usesExactCycleScheduling())
+			{
+				m_nextCycleDelay = _delay;
+				return IPeripherals::MaxDelayCycles;
+			}
+			m_periph.disableCycleDelay();
+			return _delay >> static_cast<uint32_t>(m_clockSource);
+		};
 		const auto diff = now - m_lastClock;
-		uint32_t fineDelay = m_cyclesPerSample;
+		uint32_t fineDelay = period;
 
 		if(m_hasFineEsais)
 		{
@@ -51,10 +62,10 @@ namespace dsp56k
 			}
 		}
 
-		if(diff < m_cyclesPerSample)
-			return std::min(fineDelay, static_cast<uint32_t>(m_cyclesPerSample - diff)) >> static_cast<uint32_t>(m_clockSource);	// see explanation at end of this func
+		if(diff < period)
+			return finish(std::min(fineDelay, static_cast<uint32_t>(period - diff)));
 
-		m_lastClock += m_cyclesPerSample;
+		m_lastClock += period;
 
 		auto advanceClock = [](Clock& _c)
 		{
@@ -89,16 +100,18 @@ namespace dsp56k
 		for(size_t i=0; i<txCount; ++i) processTx[i]->execTX();
 		for(size_t i=0; i<rxCount; ++i) processRx[i]->execRX();
 
-		if(diff >= (m_cyclesPerSample<<1))
-			return 0;
+		if(diff >= (period<<1))
+			return finish(0);
 
-		const auto delay = static_cast<uint32_t>((m_cyclesPerSample << 1) - diff);
+		const auto delay = static_cast<uint32_t>((period << 1) - diff);
 
-		// if the clock source is not instructions but cycles, we will miss frames if we return the cycle delay here because
-		// peripherals are processed via instruction counts. Return only half of the cycles in this case
-		static_assert(static_cast<uint32_t>(ClockSource::Instructions) == 0);
-		static_assert(static_cast<uint32_t>(ClockSource::Cycles) == 1);
-		return std::min(fineDelay, delay) >> static_cast<uint32_t>(m_clockSource);
+		return finish(std::min(fineDelay, delay));
+	}
+
+	void EsxiClock::refreshExactCycleDeadline()
+	{
+		if(usesExactCycleScheduling())
+			m_periph.resetCycleDelay(m_periph.getDSP().getCycles(), m_nextCycleDelay);
 	}
 
 	void EsxiClock::setPCTL(const TWord _val)
@@ -153,11 +166,18 @@ namespace dsp56k
 	void EsxiClock::restartClock()
 	{
 		m_lastClock = *m_dspInstructionCounter;
-		m_periph.setDelayCycles(0);
+		for(auto& entry : m_esais)
+			entry.fineLastClock = m_lastClock;
+		requestProcessing();
 	}
 
 	TWord EsxiClock::getRemainingInstructionsForFrameSync() const
 	{
+		// The JIT shortcut advances instructions and cycles 1:1. It is not an
+		// exact representation of a multi-cycle instruction stream.
+		if(usesExactCycleScheduling())
+			return 0;
+
 		constexpr TWord offset = 1;
 
 		const auto cyclesSinceWrite = getDspInstructionCounter() - getLastClock();
@@ -177,16 +197,42 @@ namespace dsp56k
 
 	void EsxiClock::setClockSource(const DSP* _dsp, const ClockSource _clockSource)
 	{
+		const uint64_t* nextCounter = nullptr;
 		switch (_clockSource)
 		{
 		case ClockSource::Instructions:
-			m_dspInstructionCounter = &_dsp->getInstructionCounter();
+			nextCounter = &_dsp->getInstructionCounter();
 			break;
 		case ClockSource::Cycles:
-			m_dspInstructionCounter = &_dsp->getCycles();
+			nextCounter = &_dsp->getCycles();
 			break;
 		}
+		if(m_dspInstructionCounter == nextCounter && m_clockSource == _clockSource)
+			return;
+		m_dspInstructionCounter = nextCounter;
 		m_clockSource = _clockSource;
+		// Counters from different domains cannot share phase anchors or deadlines.
+		restartClock();
+	}
+
+	void EsxiClock::setExactCycleScheduling(const bool _enabled)
+	{
+		if(m_exactCycleScheduling == _enabled)
+			return;
+		m_exactCycleScheduling = _enabled;
+		// Do not carry advisory-domain phase or deadlines into or out of exact mode.
+		restartClock();
+	}
+
+	void EsxiClock::requestProcessing()
+	{
+		if(!m_periph.hasDSP())
+			return;
+		if(usesExactCycleScheduling())
+			m_periph.resetCycleDelay(*m_dspInstructionCounter, 0);
+		else
+			m_periph.disableCycleDelay();
+		m_periph.setDelayCycles(0);
 	}
 
 	void EsxiClock::updateCyclesPerSample()
@@ -226,7 +272,7 @@ namespace dsp56k
 
 		m_cyclesPerSample = cyclesPerSample;
 		m_lastClock = *m_dspInstructionCounter;
-		m_periph.setDelayCycles(0);
+		requestProcessing();
 	}
 	void EsxiClock::setEsaiDivider(Esxi* _esai, const TWord _dividerTX, const TWord _dividerRX)
 	{
@@ -252,7 +298,7 @@ namespace dsp56k
 		}
 
 		if(m_periph.hasDSP())
-			m_periph.setDelayCycles(0);
+			requestProcessing();
 	}
 
 	void EsxiClock::setEsaiFinePeriod(Esxi* _esai, const uint32_t _finePeriod)
@@ -278,7 +324,7 @@ namespace dsp56k
 		for(const auto& entry : m_esais)
 			m_hasFineEsais = m_hasFineEsais || entry.finePeriod != 0;
 		if(m_periph.hasDSP())
-			m_periph.setDelayCycles(0);
+			requestProcessing();
 	}
 
 	bool EsxiClock::setEsaiCounter(const Esxi* _esai, const int _counterTX, const int _counterRX)

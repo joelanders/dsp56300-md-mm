@@ -7,6 +7,8 @@ namespace dsp56k
 {
 	void skipToFrameSync(DSP* _dsp, TWord _instructions)
 	{
+		if(_dsp->isPacedJitExecutionActive())
+			return;
 //		m_block.increaseInstructionCount(r32(count));
 		// TODO: we should increase by the cycle count here, but as the custom peripheral func still works on instructions, we need to use 1 for now
 //		const auto cycles = dsp56k::calcCycles(Inst, m_pcCurrentOp, op, m_block.dsp().memory().getBridgedMemoryAddress(), 1);
