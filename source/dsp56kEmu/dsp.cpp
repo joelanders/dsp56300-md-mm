@@ -185,7 +185,7 @@ namespace dsp56k
 			return;
 		}
 
-		const auto vba = interrupt;
+		const auto vba = interrupt.vector;
 
 		if(isInterruptMasked(vba))
 		{
@@ -202,10 +202,10 @@ namespace dsp56k
 			m_pendingInterrupts.pop_front();
 		}
 
-		execInterrupt(vba);
+		execInterrupt(vba, interrupt.token);
 	}
 
-	void DSP::execInterrupt(const TWord vba)
+	void DSP::execInterrupt(const TWord vba, const uint64_t token)
 	{
 		if(m_budgetedExecutionActive)
 			m_budgetedAtomicBoundary = true;
@@ -214,6 +214,8 @@ namespace dsp56k
 
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
+		if(m_interruptServicedCallback)
+			m_interruptServicedCallback(vba, token);
 
 #if DSP56300_DEBUGGER
 		if(m_debugger)
@@ -1767,13 +1769,59 @@ namespace dsp56k
 	void DSP::injectExternalInterrupt(const TWord _vba)
 	{
 		m_pendingExternalInterrupts.waitNotFull();
-		m_pendingExternalInterrupts.push_back(_vba);
+		m_pendingExternalInterrupts.push_back({_vba, 0});
+	}
+
+	bool DSP::tryInjectExternalInterrupt(const TWord _vba,
+		ExternalInterruptToken& _token) noexcept
+	{
+		if(m_pendingExternalInterrupts.full())
+			return false;
+		if(m_nextExternalInterruptToken == 0)
+			++m_nextExternalInterruptToken;
+		_token = m_nextExternalInterruptToken++;
+		m_pendingExternalInterrupts.push_back({_vba, _token});
+		return true;
+	}
+
+	bool DSP::cancelExternalInterrupt(const ExternalInterruptToken _token) noexcept
+	{
+		if(_token == 0)
+			return false;
+		bool removed = false;
+		auto removeFrom = [_token, &removed](auto& _queue, auto& _retained)
+		{
+			size_t retainedCount = 0;
+			while(!_queue.empty())
+			{
+				auto request = _queue.pop_front();
+				if(!removed && request.token == _token)
+				{
+					removed = true;
+					continue;
+				}
+				_retained[retainedCount++] = request;
+			}
+			for(size_t i = 0; i < retainedCount; ++i)
+				_queue.push_back(_retained[i]);
+		};
+		std::array<PendingInterrupt, 32> external{};
+		removeFrom(m_pendingExternalInterrupts, external);
+		std::array<PendingInterrupt, 1024> pending{};
+		removeFrom(m_pendingInterrupts, pending);
+		if(m_pendingInterrupts.empty() && m_processingMode == Default)
+			m_interruptFunc = m_execPeripheralsFunc;
+		return removed;
 	}
 
 	void DSP::processExternalInterrupts()
 	{
-		while(!m_pendingExternalInterrupts.empty())
-			injectInterrupt(m_pendingExternalInterrupts.pop_front());
+		while(!m_pendingExternalInterrupts.empty() && !m_pendingInterrupts.full())
+		{
+			m_pendingInterrupts.push_back(m_pendingExternalInterrupts.pop_front());
+			if(m_interruptFunc == m_execPeripheralsFunc)
+				m_interruptFunc = &dspExecInterrupts;
+		}
 	}
 
 	void DSP::clearOpcodeCache()

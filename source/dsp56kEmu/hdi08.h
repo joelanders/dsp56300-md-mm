@@ -63,6 +63,22 @@ namespace dsp56k
 		using CallbackRx = std::function<void()>;
 		using CallbackHostStateChanged = std::function<void()>;
 
+		enum class HostTxRetention
+		{
+			Legacy,
+			SingleRegister,
+			BoundedFifo,
+		};
+
+		enum class HostCommandAdmission
+		{
+			Accepted,
+			Disabled,
+			Busy,
+			InterruptQueueFull,
+			InvalidVector,
+		};
+
 		TWord readStatusRegister();
 
 		TWord readControlRegister() const
@@ -87,7 +103,12 @@ namespace dsp56k
 			return !m_dataTX.empty();
 		}
 		TWord readTX();
+		bool tryReadTX(TWord& _word) noexcept;
 		void writeTX(TWord _val);
+		size_t txWordsAvailable() const { return m_dataTX.size(); }
+		// Quiescent owner reset. As with readTX(), HTDE is recomputed by the
+		// next peripheral service after this wakes it.
+		void clearTX();
 
 		uint32_t exec() noexcept;
 
@@ -95,7 +116,10 @@ namespace dsp56k
 
 		void writeRX(const std::vector<TWord>& _data)		{ writeRX(_data.data(), _data.size()); }
 		void writeRX(const TWord* _data, size_t _count);
+		bool tryWriteRX(TWord _word) noexcept;
 		void clearRX();
+		size_t rxWordsAvailable() const { return m_dataRX.size(); }
+		size_t rxWordsFree() const { return m_dataRX.remaining(); }
 
 		const auto& rxData() const { return m_dataRX; }
 		const auto& txData() const { return m_dataTX; }
@@ -134,6 +158,39 @@ namespace dsp56k
 			m_transmitDataAlwaysEmpty = _alwaysEmpty;
 		}
 
+		// One-time, quiescent opt-in host retention policy. The default Legacy state
+		// preserves pre-existing behavior; bounded modes never wait at capacity.
+		// BoundedFifo retains the ring's SPSC contract. SingleRegister overwrite and
+		// host reads must instead be serialized by one execution owner.
+		bool configureHostTxRetention(HostTxRetention _retention, size_t _limit = 1) noexcept;
+		HostTxRetention hostTxRetention() const { return m_hostTxRetention; }
+		size_t hostTxAdmissionLimit() const { return m_hostTxAdmissionLimit; }
+		size_t hostTxOverflowCount() const
+		{
+			return m_hostTxOverflowCount.load(std::memory_order_acquire);
+		}
+		bool hostTxBackpressured() const
+		{
+			return m_hostTxRetention == HostTxRetention::BoundedFifo
+				&& m_dataTX.size() >= m_hostTxAdmissionLimit;
+		}
+
+		// Opt-in, single-owner native host-command seam. A command raises HCP,
+		// prevents serviceable mainline HORX consumption, and enters through the
+		// ordinary external-interrupt FIFO. HCP clears at exact vector dispatch.
+		// Admission, HCR writes, DSP execution, cancellation, and reset are serialized
+		// by one execution owner. Disabling while pending fails.
+		bool setNativeHostCommandsEnabled(bool _enabled);
+		bool nativeHostCommandsEnabled() const { return m_nativeHostCommands; }
+		HostCommandAdmission tryWriteHostCommand(TWord _vba) noexcept;
+		// Quiescent reset helper. Removes this command by its exact DSP queue token,
+		// even after it moved from the external FIFO into the core pending FIFO.
+		bool cancelPendingHostCommand() noexcept;
+		bool hostCommandPending() const
+		{
+			return m_hostCommandPending;
+		}
+
 		static void setSymbols(Disassembler& _disasm);
 
 		void injectTXInterrupt();
@@ -166,6 +223,9 @@ namespace dsp56k
 				m_callbackRx = [] {};
 		}
 
+		// Synchronous wake notification only. The callback must not re-enter HCR,
+		// command, reset, or transport configuration; owners inspect/service state
+		// after the current architectural boundary has completed.
 		void setHostStateChangedCallback(const CallbackHostStateChanged& _callback)
 		{
 			m_callbackHostStateChanged = _callback;
@@ -175,6 +235,11 @@ namespace dsp56k
 		}
 
 	private:
+		bool hostCommandHoldActive() const;
+		bool publishPendingHostCommand() noexcept;
+		bool unpublishPendingHostCommand() noexcept;
+		void onInterruptServiced(TWord _vba, uint64_t _token) noexcept;
+		TWord popTX();
 		bool dmaTriggerReceive() const;
 		bool dmaTriggerTransmit() const;
 		bool hasDmaReceiveTrigger() const;
@@ -190,12 +255,22 @@ namespace dsp56k
 		TWord m_hdr = 0;
 		TWord m_hddr = 0;
 		bool m_transmitDataAlwaysEmpty = true;
+		HostTxRetention m_hostTxRetention = HostTxRetention::Legacy;
+		size_t m_hostTxAdmissionLimit = 8192;
+		std::atomic<size_t> m_hostTxOverflowCount{0};
 		CallbackTx m_callbackTx;
 		CallbackRx m_callbackRx = [] {};
 		CallbackHostStateChanged m_callbackHostStateChanged = [] {};
 		uint32_t m_rxRateLimit;		// minimum number of instructions between two RX interrupts
 		bool m_waitServeRXInterrupt = false;
 		std::atomic<int32_t> m_pendingHostFlags01{-1};	// pulse latch: UC/queue thread sets, DSP thread reads+clears
+		bool m_nativeHostCommands = false;
+		bool m_hostCommandPending = false;
+		bool m_hostCommandPublished = false;
+		mutable bool m_hostCommandPayloadHold = false;
+		TWord m_hostCommandVba = 0;
+		uint64_t m_hostCommandToken = 0;
+		TWord m_lastRXValue = 0;
 
 		DmaChannel::RequestSource m_dmaReqSourceReceive;
 		DmaChannel::RequestSource m_dmaReqSourceTransmit;

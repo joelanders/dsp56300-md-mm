@@ -2,6 +2,8 @@
 #include "interrupts.h"
 #include "hdi08.h"
 
+#include <cassert>
+
 namespace dsp56k
 {
 	bool is56303(IPeripherals& _peripherals)
@@ -30,10 +32,131 @@ namespace dsp56k
 	{
 	}
 
+	bool HDI08::hostCommandHoldActive() const
+	{
+		if(!m_nativeHostCommands || !hostCommandPending()
+			|| !dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire)))
+			return false;
+		const auto& dsp = m_periph.getDSP();
+		if(!m_hostCommandPayloadHold
+			&& (dsp.getProcessingMode() != DSP::Default
+				|| !dsp.isInterruptMasked(m_hostCommandVba)))
+			m_hostCommandPayloadHold = true;
+		return m_hostCommandPayloadHold;
+	}
+
+	bool HDI08::setNativeHostCommandsEnabled(const bool _enabled)
+	{
+		if(m_nativeHostCommands == _enabled)
+			return true;
+		if(hostCommandPending())
+			return false;
+
+		auto& dsp = m_periph.getDSP();
+		if(_enabled)
+		{
+			if(!dsp.setInterruptServicedCallback(this,
+				[this](const TWord _vba, const DSP::ExternalInterruptToken _token)
+				{
+					onInterruptServiced(_vba, _token);
+				}))
+				return false;
+		}
+		else
+		{
+			if(!dsp.clearInterruptServicedCallback(this))
+				return false;
+			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, 0);
+		}
+		m_nativeHostCommands = _enabled;
+		return true;
+	}
+
+	HDI08::HostCommandAdmission HDI08::tryWriteHostCommand(const TWord _vba) noexcept
+	{
+		if(!m_nativeHostCommands)
+			return HostCommandAdmission::Disabled;
+		if((_vba & 1) != 0 || _vba >= Vba_End)
+			return HostCommandAdmission::InvalidVector;
+		if(hostCommandPending())
+			return HostCommandAdmission::Busy;
+
+		m_hostCommandVba = _vba;
+		m_hostCommandPending = true;
+		m_hostCommandPayloadHold = false;
+		if(dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire))
+			&& !publishPendingHostCommand())
+		{
+			m_hostCommandPending = false;
+			m_hostCommandPayloadHold = false;
+			m_periph.setDelayCycles(0);
+			return HostCommandAdmission::InterruptQueueFull;
+		}
+		m_periph.setDelayCycles(0);
+		return HostCommandAdmission::Accepted;
+	}
+
+	bool HDI08::publishPendingHostCommand() noexcept
+	{
+		if(!hostCommandPending())
+			return true;
+		if(m_hostCommandPublished)
+			return true;
+		DSP::ExternalInterruptToken token = 0;
+		if(!m_periph.getDSP().tryInjectExternalInterrupt(m_hostCommandVba, token))
+			return false;
+		m_hostCommandToken = token;
+		m_hostCommandPublished = true;
+		return true;
+	}
+
+	bool HDI08::cancelPendingHostCommand() noexcept
+	{
+		if(!hostCommandPending())
+			return false;
+		if(!unpublishPendingHostCommand())
+			return false;
+		m_hostCommandPending = false;
+		m_hostCommandPayloadHold = false;
+		return true;
+	}
+
+	bool HDI08::unpublishPendingHostCommand() noexcept
+	{
+		if(!m_hostCommandPublished)
+			return true;
+		if(!m_periph.getDSP().cancelExternalInterrupt(m_hostCommandToken))
+			return false;
+		m_hostCommandPublished = false;
+		m_hostCommandToken = 0;
+		return true;
+	}
+
+	void HDI08::onInterruptServiced(const TWord _vba,
+		const uint64_t _token) noexcept
+	{
+		(void)hostCommandHoldActive();
+		if(!hostCommandPending()
+			|| !m_hostCommandPublished)
+			return;
+		const auto expectedToken = m_hostCommandToken;
+		if(expectedToken == 0
+			|| _vba != m_hostCommandVba
+			|| _token != expectedToken)
+			return;
+		m_hostCommandPending = false;
+		m_hostCommandPublished = false;
+		m_hostCommandPayloadHold = false;
+		m_hostCommandToken = 0;
+	}
+
 	TWord HDI08::readStatusRegister()
 	{
 		// Toggle HDI8 "Receive Data Full" bit
-		dsp56k::bitset<TWord, HSR_HRDF>(m_hsr, m_dataRX.empty() ? 0 : 1);
+		dsp56k::bitset<TWord, HSR_HRDF>(m_hsr,
+			m_dataRX.empty() || hostCommandHoldActive() ? 0 : 1);
+		if(m_nativeHostCommands)
+			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, hostCommandPending() ? 1 : 0);
 
 		// Apply pending host flags, if applicable
 		const auto hf01 = m_pendingHostFlags01.load(std::memory_order_acquire);
@@ -53,6 +176,10 @@ namespace dsp56k
 
 	uint32_t HDI08::exec() noexcept
 	{
+		if(m_nativeHostCommands && hostCommandPending()
+			&& dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire))
+			&& !publishPendingHostCommand())
+			return 0;
 		if (!bittest(m_hpcr, HPCR_HEN)) 
 			return IPeripherals::MaxDelayCycles;
 
@@ -118,6 +245,8 @@ namespace dsp56k
 	TWord HDI08::readRX(const Instruction _inst)
 	{
 		m_periph.setDelayCycles(0);
+		if(hostCommandHoldActive())
+			return m_lastRXValue;
 
 		if (m_dataRX.empty())
 		{
@@ -145,6 +274,7 @@ namespace dsp56k
 //			LOG("HDI08 RX = " << HEX(res) << " (pop)");
 			break;
 		}
+		m_lastRXValue = res;
 
 		return res;
 	}
@@ -159,6 +289,15 @@ namespace dsp56k
 			m_dataRX.push_back(d);
 		}
 		m_periph.setDelayCycles(0);
+	}
+
+	bool HDI08::tryWriteRX(const TWord _word) noexcept
+	{
+		if(m_dataRX.full())
+			return false;
+		m_dataRX.push_back(_word & 0x00ffffff);
+		m_periph.setDelayCycles(0);
+		return true;
 	}
 
 	void HDI08::clearRX()
@@ -206,11 +345,23 @@ namespace dsp56k
 
 	void HDI08::reset()
 	{
+		const auto hostCommandCancelled = !hostCommandPending()
+			|| cancelPendingHostCommand();
+		assert(hostCommandCancelled
+			&& "HDI08 reset requires quiescent ownership of its published host command");
+		if(!hostCommandCancelled)
+			return;
 		m_hcr.store(0, std::memory_order_relaxed);
 		m_hpcr = 0;
 		m_hsr = 0;
 		bitset<TWord, HSR_HTDE>(m_hsr, 1);
 		m_hddr = 0;
+		m_hostCommandPending = false;
+		m_hostCommandPublished = false;
+		m_hostCommandPayloadHold = false;
+		m_hostCommandVba = 0;
+		m_hostCommandToken = 0;
+		m_lastRXValue = 0;
 		// m_hdr is not affected by reset
 	}
 
@@ -297,20 +448,70 @@ namespace dsp56k
 		++m_pendingTXInterrupts;
 	}
 
-	uint32_t HDI08::readTX()
+	TWord HDI08::popTX()
 	{
-		m_dataTX.waitNotEmpty();
 		if(!m_transmitDataAlwaysEmpty)
 			m_periph.setDelayCycles(0);
 		return m_dataTX.pop_front();
 	}
 
+	uint32_t HDI08::readTX()
+	{
+		m_dataTX.waitNotEmpty();
+		return popTX();
+	}
+
+	bool HDI08::tryReadTX(TWord& _word) noexcept
+	{
+		if(m_dataTX.empty())
+			return false;
+		_word = popTX();
+		return true;
+	}
+
+	void HDI08::clearTX()
+	{
+		m_dataTX.clear();
+		m_periph.setDelayCycles(0);
+	}
+
+	bool HDI08::configureHostTxRetention(const HostTxRetention _retention,
+		const size_t _limit) noexcept
+	{
+		if(m_hostTxRetention != HostTxRetention::Legacy
+			|| _retention == HostTxRetention::Legacy || !m_dataTX.empty())
+			return false;
+		if(_retention == HostTxRetention::BoundedFifo
+			&& (_limit == 0 || _limit > m_dataTX.capacity()))
+			return false;
+
+		m_hostTxRetention = _retention;
+		m_hostTxAdmissionLimit = _retention == HostTxRetention::BoundedFifo
+			? _limit : 1;
+		m_hostTxOverflowCount.store(0, std::memory_order_release);
+		if(_retention == HostTxRetention::SingleRegister)
+			m_transmitDataAlwaysEmpty = false;
+		else if(_retention == HostTxRetention::BoundedFifo)
+			m_transmitDataAlwaysEmpty = true;
+		return true;
+	}
+
 	void HDI08::writeTX(const TWord _val)
 	{
-		if(!m_transmitDataAlwaysEmpty && !m_dataTX.empty())
+		if((m_hostTxRetention == HostTxRetention::SingleRegister
+			|| (m_hostTxRetention == HostTxRetention::Legacy
+				&& !m_transmitDataAlwaysEmpty)) && !m_dataTX.empty())
 		{
 			LOG("Write HDI08 HOTX: Discarding " << HEX(m_dataTX.front()) << ", HOTX is full, replacing with " << HEX(_val));
 			m_dataTX.front() = _val;
+			if(m_hostTxRetention != HostTxRetention::Legacy)
+				m_hostTxOverflowCount.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if(m_hostTxRetention == HostTxRetention::BoundedFifo
+			&& m_dataTX.size() >= m_hostTxAdmissionLimit)
+		{
+			m_hostTxOverflowCount.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
 
@@ -336,12 +537,28 @@ namespace dsp56k
 
 		const auto hadTXInterrupt = txInterruptEnabled();
 		const auto hadRXInterrupt = rxInterruptEnabled();
+		const auto hadHostCommandInterrupt =
+			dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire));
+		const auto hasHostCommandInterrupt = dsp56k::bittest<TWord, HCR_HCIE>(_val);
+		if(m_nativeHostCommands && hadHostCommandInterrupt
+			&& !hasHostCommandInterrupt && hostCommandPending())
+		{
+			const auto unpublished = unpublishPendingHostCommand();
+			assert(unpublished
+				&& "HDI08 HCR writes require quiescent host-command ownership");
+			if(!unpublished)
+				return;
+			m_hostCommandPayloadHold = false;
+		}
 		m_hcr.store(_val, std::memory_order_release);
 
 		m_callbackHostStateChanged();
 
 		const auto hasTXInterrupt = txInterruptEnabled();
 		const auto hasRXInterrupt = rxInterruptEnabled();
+		if(m_nativeHostCommands && !hadHostCommandInterrupt
+			&& hasHostCommandInterrupt && hostCommandPending())
+			(void)publishPendingHostCommand();
 
 		if(!hadTXInterrupt && hasTXInterrupt && dsp56k::bittest<TWord, HSR_HTDE>(m_hsr))
 		{

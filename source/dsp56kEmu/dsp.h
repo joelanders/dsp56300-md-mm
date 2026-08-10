@@ -11,6 +11,10 @@
 #include "jit.h"
 #include "jittypes.h"
 
+#include <array>
+#include <functional>
+#include <utility>
+
 #if 0
 #	define LOGJITPC(PC)		LOG(HEX(reinterpret_cast<uint64_t>(this)) << " exec @ " << HEX(PC))
 #else
@@ -192,8 +196,17 @@ namespace dsp56k
 
 		// The lock-free ring buffer's counters are now atomic (release/acquire), so it is correct on ARM too -
 		// the old #ifdef HAVE_ARM64 workaround that forced the blocking (Lock=true) variant here is gone.
-		RingBuffer<TWord, 1024, false>				m_pendingInterrupts;	// TODO: array is way too large
-		RingBuffer<TWord, 32, false>				m_pendingExternalInterrupts;
+		struct PendingInterrupt
+		{
+			TWord vector = 0;
+			uint64_t token = 0;
+			operator TWord() const { return vector; }
+		};
+		RingBuffer<PendingInterrupt, 1024, false>		m_pendingInterrupts;	// TODO: array is way too large
+		RingBuffer<PendingInterrupt, 32, false>		m_pendingExternalInterrupts;
+		uint64_t							m_nextExternalInterruptToken = 1;
+		const void*							m_interruptServicedCallbackOwner = nullptr;
+		std::function<void(TWord, uint64_t)>			m_interruptServicedCallback;
 
 		std::vector<std::function<void()>>			m_customInterrupts;
 
@@ -357,7 +370,7 @@ namespace dsp56k
 		}
 
 		void	execInterrupts					();
-		void	execInterrupt					(uint32_t vba);
+		void	execInterrupt					(uint32_t vba, uint64_t token = 0);
 		void	execDefaultPreventInterrupt		();
 
 		bool	readReg							( EReg _reg, TReg8& _res ) const;
@@ -394,7 +407,36 @@ namespace dsp56k
 		bool			isInterruptMasked				(const TWord _vba) const;
 
 		void			injectExternalInterrupt			(const TWord _vba);
+		// Single-producer, nonblocking counterpart used by owner-thread transports.
+		// A full external-interrupt FIFO rejects without changing DSP state.
+		using ExternalInterruptToken = uint64_t;
+		bool			tryInjectExternalInterrupt		(const TWord _vba,
+			ExternalInterruptToken& _token) noexcept;
+		// Quiescent owner-only cancellation by exact publication token. It never
+		// removes another producer's equal vector.
+		bool			cancelExternalInterrupt			(ExternalInterruptToken _token) noexcept;
 		void			processExternalInterrupts		();
+
+		// Quiescent configuration hook for a peripheral that must observe the exact
+		// architectural dispatch boundary. Ownership is exclusive and identity-checked.
+		bool setInterruptServicedCallback(const void* _owner,
+			std::function<void(TWord, ExternalInterruptToken)> _callback)
+		{
+			if(!_owner || (m_interruptServicedCallbackOwner
+				&& m_interruptServicedCallbackOwner != _owner))
+				return false;
+			m_interruptServicedCallback = std::move(_callback);
+			m_interruptServicedCallbackOwner = _owner;
+			return true;
+		}
+		bool clearInterruptServicedCallback(const void* _owner)
+		{
+			if(!_owner || m_interruptServicedCallbackOwner != _owner)
+				return false;
+			m_interruptServicedCallback = nullptr;
+			m_interruptServicedCallbackOwner = nullptr;
+			return true;
+		}
 
 		bool			hasPendingInterrupts			() const
 		{
