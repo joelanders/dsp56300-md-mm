@@ -309,6 +309,11 @@ namespace dsp56k
 		return interrupt >= Vba_End || !isInterruptMasked(interrupt);
 	}
 
+	bool DSP::canServicePacedJitWait() const
+	{
+		return m_pacedJitActive && m_budgetedWait && hasServiceablePendingInterrupt();
+	}
+
 	bool DSP::advanceBudgetedWait(const uint64_t _remainingBudget) noexcept
 	{
 		if(hasServiceablePendingInterrupt())

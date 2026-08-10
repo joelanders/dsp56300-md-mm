@@ -324,6 +324,10 @@ namespace dsp56k
 		bool endPacedJitExecution();
 		PacedJitExecutionResult executePacedJitSlice(uint32_t _instructionBudget);
 		bool isPacedJitExecutionActive() const { return m_pacedJitActive; }
+		// Read-only eligibility for the paced owner's zero-cycle WAIT completion
+		// boundary. The FIFO front must exist and pass the same mask predicate used
+		// by the dispatcher; this neither consumes nor reorders the request.
+		bool canServicePacedJitWait() const;
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
 		{
