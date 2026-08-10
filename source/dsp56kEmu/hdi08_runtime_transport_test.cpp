@@ -285,6 +285,7 @@ namespace
 		auto& hdi = fixture.peripherals.getHI08();
 		constexpr TWord Vector = 0x0c;
 		require(hdi.setNativeHostCommandsEnabled(true), "unpublished fixture enable failed");
+		const auto generation = hdi.hostCommandDispatchGeneration();
 		require(hdi.tryWriteHostCommand(Vector) == HDI08::HostCommandAdmission::Accepted,
 			"HCIE-off unpublished command setup failed");
 		fixture.dsp.injectExternalInterrupt(Vector);
@@ -295,6 +296,7 @@ namespace
 		fixture.dsp.processExternalInterrupts();
 		fixture.dsp.execInterpreter();
 		require(hdi.hostCommandPending()
+			&& hdi.hostCommandDispatchGeneration() == generation
 			&& (hdi.readStatusRegister() & (TWord{1} << HDI08::HSR_HCP)) != 0,
 			"legacy token-zero same-vector dispatch cleared unpublished HCP");
 		require(hdi.cancelPendingHostCommand(), "unpublished fixture did not cancel");
@@ -305,6 +307,7 @@ namespace
 		Fixture fixture;
 		auto& hdi = fixture.peripherals.getHI08();
 		require(hdi.setNativeHostCommandsEnabled(true), "masked fixture enable failed");
+		const auto generation = hdi.hostCommandDispatchGeneration();
 		hdi.writeControlRegister(TWord{1} << HDI08::HCR_HCIE);
 		fixture.dsp.regs().sr.var |= SR_I0 | SR_I1;
 		require(hdi.tryWriteRX(0x654321)
@@ -316,16 +319,17 @@ namespace
 
 		fixture.dsp.processExternalInterrupts();
 		fixture.dsp.resetSW();
-		require(!hdi.hostCommandPending() && hdi.nativeHostCommandsEnabled(),
+		require(!hdi.hostCommandPending() && hdi.nativeHostCommandsEnabled()
+			&& hdi.hostCommandDispatchGeneration() == generation,
 			"DSP software reset did not cancel the command or preserve native mode");
 		fixture.dsp.regs().sr.var &= ~(SR_I0 | SR_I1);
-		const auto vectorEnd = fixture.install(Vba_IRQA, "move #$7,y:$2");
+		const auto vectorEnd = fixture.install(Vba_IRQA, "move #$7,y0");
 		fixture.install(vectorEnd, "nop");
 		fixture.install(0x100, "bra $100");
 		fixture.dsp.setPC(0x100);
 		for(size_t i = 0; i < 4; ++i)
 			fixture.dsp.execInterpreter();
-		require(fixture.memory.get(MemArea_Y, 2) == 0,
+		require(loword(fixture.dsp.regs().y).toWord() == 0,
 			"cancelled host-command vector dispatched stale work");
 
 		constexpr TWord NewVector = 0x0c;
@@ -337,7 +341,9 @@ namespace
 		fixture.install(newVectorEnd, "nop");
 		fixture.dsp.processExternalInterrupts();
 		fixture.dsp.execInterpreter();
-		require(!hdi.hostCommandPending() && fixture.memory.get(MemArea_Y, 4) == 0x2468ac,
+		require(!hdi.hostCommandPending()
+			&& hdi.hostCommandDispatchGeneration() == generation + 1
+			&& fixture.memory.get(MemArea_Y, 4) == 0x2468ac,
 			"post-reset native command did not dispatch through the surviving observer");
 	}
 
@@ -351,8 +357,8 @@ namespace
 		constexpr TWord CommandVector = 0x0c;
 		fixture.install(0x100, "wait");
 		fixture.install(0x101, "move #$1,r0");
-		fixture.install(0x20, "nop");
-		fixture.install(0x21, "nop");
+		fixture.install(Vba_NMI, "nop");
+		fixture.install(Vba_NMI + 1, "nop");
 		const auto commandEnd = fixture.install(CommandVector, "movep x:<<$ffffc6,y:>$8");
 		fixture.install(commandEnd, "nop");
 		fixture.dsp.setPC(0x100);
@@ -365,7 +371,7 @@ namespace
 		for(size_t i = 0; i < 32; ++i)
 		{
 			DSP::ExternalInterruptToken token = 0;
-			require(fixture.dsp.tryInjectExternalInterrupt(0x20, token),
+			require(fixture.dsp.tryInjectExternalInterrupt(Vba_NMI, token),
 				"retry fixture external interrupt FIFO filled early");
 		}
 		require(hdi.tryWriteRX(0x112233)
@@ -378,8 +384,9 @@ namespace
 			"failed HCIE publication lost HCP or exposed mainline HRDF");
 		const auto wake = fixture.dsp.executePacedJitSlice(1);
 		require(wake.stop == DSP::PacedJitExecutionStop::BudgetExhausted
-			&& wake.instructionDelta == 0 && hdi.hostCommandPending(),
-			"full-FIFO retry did not wake through an ordinary paced owner boundary");
+			&& wake.instructionDelta == 1 && hdi.hostCommandPending()
+			&& !fixture.dsp.hasPendingExternalInterrupts(),
+			"full-FIFO retry did not wake/drain through one paced owner boundary");
 		for(size_t i = 0; i < 160 && hdi.hostCommandPending(); ++i)
 		{
 			const auto result = fixture.dsp.executePacedJitSlice(1);
@@ -443,8 +450,8 @@ namespace
 		constexpr TWord CommandVector = 0x0c;
 		fixture.install(0x100, "wait");
 		fixture.install(0x101, "nop");
-		fixture.install(0x20, "nop");
-		fixture.install(0x21, "nop");
+		fixture.install(Vba_NMI, "nop");
+		fixture.install(Vba_NMI + 1, "nop");
 		fixture.install(CommandVector, "nop");
 		fixture.install(CommandVector + 1, "nop");
 		fixture.dsp.setPC(0x100);
@@ -456,7 +463,7 @@ namespace
 		for(size_t i = 0; i < 32; ++i)
 		{
 			DSP::ExternalInterruptToken token = 0;
-			require(fixture.dsp.tryInjectExternalInterrupt(0x20, token),
+			require(fixture.dsp.tryInjectExternalInterrupt(Vba_NMI, token),
 				"data-free retry FIFO filled early");
 		}
 		require(hdi.tryWriteHostCommand(CommandVector)
@@ -465,8 +472,8 @@ namespace
 			"full data-free command admission partially mutated HCP");
 		const auto wake = fixture.dsp.executePacedJitSlice(1);
 		require(wake.stop == DSP::PacedJitExecutionStop::BudgetExhausted
-			&& wake.instructionDelta == 0 && !fixture.dsp.hasPendingExternalInterrupts(),
-			"rejected data-free command did not wake/drain through an owner boundary");
+			&& wake.instructionDelta == 1 && !fixture.dsp.hasPendingExternalInterrupts(),
+			"rejected data-free command did not wake/drain through one owner boundary");
 		require(hdi.tryWriteHostCommand(CommandVector) == HDI08::HostCommandAdmission::Accepted,
 			"explicit data-free command retry did not use returned FIFO capacity");
 		for(size_t i = 0; i < 160 && hdi.hostCommandPending(); ++i)
@@ -532,7 +539,7 @@ namespace
 			"paced-WAIT host command setup failed");
 		const auto wake = fixture.dsp.executePacedJitSlice(1);
 		require(wake.stop == DSP::PacedJitExecutionStop::BudgetExhausted
-			&& wake.instructionDelta == 0 && hdi.hostCommandPending(),
+			&& wake.instructionDelta == 1 && hdi.hostCommandPending(),
 			"host command did not expose the parked paced-WAIT wake boundary");
 		const auto vector = fixture.dsp.executePacedJitSlice(1);
 		require((vector.stop == DSP::PacedJitExecutionStop::BudgetExhausted

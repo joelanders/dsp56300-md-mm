@@ -190,6 +190,13 @@ namespace dsp56k
 		{
 			return m_hostCommandPending;
 		}
+		// Single-owner monotonic observation seam. This advances only when the exact
+		// tagged native command reaches vector dispatch, never on cancellation or
+		// reset, so an owner can distinguish service from teardown.
+		uint64_t hostCommandDispatchGeneration() const
+		{
+			return m_hostCommandDispatchGeneration;
+		}
 
 		static void setSymbols(Disassembler& _disasm);
 
@@ -270,6 +277,7 @@ namespace dsp56k
 		mutable bool m_hostCommandPayloadHold = false;
 		TWord m_hostCommandVba = 0;
 		uint64_t m_hostCommandToken = 0;
+		uint64_t m_hostCommandDispatchGeneration = 0;
 		TWord m_lastRXValue = 0;
 
 		DmaChannel::RequestSource m_dmaReqSourceReceive;

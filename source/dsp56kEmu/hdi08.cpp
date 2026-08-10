@@ -144,6 +144,7 @@ namespace dsp56k
 			|| _vba != m_hostCommandVba
 			|| _token != expectedToken)
 			return;
+		++m_hostCommandDispatchGeneration;
 		m_hostCommandPending = false;
 		m_hostCommandPublished = false;
 		m_hostCommandPayloadHold = false;
