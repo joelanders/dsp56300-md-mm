@@ -139,11 +139,21 @@ namespace dsp56k
 
 	void Jit::create(TWord _pc, bool _execute)
 	{
+		if(!m_dsp.jitCompilationAllowed())
+		{
+			m_dsp.notifyJitCacheMiss();
+			return;
+		}
 		m_currentChain->create(_pc, _execute);
 	}
 
 	void Jit::recreate(TWord _pc)
 	{
+		if(!m_dsp.jitCompilationAllowed())
+		{
+			m_dsp.notifyJitCacheMiss();
+			return;
+		}
 		m_currentChain->recreate(_pc);
 	}
 
@@ -211,14 +221,28 @@ namespace dsp56k
 		return reinterpret_cast<Jit*>(reinterpret_cast<uint8_t*>(_regs) + offsetJit - offsetRegs);
 	}
 
-	void Jit::ensureProgramAddress(const TWord _offset)
+	bool Jit::ensureProgramAddress(const TWord _offset)
 	{
 		if(m_currentChain && _offset < m_currentChain->getFuncSize())
-			return;
+			return true;
+		if(!m_dsp.jitCompilationAllowed())
+		{
+			m_dsp.notifyJitCacheMiss();
+			return false;
+		}
 
 		m_maxUsedPAddress = std::max(m_maxUsedPAddress, static_cast<size_t>(_offset));
 		if(m_currentChain)
 			m_currentChain->setMaxUsedPAddress(m_maxUsedPAddress);
+		return true;
+	}
+
+	bool Jit::canExecuteProgramAddressWithoutCompilation(const TWord _offset) const noexcept
+	{
+		if(!m_currentChain || _offset >= m_currentChain->getFuncSize())
+			return false;
+		const auto function = m_currentChain->getFunc(_offset);
+		return function != &funcCreate && function != &funcRecreate;
 	}
 
 	void Jit::notifyProgramMemWrite(const TWord _offset)
@@ -226,7 +250,7 @@ namespace dsp56k
 		for (auto& it : m_chains)
 			it.second->notifyPMemWrite(_offset, it.second.get() == m_currentChain);
 
-		ensureProgramAddress(_offset);
+		static_cast<void>(ensureProgramAddress(_offset));
 	}
 
 	void Jit::run(const TWord _pc) noexcept
@@ -312,6 +336,14 @@ namespace dsp56k
 
 		if (pMemWriteAddr == g_pcInvalid)
 			return;
+		if(!m_dsp.jitCompilationAllowed())
+		{
+			// Destruction/recycling can allocate through cache containers. Preserve
+			// the architectural write, fail the bounded visit, and defer JIT cache
+			// invalidation until preparation explicitly reopens compilation.
+			m_dsp.deferJitProgramWrite(pMemWriteAddr);
+			return;
+		}
 
 		for (const auto& it : m_chains)
 		{
@@ -341,6 +373,11 @@ namespace dsp56k
 
 		if(itExisting == m_chains.end())
 		{
+			if(!m_dsp.jitCompilationAllowed())
+			{
+				m_dsp.notifyJitCacheMiss();
+				return;
+			}
 			m_currentChain = new JitBlockChain(*this, mode, m_maxUsedPAddress);
 			m_chains.insert(std::make_pair(mode, m_currentChain));
 		}

@@ -145,6 +145,44 @@ namespace dsp56k
 			PacedJitExecutionStop stop = PacedJitExecutionStop::BudgetExhausted;
 		};
 
+		// Performance-oriented counterpart to the exact one-boundary paced mode.
+		// Each visit executes at most one generated block configured for 32 source
+		// instructions and one finite-DO iteration. Measured deltas remain
+		// authoritative because REP and control flow may retire a larger dynamic
+		// count. A parked WAIT may advance both counters by at most that same fixed
+		// quantum without retiring a source opcode. WAIT and STOP retain the same
+		// bounded no-successor latches.
+		enum class BoundedJitActivation
+		{
+			Activated,
+			Unsupported,
+			AlreadyActive,
+			InterpreterStateOwned,
+		};
+
+		enum class BoundedJitExecutionStop
+		{
+			BlockComplete,
+			Waiting,
+			Halted,
+			Inactive,
+			InvalidBudget,
+			OwnershipLost,
+			BoundaryViolation,
+			ReentryDenied,
+			CacheMiss,
+		};
+
+		struct BoundedJitExecutionResult
+		{
+			uint64_t instructionDelta = 0;
+			uint64_t cycleCounterDelta = 0;
+			BoundedJitExecutionStop stop = BoundedJitExecutionStop::BlockComplete;
+		};
+
+		static constexpr uint32_t BoundedJitMaxInstructionsPerBlock = 32;
+		static constexpr uint32_t BoundedJitMaxDoIterations = 1;
+
 		typedef void (*TInterruptFunc)(DSP*) noexcept;
 
 		static constexpr uint32_t PeripheralsProcessingStepSize = 32;
@@ -191,6 +229,12 @@ namespace dsp56k
 		bool							m_pacedJitExpectedAtomic = false;
 		bool							m_pacedJitOwnershipLost = false;
 		bool							m_pacedJitTeardownPending = false;
+		bool							m_boundedJitMode = false;
+		bool							m_boundedJitCompilationAllowed = true;
+		bool							m_boundedJitCacheMiss = false;
+		TWord							m_boundedJitDeferredProgramWrite = 0xffffffffu;
+		uint32_t						m_ownedJitMaxInstructions = 0;
+		uint32_t						m_ownedJitMaxDoIterations = 0;
 		uint64_t						m_pacedJitConfigGeneration = 0;
 		JitConfig						m_pacedJitSavedConfig;
 
@@ -286,7 +330,8 @@ namespace dsp56k
 			m_interruptFunc(this);
 
 			const auto pc = getPC().toWord();
-			m_jit.ensureProgramAddress(pc);
+			if(!m_jit.ensureProgramAddress(pc))
+				return;
 			LOGJITPC(pc);
 			m_jitEntries[pc](&reg, pc);
 		}
@@ -336,11 +381,41 @@ namespace dsp56k
 		PacedJitActivation beginPacedJitExecution();
 		bool endPacedJitExecution();
 		PacedJitExecutionResult executePacedJitSlice(uint32_t _instructionBudget);
-		bool isPacedJitExecutionActive() const { return m_pacedJitActive; }
+		bool isPacedJitExecutionActive() const
+		{
+			return m_pacedJitActive && !m_boundedJitMode;
+		}
 		// Read-only eligibility for the paced owner's zero-cycle WAIT completion
 		// boundary. The FIFO front must exist and pass the same mask predicate used
 		// by the dispatcher; this neither consumes nor reorders the request.
 		bool canServicePacedJitWait() const;
+
+		// Fixed-block, single-owner JIT mode for a performance scheduler. It owns and
+		// restores the same exact configuration boundary as paced mode, remains
+		// mutually exclusive with every other executor, and never runs more than one
+		// generated block per call. No mid-block peripheral preemption is claimed.
+		// Callback reentry is denied. Callbacks must not reset or otherwise mutate
+		// core/configuration state. A pre-dispatch JIT-configuration mutation is
+		// detected before source dispatch; the same mutation from inside generated
+		// code is a caller precondition violation. RESET-instruction teardown is
+		// deferred until the live block returns.
+		BoundedJitActivation beginBoundedJitExecution();
+		bool endBoundedJitExecution();
+		// _maximumWaitCounterAdvance applies only when the core is already parked in
+		// WAIT. A zero value permits one peripheral/control visit without inventing
+		// counter progress; ordinary generated blocks ignore it.
+		BoundedJitExecutionResult executeBoundedJitBlock(
+			uint32_t _maximumWaitCounterAdvance = BoundedJitMaxInstructionsPerBlock);
+		bool isBoundedJitExecutionActive() const
+		{
+			return m_pacedJitActive && m_boundedJitMode;
+		}
+		bool canServiceBoundedJitWait() const;
+		// Preparation may leave compilation enabled while warming expected paths.
+		// Disabling it is a quiescent transition and rejects an unseen current PC or
+		// immediately serviceable normal vector. A later unseen block/mode returns
+		// CacheMiss without allocating and may be retried after preparation resumes.
+		bool setBoundedJitCompilationAllowed(bool _allowed);
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
 		{
@@ -544,12 +619,29 @@ namespace dsp56k
 		bool	do_exec							( TWord _loopcount, TWord _addr );
 		void	finishBudgetedDoBoundary			();
 		bool	executeBudgetedBoundary			(uint64_t _remainingBudget) noexcept;
-		bool	executePacedJitBoundary			(uint64_t _configGeneration) noexcept;
+		bool	executePacedJitBoundary			(uint64_t _configGeneration,
+			uint64_t _waitCounterAdvance) noexcept;
 		bool	advanceBudgetedWait				(uint64_t _remainingBudget) noexcept;
 		uint64_t getWaitPeripheralAdvance		() const noexcept;
 		void	completeBudgetedWait				() noexcept;
 		bool	hasServiceablePendingInterrupt		() const;
 		bool	isPacedJitConfigurationOwned		() const;
+		bool	jitCompilationAllowed			() const noexcept
+		{
+			return !m_pacedJitActive || !m_boundedJitMode
+				|| m_boundedJitCompilationAllowed;
+		}
+		void	notifyJitCacheMiss				() noexcept
+		{
+			if(m_pacedJitActive && m_boundedJitMode)
+				m_boundedJitCacheMiss = true;
+		}
+		void	deferJitProgramWrite			(TWord _address) noexcept
+		{
+			m_boundedJitDeferredProgramWrite = _address;
+			notifyJitCacheMiss();
+			notifyProgramMemWrite(_address);
+		}
 		void	requestPacedJitTeardownForReset	();
 		void	finalizePacedJitTeardown			();
 		void	haltPacedJit					(TWord _pc) noexcept;

@@ -188,9 +188,14 @@ namespace dsp56k
 					break;
 				}
 
-				if(instA == Wait)
+				// WAIT always returns to its host-side scheduler. STOP and RESET must
+				// do the same while the opt-in bounded owner is compiling multi-op
+				// blocks; otherwise generated successors can execute after the latch or
+				// reset has already taken effect. Ordinary JIT topology is unchanged.
+				if(instA == Wait || (_dsp.isBoundedJitExecutionActive()
+					&& (instA == Stop || instA == Reset)))
 				{
-					terminationReason = JitBlockInfo::TerminationReason::WaitInstruction;
+					terminationReason = JitBlockInfo::TerminationReason::YieldInstruction;
 					break;
 				}
 			}

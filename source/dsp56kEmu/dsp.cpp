@@ -196,6 +196,17 @@ namespace dsp56k
 			return;
 		}
 
+		// A prewarmed-only bounded owner must not consume or acknowledge an
+		// interrupt whose vector would require compilation. Keep the request at
+		// the FIFO front so preparation can reopen compilation and retry it.
+		if(g_useJIT && m_pacedJitExecuting && m_boundedJitMode
+			&& !m_boundedJitCompilationAllowed
+			&& !m_jit.canExecuteProgramAddressWithoutCompilation(vba))
+		{
+			notifyJitCacheMiss();
+			return;
+		}
+
 		// it is important that the processing mode is switched first before popping the vector to prevent a possible race condition in hasPendingInterrupt()
 		{
 			m_processingMode = FastInterrupt;
@@ -224,7 +235,8 @@ namespace dsp56k
 
 		if(g_useJIT && !m_budgetedExecutionActive)
 		{
-			m_jit.ensureProgramAddress(vba);
+			if(!m_jit.ensureProgramAddress(vba))
+				return;
 			LOGJITPC(vba);
 			const auto pc = getPC();
 			m_jitEntries[vba](&reg, vba);
@@ -313,7 +325,14 @@ namespace dsp56k
 
 	bool DSP::canServicePacedJitWait() const
 	{
-		return m_pacedJitActive && m_budgetedWait && hasServiceablePendingInterrupt();
+		return m_pacedJitActive && !m_boundedJitMode && m_budgetedWait
+			&& hasServiceablePendingInterrupt();
+	}
+
+	bool DSP::canServiceBoundedJitWait() const
+	{
+		return m_pacedJitActive && m_boundedJitMode && m_budgetedWait
+			&& hasServiceablePendingInterrupt();
 	}
 
 	bool DSP::advanceBudgetedWait(const uint64_t _remainingBudget) noexcept
@@ -397,8 +416,8 @@ namespace dsp56k
 		const auto& config = m_jit.getConfig();
 		return m_jit.getConfigGeneration() == m_pacedJitConfigGeneration
 			&& !config.linkJitBlocks
-			&& config.maxInstructionsPerBlock == 1
-			&& config.maxDoIterations == 1
+			&& config.maxInstructionsPerBlock == m_ownedJitMaxInstructions
+			&& config.maxDoIterations == m_ownedJitMaxDoIterations
 			&& config.dynamicFastInterrupts
 			&& !config.getBlockConfig;
 	}
@@ -432,8 +451,45 @@ namespace dsp56k
 		m_pacedJitConfigGeneration = m_jit.getConfigGeneration();
 		m_pacedJitOwnershipLost = false;
 		m_pacedJitTeardownPending = false;
+		m_boundedJitMode = false;
+		m_ownedJitMaxInstructions = 1;
+		m_ownedJitMaxDoIterations = 1;
 		m_pacedJitActive = true;
 		return PacedJitActivation::Activated;
+	}
+
+	DSP::BoundedJitActivation DSP::beginBoundedJitExecution()
+	{
+		if constexpr(!g_useJIT)
+			return BoundedJitActivation::Unsupported;
+
+		if(m_pacedJitActive)
+			return BoundedJitActivation::AlreadyActive;
+		if(m_budgetedExecutionActive || m_budgetedWait || m_budgetedHalted)
+			return BoundedJitActivation::InterpreterStateOwned;
+
+		JitConfig savedConfig = m_jit.getConfig();
+		JitConfig boundedConfig = savedConfig;
+		boundedConfig.linkJitBlocks = false;
+		boundedConfig.maxInstructionsPerBlock = BoundedJitMaxInstructionsPerBlock;
+		boundedConfig.maxDoIterations = BoundedJitMaxDoIterations;
+		boundedConfig.dynamicFastInterrupts = true;
+		boundedConfig.getBlockConfig = {};
+
+		m_jit.destroyAllBlocks();
+		m_pacedJitSavedConfig = std::move(savedConfig);
+		m_jit.setConfig(std::move(boundedConfig));
+		m_pacedJitConfigGeneration = m_jit.getConfigGeneration();
+		m_pacedJitOwnershipLost = false;
+		m_pacedJitTeardownPending = false;
+		m_boundedJitMode = true;
+		m_boundedJitCompilationAllowed = true;
+		m_boundedJitCacheMiss = false;
+		m_boundedJitDeferredProgramWrite = 0xffffffffu;
+		m_ownedJitMaxInstructions = BoundedJitMaxInstructionsPerBlock;
+		m_ownedJitMaxDoIterations = BoundedJitMaxDoIterations;
+		m_pacedJitActive = true;
+		return BoundedJitActivation::Activated;
 	}
 
 	void DSP::finalizePacedJitTeardown()
@@ -450,13 +506,27 @@ namespace dsp56k
 		m_pacedJitExpectedAtomic = false;
 		m_pacedJitOwnershipLost = false;
 		m_pacedJitTeardownPending = false;
+		m_boundedJitMode = false;
+		m_boundedJitCompilationAllowed = true;
+		m_boundedJitCacheMiss = false;
+		m_boundedJitDeferredProgramWrite = 0xffffffffu;
+		m_ownedJitMaxInstructions = 0;
+		m_ownedJitMaxDoIterations = 0;
 		m_pacedJitConfigGeneration = 0;
 		m_jit.destroyAllBlocks();
 	}
 
 	bool DSP::endPacedJitExecution()
 	{
-		if(!m_pacedJitActive || m_pacedJitExecuting)
+		if(!m_pacedJitActive || m_boundedJitMode || m_pacedJitExecuting)
+			return false;
+		finalizePacedJitTeardown();
+		return true;
+	}
+
+	bool DSP::endBoundedJitExecution()
+	{
+		if(!m_pacedJitActive || !m_boundedJitMode || m_pacedJitExecuting)
 			return false;
 		finalizePacedJitTeardown();
 		return true;
@@ -475,14 +545,15 @@ namespace dsp56k
 		finalizePacedJitTeardown();
 	}
 
-	bool DSP::executePacedJitBoundary(const uint64_t _configGeneration) noexcept
+	bool DSP::executePacedJitBoundary(const uint64_t _configGeneration,
+		const uint64_t _waitCounterAdvance) noexcept
 	{
 		m_pacedJitAtomicBoundary = false;
 		m_pacedJitExpectedAtomic = false;
 
 		if(m_budgetedWait)
 		{
-			if(advanceBudgetedWait(1))
+			if(advanceBudgetedWait(_waitCounterAdvance))
 				return false;
 			if(m_pacedJitAtomicBoundary)
 				return true;
@@ -493,7 +564,8 @@ namespace dsp56k
 		// detected configuration change or RESET-instruction teardown must stop
 		// this visit before it fetches or dispatches any program opcode.
 		if(m_pacedJitOwnershipLost || m_pacedJitTeardownPending
-			|| m_jit.getConfigGeneration() != _configGeneration)
+			|| m_jit.getConfigGeneration() != _configGeneration
+			|| m_boundedJitCacheMiss)
 			return false;
 		if(m_pacedJitAtomicBoundary)
 		{
@@ -509,7 +581,8 @@ namespace dsp56k
 		m_pacedJitExpectedAtomic = (Opcodes::getFlags(instA, instB)
 			& (OpFlagRepDynamic | OpFlagRepImmediate)) != 0;
 
-		m_jit.ensureProgramAddress(pc);
+		if(!m_jit.ensureProgramAddress(pc))
+			return false;
 		LOGJITPC(pc);
 		m_jitEntries[pc](&reg, pc);
 		return true;
@@ -523,7 +596,7 @@ namespace dsp56k
 			result.stop = PacedJitExecutionStop::ReentryDenied;
 			return result;
 		}
-		if(!m_pacedJitActive)
+		if(!m_pacedJitActive || m_boundedJitMode)
 		{
 			result.stop = PacedJitExecutionStop::Inactive;
 			return result;
@@ -556,7 +629,7 @@ namespace dsp56k
 		const auto cyclesBefore = m_cycles;
 		const auto configGeneration = m_pacedJitConfigGeneration;
 		m_pacedJitExecuting = true;
-		const auto completedBoundary = executePacedJitBoundary(configGeneration);
+		const auto completedBoundary = executePacedJitBoundary(configGeneration, 1);
 		m_pacedJitExecuting = false;
 
 		result.instructionDelta = m_instructions - instructionsBefore;
@@ -606,6 +679,126 @@ namespace dsp56k
 		else if(m_budgetedHalted)
 			result.stop = PacedJitExecutionStop::Halted;
 		return result;
+	}
+
+	DSP::BoundedJitExecutionResult DSP::executeBoundedJitBlock(
+		const uint32_t _maximumWaitCounterAdvance)
+	{
+		BoundedJitExecutionResult result;
+		if(m_pacedJitExecuting)
+		{
+			result.stop = BoundedJitExecutionStop::ReentryDenied;
+			return result;
+		}
+		if(!m_pacedJitActive || !m_boundedJitMode)
+		{
+			result.stop = BoundedJitExecutionStop::Inactive;
+			return result;
+		}
+		if(_maximumWaitCounterAdvance > BoundedJitMaxInstructionsPerBlock)
+		{
+			result.stop = BoundedJitExecutionStop::InvalidBudget;
+			return result;
+		}
+		if(m_pacedJitOwnershipLost || !isPacedJitConfigurationOwned())
+		{
+			m_pacedJitOwnershipLost = true;
+			result.stop = BoundedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(m_budgetedHalted)
+		{
+			result.stop = BoundedJitExecutionStop::Halted;
+			return result;
+		}
+		m_boundedJitCacheMiss = false;
+
+		const auto instructionsBefore = m_instructions;
+		const auto cyclesBefore = m_cycles;
+		const auto configGeneration = m_pacedJitConfigGeneration;
+		m_pacedJitExecuting = true;
+		const auto completedBlock = executePacedJitBoundary(configGeneration,
+			_maximumWaitCounterAdvance);
+		m_pacedJitExecuting = false;
+
+		result.instructionDelta = m_instructions - instructionsBefore;
+		result.cycleCounterDelta = m_cycles - cyclesBefore;
+
+		if(m_pacedJitTeardownPending)
+		{
+			finalizePacedJitTeardown();
+			result.stop = BoundedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(m_jit.getConfigGeneration() != configGeneration
+			|| !isPacedJitConfigurationOwned())
+			m_pacedJitOwnershipLost = true;
+		if(m_pacedJitOwnershipLost)
+		{
+			result.stop = BoundedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+		if(m_boundedJitCacheMiss)
+		{
+			result.stop = BoundedJitExecutionStop::CacheMiss;
+			return result;
+		}
+		if(!completedBlock)
+		{
+			result.stop = m_budgetedWait ? BoundedJitExecutionStop::Waiting
+				: BoundedJitExecutionStop::OwnershipLost;
+			return result;
+		}
+
+		const auto waitWakeBoundary = result.instructionDelta == 0
+			&& m_pacedJitAtomicBoundary;
+		if(result.instructionDelta == 0 && !waitWakeBoundary)
+		{
+			m_pacedJitOwnershipLost = true;
+			result.stop = BoundedJitExecutionStop::BoundaryViolation;
+			return result;
+		}
+		if(m_budgetedWait)
+			result.stop = BoundedJitExecutionStop::Waiting;
+		else if(m_budgetedHalted)
+			result.stop = BoundedJitExecutionStop::Halted;
+		return result;
+	}
+
+	bool DSP::setBoundedJitCompilationAllowed(const bool _allowed)
+	{
+		if(!m_pacedJitActive || !m_boundedJitMode || m_pacedJitExecuting)
+			return false;
+		if(!_allowed && m_boundedJitCompilationAllowed)
+		{
+			if(!m_jit.canExecuteProgramAddressWithoutCompilation(getPC().toWord()))
+				return false;
+			const auto vectorIsReady = [this](const PendingInterrupt& _interrupt)
+			{
+				return _interrupt.vector >= Vba_End
+					|| m_jit.canExecuteProgramAddressWithoutCompilation(
+						_interrupt.vector);
+			};
+			if(hasServiceablePendingInterrupt()
+				&& !vectorIsReady(m_pendingInterrupts.front()))
+				return false;
+			if(!m_pendingExternalInterrupts.empty())
+			{
+				const auto interrupt = m_pendingExternalInterrupts.front();
+				if((interrupt.vector >= Vba_End
+					|| !isInterruptMasked(interrupt.vector))
+					&& !vectorIsReady(interrupt))
+					return false;
+			}
+		}
+		m_boundedJitCompilationAllowed = _allowed;
+		if(_allowed && m_boundedJitDeferredProgramWrite != 0xffffffffu)
+		{
+			const auto address = m_boundedJitDeferredProgramWrite;
+			m_boundedJitDeferredProgramWrite = 0xffffffffu;
+			m_jit.notifyProgramMemWrite(address);
+		}
+		return true;
 	}
 
 	bool DSP::executeBudgetedBoundary(const uint64_t _remainingBudget) noexcept

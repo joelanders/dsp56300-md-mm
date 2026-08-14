@@ -21,7 +21,7 @@ namespace dsp56k
 			LoopEnd,
 			InstructionLimit,
 			ModeChange,
-			WaitInstruction
+			YieldInstruction
 		};
 
 		enum class Flags

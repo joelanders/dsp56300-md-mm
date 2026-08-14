@@ -53,7 +53,8 @@ namespace dsp56k
 		// Ensure that an executable PC has a populated dispatch-table entry. This
 		// is deliberately distinct from notifyProgramMemWrite(): executing an
 		// unchanged default-zero P-memory word must not invalidate existing code.
-		void ensureProgramAddress(const TWord _offset);
+		bool ensureProgramAddress(const TWord _offset);
+		bool canExecuteProgramAddressWithoutCompilation(TWord _offset) const noexcept;
 		void notifyProgramMemWrite(const TWord _offset);
 
 		void run(TWord _pc) noexcept;
