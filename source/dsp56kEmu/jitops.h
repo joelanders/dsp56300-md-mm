@@ -240,7 +240,7 @@ namespace dsp56k
 		template<Instruction Inst, bool Accumulate> void op_Mpy_su(TWord op);
 		void op_Mpyi(TWord op);
 		void op_Mpyr_S1S2D(TWord op)			{ alu_multiply(op); }
-		void op_Mpyri(TWord op)					{ errNotImplemented(op); }
+		void op_Mpyri(TWord op);
 		void op_Neg(TWord op);
 		void op_Nop(TWord op);
 		void op_Norm(TWord op)					{ errNotImplemented(op); }
@@ -558,6 +558,7 @@ namespace dsp56k
 		TWord getOpWordA() const { return m_opWordA; }
 		TWord getOpWordB();
 		void getOpWordB(DspValue& _dst);
+		void getSignedOpWordB(DspValue& _dst);
 
 		// ALU
 		void unsignedImmediateToAlu(const JitReg64& _r, const uint8_t _i) const;

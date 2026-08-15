@@ -161,6 +161,7 @@ namespace dsp56k
 
 		// multiply
 		mpyi();
+		mpyri();
 		maci_xxxx();
 		mpy_su();
 		macsu_unsigned();
@@ -4392,24 +4393,77 @@ namespace dsp56k
 		{
 			verify(dsp.regs().a.var != 0);
 		});
+
+		runTest([&]()
+		{
+			dsp.setSR(0);
+			dsp.x0(0x400000);
+			dsp.regs().a.var = 0;
+			emit("mpyi #>$fffdf3,x0,a");
+		}, [&]()
+		{
+			verify(dsp.regs().a.var == 0xfffffef9800000ULL);
+		});
+	}
+
+	void UnitTests::mpyri()
+	{
+		runTest([&]()
+		{
+			dsp.setSR(0);
+			dsp.x0(0x123456);
+			dsp.regs().a.var = 0;
+			emit("mpyri #>$40,x0,a");
+		}, [&]()
+		{
+			verify(dsp.regs().a.var == 0x00000009000000);
+		});
+
+		runTest([&]()
+		{
+			dsp.setSR(0);
+			dsp.x0(0x400000);
+			dsp.regs().a.var = 0;
+			emit("mpyri #>$fffdf3,x0,a");
+		}, [&]()
+		{
+			verify(dsp.regs().a.var == 0xfffffefa000000ULL);
+		});
 	}
 
 	void UnitTests::maci_xxxx()
 	{
-		// MACI accumulates s1 * immediate into the destination accumulator.
-		// the firmware uses `maci #>$7fdf3b,x0,b` at DSP1 PC=$152
-		// inside the oscillator handler. Without this op the DSP crashes the
-		// first time it reaches voice synthesis.
 		runTest([&]()
 		{
-			dsp.x0(0x400000);                       // x0 = 0.5 (fractional)
-			dsp.regs().b.var = 0x00100000000000;    // seed b with a non-zero value
-			emit(0x0141ca, 0x7fdf3b);               // maci #>$7fdf3b,x0,b
+			dsp.setSR(0);
+			dsp.y0(0x400000);
+			dsp.regs().b.var = 0;
+			emit("maci #>$ffe666,y0,b");
 		}, [&]()
 		{
-			// b must have been updated (multiply-accumulate, not skip).
-			verify(dsp.regs().b.var != 0x00100000000000);
-			verify((dsp.regs().b.var & 0xffffffffffffffULL) != 0);
+			verify(dsp.regs().b.var == 0xfffff333000000ULL);
+		});
+
+		runTest([&]()
+		{
+			dsp.setSR(0);
+			dsp.y0(0x400000);
+			dsp.regs().b.var = 0x00001000000000;
+			emit("maci #>$ffe666,y0,b");
+		}, [&]()
+		{
+			verify(dsp.regs().b.var == 0x00000333000000ULL);
+		});
+
+		runTest([&]()
+		{
+			dsp.setSR(0);
+			dsp.y0(0x800000);
+			dsp.regs().b.var = 0x00010000000000;
+			emit("maci #>$800000,y0,b");
+		}, [&]()
+		{
+			verify(dsp.regs().b.var == 0x00810000000000ULL);
 		});
 	}
 
@@ -5538,6 +5592,7 @@ namespace dsp56k
 	{
 		rep_multi();
 		do_multi();
+		mpyri_do();
 		jsr_rts();
 	}
 
@@ -5631,6 +5686,29 @@ namespace dsp56k
 		execUntil(0x101);
 
 		verify(dsp.regs().a.var == 0x00000003000000);
+	}
+
+	void UnitTests::mpyri_do()
+	{
+		dsp.resetHW();
+		dsp.x0(0x123456);
+		dsp.regs().a.var = 0;
+
+		TWord pc = 0x100;
+		pc = emitToMemory("jsr $200", pc);
+		const auto returnPC = pc;
+		emitToMemory("nop", pc);
+
+		pc = 0x200;
+		pc = emitToMemory("do #$4,>$205", pc);
+		pc = emitToMemory("mpyri #>$40,x0,a", pc);
+		pc = emitToMemory("nop", pc);
+		emitToMemory("rts", pc);
+
+		dsp.setPC(0x100);
+		execUntil(returnPC);
+
+		verify(dsp.regs().a.var == 0x00000009000000);
 	}
 
 	void UnitTests::jsr_rts()

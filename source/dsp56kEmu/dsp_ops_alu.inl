@@ -1160,7 +1160,15 @@ namespace dsp56k
 	}
 	inline void DSP::op_Mpyri(const TWord op)
 	{
-		errNotImplemented("MPYRI");
+		const bool ab = getFieldValue<Mpyri, Field_d>(op);
+		const bool negate = getFieldValue<Mpyri, Field_k>(op);
+		const TWord qq = getFieldValue<Mpyri, Field_qq>(op);
+
+		const TReg24 immediate = TReg24(immediateDataExt<Mpyri>());
+		const TReg24 source = decode_qq_read(qq);
+
+		alu_mpy(ab, source, immediate, negate, false);
+		alu_rnd(ab);
 	}
 	inline void DSP::op_Neg(const TWord op)
 	{

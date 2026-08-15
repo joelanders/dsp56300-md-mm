@@ -239,6 +239,18 @@ namespace dsp56k
 		_dst.set(getOpWordB(), DspValue::Immediate24);
 	}
 
+	void JitOps::getSignedOpWordB(DspValue& _dst)
+	{
+		const auto word = getOpWordB();
+		_dst.set(word, DspValue::Immediate24);
+
+		if(word & 0x00800000)
+		{
+			_dst.toTemp();
+			signextend24to64(r64(_dst));
+		}
+	}
+
 	void JitOps::getXY0(DspValue& _dst, const uint32_t _aluIndex, bool _signextend) const
 	{
 		if (!_dst.isRegValid())

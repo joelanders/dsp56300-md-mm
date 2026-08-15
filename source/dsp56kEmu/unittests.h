@@ -124,6 +124,7 @@ namespace  dsp56k
 		void cmp_xxxx();
 		void subr();
 		void mpyi();
+		void mpyri();
 		void maci_xxxx();
 		void mpy_su();
 		void macsu_unsigned();
@@ -168,6 +169,7 @@ namespace  dsp56k
 		void multiInstructionTests();
 		void rep_multi();
 		void do_multi();
+		void mpyri_do();
 		void jsr_rts();
 
 		Peripherals56362 peripheralsX;
