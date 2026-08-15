@@ -314,14 +314,15 @@ namespace dsp56k
 
 		if(!hasMmuSupport())
 		{
-#ifdef HAVE_X86_64
 			if(asmjit::Support::isPowerOf2(m_block.dsp().memory().size(_area)))
 			{
-				// just return garbage in case memory is read from an invalid address
+				// Mirror dynamic addresses into a power-of-two backing store. This was
+				// historically x86-only, leaving ARM64's destination register untouched
+				// when the address exceeded the backing store and making the result depend
+				// on whichever temporary register happened to be allocated.
 				m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().size(_area)-1)));
 			}
 			else
-#endif
 			{
 				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().size(_area)));
 				m_block.asm_().jge(skip.get());
@@ -349,14 +350,13 @@ namespace dsp56k
 
 		if(!hasMmuSupport())
 		{
-#ifdef HAVE_X86_64
 			if (asmjit::Support::isPowerOf2(m_block.dsp().memory().sizeXY()))
 			{
-				// just return garbage in case memory is read from an invalid address
+				// Match scalar reads and x86-64: a power-of-two external backing store
+				// mirrors dynamic addresses rather than skipping the load with stale data.
 				m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().sizeXY() - 1)));
 			}
 			else
-#endif
 			{
 				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().sizeXY()));
 				m_block.asm_().jge(skip.get());

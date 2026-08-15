@@ -47,6 +47,7 @@ namespace dsp56k
 		runTest(&JitUnittests::getSetRegs_build, &JitUnittests::getSetRegs_verify);
 
 		runAllTests();
+		dynamicPowerOfTwoReadMirroring();
 
 		jitDiv();
 		rep_div();
@@ -57,6 +58,51 @@ namespace dsp56k
 	JitUnittests::~JitUnittests()
 	{
 		m_rt.reset(asmjit::ResetPolicy::kHard);
+	}
+
+	void JitUnittests::dynamicPowerOfTwoReadMirroring()
+	{
+		// Dynamic JIT reads mirror through power-of-two backing stores. x86-64 has
+		// always applied the mask; ARM64 used to skip the load on an oversized
+		// address and leak the previous contents of its destination host register.
+		// Prime those registers with sentinels so the old ARM behavior fails
+		// deterministically instead of depending on allocator luck.
+		mem.set(MemArea_P, 0x123, 0x123456);
+		mem.set(MemArea_X, 0x234, 0x234567);
+		mem.set(MemArea_Y, 0x234, 0x345678);
+		runTest([&]()
+		{
+			m_checks.fill(0);
+			{
+				DspValue offset(*block, UsePooledTemp);
+				offset.temp(DspValue::Memory);
+				block->asm_().mov(r32(offset), asmjit::Imm(0x080123));
+				DspValue value(*block, UsePooledTemp);
+				value.temp(DspValue::Memory);
+				block->asm_().mov(r32(value), asmjit::Imm(0xdeadbeef));
+				block->mem().readDspMemory(value, MemArea_P, offset);
+				block->mem().mov(m_checks[0], value);
+			}
+			{
+				DspValue offset(*block, UsePooledTemp);
+				offset.temp(DspValue::Memory);
+				block->asm_().mov(r32(offset), asmjit::Imm(0x800234));
+				DspValue x(*block, UsePooledTemp);
+				DspValue y(*block, UsePooledTemp);
+				x.temp(DspValue::Memory);
+				y.temp(DspValue::Memory);
+				block->asm_().mov(r32(x), asmjit::Imm(0xdeadbeef));
+				block->asm_().mov(r32(y), asmjit::Imm(0xcafef00d));
+				block->mem().readDspMemory(x, y, offset);
+				block->mem().mov(m_checks[1], x);
+				block->mem().mov(m_checks[2], y);
+			}
+		}, [&]()
+		{
+			verify(m_checks[0] == 0x123456);
+			verify(m_checks[1] == 0x234567);
+			verify(m_checks[2] == 0x345678);
+		});
 	}
 
 	void JitUnittests::runTest(void( JitUnittests::* _build)(), void( JitUnittests::* _verify)())
