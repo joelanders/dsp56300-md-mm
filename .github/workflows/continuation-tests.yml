@@ -1,0 +1,50 @@
+name: DSP56300 continuation tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/elektron-alpha-continuation-20260815
+  pull_request:
+    paths:
+      - ".github/workflows/continuation-tests.yml"
+      - "CMakeLists.txt"
+      - "source/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dsp56300-continuation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }} Release tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+          - name: macOS arm64
+            os: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
