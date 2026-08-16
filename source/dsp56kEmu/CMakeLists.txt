@@ -110,10 +110,8 @@ endif()
 
 if(MSVC)
 	SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /constexpr:steps10000000")
-elseif(UNIX AND NOT APPLE)
-	if(NOT ANDROID)
-		SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fconstexpr-loop-limit=10000000")
-	endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT ANDROID)
+	SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fconstexpr-loop-limit=10000000")
 endif()
 
 if(UNIX AND NOT APPLE)
