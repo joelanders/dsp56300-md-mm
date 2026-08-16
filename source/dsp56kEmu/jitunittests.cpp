@@ -65,18 +65,23 @@ namespace dsp56k
 		// Dynamic JIT reads mirror through power-of-two backing stores. x86-64 has
 		// always applied the mask; ARM64 used to skip the load on an oversized
 		// address and leak the previous contents of its destination host register.
-		// Prime those registers with sentinels so the old ARM behavior fails
-		// deterministically instead of depending on allocator luck.
-		mem.set(MemArea_P, 0x123, 0x123456);
-		mem.set(MemArea_X, 0x234, 0x234567);
-		mem.set(MemArea_Y, 0x234, 0x345678);
-		runTest([&]()
+		// Use a small, explicitly non-MMU fixture so hosts capable of mapping the
+		// DSP's full virtual address space still exercise this fallback path.
+		DefaultMemoryValidator memoryValidator;
+		Peripherals56362 peripheralsX;
+		Peripherals56367 peripheralsY;
+		Memory powerOfTwoMemory(memoryValidator, 0x1000);
+		DSP powerOfTwoDsp(powerOfTwoMemory, &peripheralsX, &peripheralsY);
+		powerOfTwoMemory.set(MemArea_P, 0x123, 0x123456);
+		powerOfTwoMemory.set(MemArea_X, 0x234, 0x234567);
+		powerOfTwoMemory.set(MemArea_Y, 0x234, 0x345678);
+		runTest(powerOfTwoDsp, [&]()
 		{
 			m_checks.fill(0);
 			{
 				DspValue offset(*block, UsePooledTemp);
 				offset.temp(DspValue::Memory);
-				block->asm_().mov(r32(offset), asmjit::Imm(0x080123));
+				block->asm_().mov(r32(offset), asmjit::Imm(0x1123));
 				DspValue value(*block, UsePooledTemp);
 				value.temp(DspValue::Memory);
 				block->asm_().mov(r32(value), asmjit::Imm(0xdeadbeef));
@@ -86,7 +91,7 @@ namespace dsp56k
 			{
 				DspValue offset(*block, UsePooledTemp);
 				offset.temp(DspValue::Memory);
-				block->asm_().mov(r32(offset), asmjit::Imm(0x800234));
+				block->asm_().mov(r32(offset), asmjit::Imm(0x1234));
 				DspValue x(*block, UsePooledTemp);
 				DspValue y(*block, UsePooledTemp);
 				x.temp(DspValue::Memory);
@@ -117,6 +122,11 @@ namespace dsp56k
 	}
 
 	void JitUnittests::runTest(const std::function<void()>& _build, const std::function<void()>& _verify)
+	{
+		runTest(dsp, _build, _verify);
+	}
+
+	void JitUnittests::runTest(DSP& _dsp, const std::function<void()>& _build, const std::function<void()>& _verify)
 	{
 		AsmJitErrorHandler errorHandler;
 		asmjit::CodeHolder code;
@@ -155,7 +165,7 @@ namespace dsp56k
 			config.dynamicPeripheralAddressing = true;
 			config.aguSupportBitreverse = true;
 
-			JitBlock b(m_asm, dsp, rtData, std::move(config));
+			JitBlock b(m_asm, _dsp, rtData, std::move(config));
 			JitBlockRuntimeData rt;
 			JitOps o(b, rt);
 
@@ -168,7 +178,7 @@ namespace dsp56k
 
 			PushAllUsed pusher(b);
 
-			m_asm.mov(regDspPtr, asmjit::Imm(&dsp.regs()));
+			m_asm.mov(regDspPtr, asmjit::Imm(&_dsp.regs()));
 			_build();
 
 			block = nullptr;
@@ -200,7 +210,7 @@ namespace dsp56k
 			if(m_logging)
 				LOG("Running test code");
 
-			func(&dsp.regs(), 0xbadbc);
+			func(&_dsp.regs(), 0xbadbc);
 
 			if(m_logging)
 				LOG("Verifying test code");

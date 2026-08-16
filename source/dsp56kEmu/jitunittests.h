@@ -20,6 +20,7 @@ namespace dsp56k
 	private:
 		void runTest(void(JitUnittests::*_build)(), void(JitUnittests::*_verify)());
 		void runTest(const std::function<void()>& _build, const std::function<void()>& _verify) override;
+		void runTest(DSP& _dsp, const std::function<void()>& _build, const std::function<void()>& _verify);
 		void nop(size_t _count = 1) const;
 		void dynamicPowerOfTwoReadMirroring();
 		
