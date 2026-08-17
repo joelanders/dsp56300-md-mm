@@ -47,7 +47,8 @@ namespace dsp56k
 
 		bool	plock		( TWord _address );
 
-		void	pfree		();
+		void	pfree();
+		void pflush();
 
 		void	pflushun	();
 

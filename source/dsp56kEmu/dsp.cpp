@@ -2,18 +2,18 @@
 
 #include "dsp.h"
 
-#include <iomanip>
 #include <cstring>
+#include <iomanip>
 
-#include "registers.h"
-#include "types.h"
-#include "memory.h"
-#include "disasm.h"
 #include "aar.h"
 #include "debuggerinterface.h"
+#include "disasm.h"
 #include "dspconfig.h"
 #include "interrupts.h"
+#include "memory.h"
 #include "opcodecycles.h"
+#include "registers.h"
+#include "types.h"
 
 #include "dsp_decode.inl"
 
@@ -30,7 +30,9 @@
 #if 0
 #	define LOGSC(F)	logSC(F)
 #else
-#	define LOGSC(F)	{}
+#	define LOGSC(F)                                                                                                       \
+	{                                                                                                                  \
+	}
 #endif
 
 //
@@ -122,12 +124,15 @@ namespace dsp56k
 		iprc(0);
 		iprp(0);
 
-		// TODO: The Bus Control Register (BCR), the Address Attribute Registers (AAR3�AAR0) and the DRAM Control Register (DCR) are set to their initial values as described in Chapter 9, External Memory Interface (Port A). The initial value causes a maximum number of wait states to be added to every external memory access.
+		// TODO: The Bus Control Register (BCR), the Address Attribute Registers (AAR3�AAR0) and the DRAM Control
+		// Register (DCR) are set to their initial values as described in Chapter 9, External Memory Interface (Port A).
+		// The initial value causes a maximum number of wait states to be added to every external memory access.
 
 		reg.sp = TReg24(int(0));
 		reg.sc = TReg5(char(0));
 
-		reg.sz.var = 0xbadbad; // The SZ register is not initialized during hardware reset, and must be set, using a MOVEC instruction, prior to enabling the stack extension.
+		reg.sz.var = 0xbadbad; // The SZ register is not initialized during hardware reset, and must be set, using a
+							   // MOVEC instruction, prior to enabling the stack extension.
 
 		const CCRMask srClear	= static_cast<CCRMask>(SR_RM | SR_SM | SR_CE | SR_SA | SR_FV | SR_LF | SR_DM | SR_SC | SR_S0 | SR_S1 | 0xf);
 		const CCRMask srSet		= static_cast<CCRMask>(SR_CP0 | SR_CP1 | SR_I0 | SR_I1);
@@ -145,7 +150,10 @@ namespace dsp56k
 
 		reg.vba = TReg24(int(0));
 
-		// TODO: The DSP56300 core remains in the Reset state until RESET is deasserted. Upon leaving the Reset state, the Chip Operating mode bits of the OMR are loaded from the external mode select pins (MODA, MODB, MODC, MODD), and program execution begins at the program memory address as described in Chapter 11, Operating Modes and Memory Spaces.
+		// TODO: The DSP56300 core remains in the Reset state until RESET is deasserted. Upon leaving the Reset state,
+		// the Chip Operating mode bits of the OMR are loaded from the external mode select pins (MODA, MODB, MODC,
+		// MODD), and program execution begins at the program memory address as described in Chapter 11, Operating Modes
+		// and Memory Spaces.
 
 		reg.pc = TReg24(int(0));
 		reg.omr = TReg24(int(0));
@@ -207,7 +215,8 @@ namespace dsp56k
 			return;
 		}
 
-		// it is important that the processing mode is switched first before popping the vector to prevent a possible race condition in hasPendingInterrupt()
+		// it is important that the processing mode is switched first before popping the vector to prevent a possible
+		// race condition in hasPendingInterrupt()
 		{
 			m_processingMode = FastInterrupt;
 			m_pendingInterrupts.pop_front();
@@ -323,16 +332,26 @@ namespace dsp56k
 		return interrupt >= Vba_End || !isInterruptMasked(interrupt);
 	}
 
+	bool DSP::hasServiceableInterrupt() const
+	{
+		if (hasServiceablePendingInterrupt())
+			return true;
+		if (m_pendingExternalInterrupts.empty())
+			return false;
+		const auto interrupt = m_pendingExternalInterrupts.front().vector;
+		return interrupt >= Vba_End || !isInterruptMasked(interrupt);
+	}
+
 	bool DSP::canServicePacedJitWait() const
 	{
 		return m_pacedJitActive && !m_boundedJitMode && m_budgetedWait
-			&& hasServiceablePendingInterrupt();
+			&& hasServiceableInterrupt();
 	}
 
 	bool DSP::canServiceBoundedJitWait() const
 	{
 		return m_pacedJitActive && m_boundedJitMode && m_budgetedWait
-			&& hasServiceablePendingInterrupt();
+			&& hasServiceableInterrupt();
 	}
 
 	bool DSP::advanceBudgetedWait(const uint64_t _remainingBudget) noexcept
@@ -485,6 +504,7 @@ namespace dsp56k
 		m_boundedJitMode = true;
 		m_boundedJitCompilationAllowed = true;
 		m_boundedJitCacheMiss = false;
+		m_boundedJitDeferredVolatileWrites = false;
 		m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		m_ownedJitMaxInstructions = BoundedJitMaxInstructionsPerBlock;
 		m_ownedJitMaxDoIterations = BoundedJitMaxDoIterations;
@@ -509,6 +529,7 @@ namespace dsp56k
 		m_boundedJitMode = false;
 		m_boundedJitCompilationAllowed = true;
 		m_boundedJitCacheMiss = false;
+		m_boundedJitDeferredVolatileWrites = false;
 		m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		m_ownedJitMaxInstructions = 0;
 		m_ownedJitMaxDoIterations = 0;
@@ -581,14 +602,36 @@ namespace dsp56k
 		m_pacedJitExpectedAtomic = (Opcodes::getFlags(instA, instB)
 			& (OpFlagRepDynamic | OpFlagRepImmediate)) != 0;
 
-		if(!m_jit.ensureProgramAddress(pc))
+		if(!m_boundedJitCompilationAllowed &&
+			(m_jit.requiresRealtimeInterpreter(pc) || !m_jit.canExecuteProgramAddressWithoutCompilation(pc)))
+		{
+			m_budgetedStartedDo = false;
+			m_budgetedAtomicBoundary = false;
+			m_budgetedExecutionActive = true;
+#if DSP56300_DEBUGGER
+			if (m_debugger)
+				m_debugger->onExec(getPC().var);
+#endif
+			pcCurrentInstruction = reg.pc.toWord();
+			const auto op = fetchPC();
+			execOp(op);
+			if (!m_budgetedWait)
+				finishBudgetedDoBoundary();
+			m_budgetedExecutionActive = false;
+			if (m_budgetedAtomicBoundary)
+				m_pacedJitAtomicBoundary = true;
+			return true;
+		}
+
+		if (!m_jit.ensureProgramAddress(pc))
 			return false;
 		LOGJITPC(pc);
 		m_jitEntries[pc](&reg, pc);
 		return true;
 	}
 
-	DSP::PacedJitExecutionResult DSP::executePacedJitSlice(const uint32_t _instructionBudget)
+	DSP::PacedJitExecutionResult DSP::executePacedJitSlice(const uint32_t _instructionBudget,
+														   const uint64_t _waitCounterAdvance)
 	{
 		PacedJitExecutionResult result;
 		if(m_pacedJitExecuting)
@@ -629,7 +672,7 @@ namespace dsp56k
 		const auto cyclesBefore = m_cycles;
 		const auto configGeneration = m_pacedJitConfigGeneration;
 		m_pacedJitExecuting = true;
-		const auto completedBoundary = executePacedJitBoundary(configGeneration, 1);
+		const auto completedBoundary = executePacedJitBoundary(configGeneration, _waitCounterAdvance);
 		m_pacedJitExecuting = false;
 
 		result.instructionDelta = m_instructions - instructionsBefore;
@@ -792,6 +835,11 @@ namespace dsp56k
 			}
 		}
 		m_boundedJitCompilationAllowed = _allowed;
+		if (_allowed && m_boundedJitDeferredVolatileWrites)
+		{
+			m_boundedJitDeferredVolatileWrites = false;
+			m_jit.refreshVolatileProgramAddresses();
+		}
 		if(_allowed && m_boundedJitDeferredProgramWrite != 0xffffffffu)
 		{
 			const auto address = m_boundedJitDeferredProgramWrite;
@@ -1225,7 +1273,8 @@ namespace dsp56k
 		reg.lc = ssl();
 		reg.la = ssh();
 
-	//	LOG( "DO END: loop flag = " << sr_test(SR_LF) << " sc=" << (int)sc.var << " lc:" << std::hex << lc.var << " la:" << std::hex << la.var );
+		//	LOG( "DO END: loop flag = " << sr_test(SR_LF) << " sc=" << (int)sc.var << " lc:" << std::hex << lc.var << "
+		//la:" << std::hex << la.var );
 
 		return true;
 	}
@@ -1879,8 +1928,8 @@ namespace dsp56k
 		sr_toggle(CCRB_N, bitvalue<uint64_t, 47>(d));	// Set if bit 47 of the result is set
 		sr_toggle(CCR_Z, masked == 0);					// Set if bits 47�24 of the result are 0
 		sr_clear(CCR_V);								// Always cleared
-		//sr_s_update();								// Changed according to the standard definition
-		//sr_l_update_by_v();							// Changed according to the standard definition
+		// sr_s_update();								// Changed according to the standard definition
+		// sr_l_update_by_v();							// Changed according to the standard definition
 	}
 
 	void DSP::set_m( const int which, const TWord val)
@@ -2082,24 +2131,24 @@ namespace dsp56k
 		_ss << "  hit=   " << logReg(Reg_HIT, -6) << "   miss=   " << logReg(Reg_MISS, -6) << " replace=" << logReg(Reg_REPLACE,-6) << std::endl;
 		_ss << "  cyc=   " << logReg(Reg_CYC, -6) << "   ictr=   " << logReg(Reg_ICTR, -6) << std::endl;
 		_ss << " cnt1=   " << logReg(Reg_CNT1, -6) << "   cnt2=   " << logReg(Reg_CNT2, -6) << " cnt3=   " << logReg(Reg_CNT3,-6) << "  cnt4=   " << logReg(Reg_CNT4,-6) << std::endl;
-/*
-   x=       $000000000000    y=       $000000000000
-   a=     $00000000000051    b=     $00000000000000
-               x1=$000000   x0=$000000   r7=$000000 n7=$000000 m7=$ffffff
-               y1=$000000   y0=$000000   r6=$000000 n6=$000000 m6=$ffffff
-  a2=    $00   a1=$000000   a0=$000051   r5=$000000 n5=$000000 m5=$ffffff
-  b2=    $00   b1=$000000   b0=$000000   r4=$000000 n4=$000000 m4=$ffffff
-                                         r3=$000000 n3=$000000 m3=$ffffff
-  pc=$000102   sr=$c00300  omr=$00030e   r2=$000000 n2=$000000 m2=$ffffff
-  la=$ffffff   lc=$000000                r1=$000100 n1=$000000 m1=$ffffff
- ssh=$000000  ssl=$000000   sp=$000000   r0=$000151 n0=$000000 m0=$ffffff
-  ep=$000000   sz=$000000   sc=$000000  vba=$000000
-iprc=$000000 iprp=$000000  bcr=$212421  dcr=$000000
-aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
-  hit=   000000   miss=   000000 replace=000000
-  cyc=   001027   ictr=   000259
- cnt1=   000000   cnt2=   000000 cnt3=   000000  cnt4=   000000
-*/
+		/*
+		   x=       $000000000000    y=       $000000000000
+		   a=     $00000000000051    b=     $00000000000000
+					   x1=$000000   x0=$000000   r7=$000000 n7=$000000 m7=$ffffff
+					   y1=$000000   y0=$000000   r6=$000000 n6=$000000 m6=$ffffff
+		  a2=    $00   a1=$000000   a0=$000051   r5=$000000 n5=$000000 m5=$ffffff
+		  b2=    $00   b1=$000000   b0=$000000   r4=$000000 n4=$000000 m4=$ffffff
+												 r3=$000000 n3=$000000 m3=$ffffff
+		  pc=$000102   sr=$c00300  omr=$00030e   r2=$000000 n2=$000000 m2=$ffffff
+		  la=$ffffff   lc=$000000                r1=$000100 n1=$000000 m1=$ffffff
+		 ssh=$000000  ssl=$000000   sp=$000000   r0=$000151 n0=$000000 m0=$ffffff
+		  ep=$000000   sz=$000000   sc=$000000  vba=$000000
+		iprc=$000000 iprp=$000000  bcr=$212421  dcr=$000000
+		aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
+		  hit=   000000   miss=   000000 replace=000000
+		  cyc=   001027   ictr=   000259
+		 cnt1=   000000   cnt2=   000000 cnt3=   000000  cnt4=   000000
+		*/
 	}
 
 	void DSP::errNotImplemented(const char* _opName)

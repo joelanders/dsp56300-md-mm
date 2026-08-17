@@ -7,12 +7,12 @@
 #include "jitregtracker.h"
 #include "jittypes.h"
 
+#include "opcodeanalysis.h"
 #include "opcodes.h"
 #include "opcodetypes.h"
 #include "registers.h"
 #include "types.h"
 #include "utils.h"
-#include "opcodeanalysis.h"
 
 namespace dsp56k
 {
@@ -250,7 +250,7 @@ namespace dsp56k
 		void op_Or_xx(TWord op);
 		void op_Or_xxxx(TWord op);
 		void op_Ori(TWord op);
-		void op_Pflush(TWord op)				{ errNotImplemented(op); }
+		void op_Pflush(TWord op);
 		void op_Pflushun(TWord op);
 		void op_Pfree(TWord op);
 		void op_Plock(TWord op);

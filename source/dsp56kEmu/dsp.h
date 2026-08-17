@@ -3,13 +3,13 @@
 #include "disasm.h"
 #include "dspconfig.h"
 #include "dspregs.h"
-#include "registers.h"
-#include "memory.h"
-#include "utils.h"
 #include "instructioncache.h"
-#include "opcodes.h"
 #include "jit.h"
 #include "jittypes.h"
+#include "memory.h"
+#include "opcodes.h"
+#include "registers.h"
+#include "utils.h"
 
 #include <array>
 #include <functional>
@@ -18,7 +18,9 @@
 #if 0
 #	define LOGJITPC(PC)		LOG(HEX(reinterpret_cast<uint64_t>(this)) << " exec @ " << HEX(PC))
 #else
-#	define LOGJITPC(PC)		{}
+#	define LOGJITPC(PC)                                                                                                   \
+	{                                                                                                                  \
+	}
 #endif
 
 namespace dsp56k
@@ -75,7 +77,9 @@ namespace dsp56k
 		enum ProcessingMode
 		{
 			Default,
-			DefaultPreventInterrupt,	// The only purpose of this state is to give time to regular processing if the emulation is so slow that interrupts are constantly processed, leaving no room for regular processing
+			DefaultPreventInterrupt, // The only purpose of this state is to give time to regular processing if the
+									 // emulation is so slow that interrupts are constantly processed, leaving no room
+									 // for regular processing
 			FastInterrupt,
 			LongInterrupt,
 		};
@@ -232,6 +236,7 @@ namespace dsp56k
 		bool							m_boundedJitMode = false;
 		bool							m_boundedJitCompilationAllowed = true;
 		bool							m_boundedJitCacheMiss = false;
+		bool m_boundedJitDeferredVolatileWrites = false;
 		TWord							m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		uint32_t						m_ownedJitMaxInstructions = 0;
 		uint32_t						m_ownedJitMaxDoIterations = 0;
@@ -380,7 +385,7 @@ namespace dsp56k
 		// scheduler timing parity is claimed by the measured counter deltas.
 		PacedJitActivation beginPacedJitExecution();
 		bool endPacedJitExecution();
-		PacedJitExecutionResult executePacedJitSlice(uint32_t _instructionBudget);
+		PacedJitExecutionResult executePacedJitSlice(uint32_t _instructionBudget, uint64_t _waitCounterAdvance = 1);
 		bool isPacedJitExecutionActive() const
 		{
 			return m_pacedJitActive && !m_boundedJitMode;
@@ -413,14 +418,16 @@ namespace dsp56k
 		bool canServiceBoundedJitWait() const;
 		// Preparation may leave compilation enabled while warming expected paths.
 		// Disabling it is a quiescent transition and rejects an unseen current PC or
-		// immediately serviceable normal vector. A later unseen block/mode returns
-		// CacheMiss without allocating and may be retried after preparation resumes.
+		// immediately serviceable normal vector. A later unseen ordinary PC uses one
+		// allocation-free interpreter boundary; an unseen vector or mode still
+		// returns CacheMiss and may be retried after preparation resumes.
 		bool setBoundedJitCompilationAllowed(bool _allowed);
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
 		{
 			// this is a super hot function and for some reason the compiler insists of doing all the stack frame work
-			// before this early out. To fix this, we move the remaining code into a helper func below, marked as noinline
+			// before this early out. To fix this, we move the remaining code into a helper func below, marked as
+			// noinline
 			if (ASMJIT_LIKELY(!perif[0]->isDue(m_instructions, m_cycles)))
 				return;
 
@@ -531,6 +538,9 @@ namespace dsp56k
 		{
 			return !m_pendingExternalInterrupts.empty();
 		}
+		// True only when the FIFO head can enter under the current mask. Includes
+		// externally injected requests not yet transferred into the core queue.
+		bool hasServiceableInterrupt() const;
 
 		void			clearOpcodeCache				();
 		void			clearOpcodeCache				(TWord _address);
@@ -640,6 +650,11 @@ namespace dsp56k
 		{
 			m_boundedJitDeferredProgramWrite = _address;
 			notifyJitCacheMiss();
+			notifyProgramMemWrite(_address);
+		}
+		void deferVolatileJitProgramWrite(TWord _address) noexcept
+		{
+			m_boundedJitDeferredVolatileWrites = true;
 			notifyProgramMemWrite(_address);
 		}
 		void	requestPacedJitTeardownForReset	();
@@ -1405,7 +1420,8 @@ namespace dsp56k
 
 		template<Instruction Inst> TWord immediateDataExt()
 		{
-			// TODO: it would be better to check for extension word type & ImmediateDataExt but as there is code that is not compiled at compile time, we can't do that yet
+			// TODO: it would be better to check for extension word type & ImmediateDataExt but as there is code that is
+			// not compiled at compile time, we can't do that yet
 			static_assert(g_opcodes[Inst].m_extensionWordType, "opcode does not have an immediate data extension word");
 			return fetchOpWordB();
 		}

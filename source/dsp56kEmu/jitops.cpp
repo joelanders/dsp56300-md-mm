@@ -512,7 +512,8 @@ namespace dsp56k
 
 		m_resultFlags |= WriteToLC | WriteToLA;
 
-	//	LOG( "DO END: loop flag = " << sr_test(SR_LF) << " sc=" << (int)sc.var << " lc:" << std::hex << lc.var << " la:" << std::hex << la.var );
+		//	LOG( "DO END: loop flag = " << sr_test(SR_LF) << " sc=" << (int)sc.var << " lc:" << std::hex << lc.var << "
+		//la:" << std::hex << la.var );
 	}
 
 	void JitOps::op_Stop(TWord op)
@@ -658,7 +659,8 @@ namespace dsp56k
 		reinterpret_cast<uint64_t&>(regsWritten) &= ~static_cast<uint64_t>(RegisterMask::SR);
 		reinterpret_cast<uint64_t&>(regsRead) &= ~static_cast<uint64_t>(RegisterMask::SR);
 
-		// we need to read registers that are write-only beause the write is conditional. Otherwise this would discard the current register values if the write is not happening and writes back crap to memory
+		// we need to read registers that are write-only beause the write is conditional. Otherwise this would discard
+		// the current register values if the write is not happening and writes back crap to memory
 		regsRead |= regsWritten;
 
 		const TWord cccc = getFieldValue<Ifcc,Field_CCCC>(op);
@@ -747,6 +749,8 @@ namespace dsp56k
 		}
 	}
 
+	void callDSPPflush(DSP *const _dsp, const TWord op) { _dsp->op_Pflush(op); }
+
 	void callDSPPflushun(DSP* const _dsp, const TWord op)
 	{
 		_dsp->op_Pflushun(op);
@@ -759,7 +763,9 @@ namespace dsp56k
 
 	void callDSPPlock(DSP* const _dsp, const TWord ea)
 	{
-		_dsp->cachePlock(ea);
+		_dsp->cachePlock(ea); }
+
+	void JitOps::op_Pflush(TWord op) { callDSPFunc(&callDSPPflush, op);
 	}
 
 	void JitOps::op_Pflushun(TWord op)
@@ -872,7 +878,8 @@ namespace dsp56k
 			// rep nop => do nothing
 			m_blockRuntimeData.getEncodedInstructionCount() += loopCount;
 
-			// Note: We use _lc minus one because the operation itself was already counted once in JitBlock.cpp, where it just counts every translated op already
+			// Note: We use _lc minus one because the operation itself was already counted once in JitBlock.cpp, where
+			// it just counts every translated op already
 			m_blockRuntimeData.getEncodedCycleCount() += (loopCount-1) * dsp56k::calcCycles(Nop, m_pcCurrentOp, 0, 0, 0);
 			m_opSize++;
 			return;
@@ -959,7 +966,8 @@ namespace dsp56k
 			if(m_repMode == RepLoop)
 			{
 				// this is not currently happening, but might be for other code in the future. Check it once it appears.
-				// A valid safe bet /workaround is to release the whole pool after each loop iteration, but costs a lot of performance obviously
+				// A valid safe bet /workaround is to release the whole pool after each loop iteration, but costs a lot
+				// of performance obviously
 				const auto written = m_block.dspRegPool().getWrittenRegs();
 
 				const auto nowLoaded = m_block.dspRegPool().getLoadedRegs();

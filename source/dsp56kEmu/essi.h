@@ -188,6 +188,8 @@ namespace dsp56k
 		// callback registration. reset() preserves host wiring; terminate() detaches it.
 		// Fine-link mode derives an advisory serial period from CRA when CRA is written.
 		void setFineLinkMode(bool _enabled);
+		void setOnDemandTxWireSemantics(bool _enabled) { m_onDemandTxWireSemantics = _enabled; }
+		void setOnDemandRxWireSemantics(bool _enabled) { m_onDemandRxWireSemantics = _enabled; }
 		void setRxDataAvailableCallback(std::function<bool()> _callback) { m_rxDataAvailable = std::move(_callback); }
 		void setRxConsumeCallback(std::function<void()> _callback) { m_rxConsumeCallback = std::move(_callback); }
 
@@ -221,6 +223,7 @@ namespace dsp56k
 		const auto& getSR() const { return m_sr; }
 		const auto& getCRA() const { return m_cra; }
 		const auto& getCRB() const { return m_crb; }
+		TWord getLastTxWrittenMask() const { return m_lastTxWrittenMask; }
 		TWord getTxWordCount() const;
 		TWord getRxWordCount() const;
 
@@ -253,6 +256,7 @@ namespace dsp56k
 		TWord m_rxFrameCounter = 0;
 		TWord m_txSlotCounter = 0;
 		TWord m_txFrameCounter = 0;
+		TWord m_lastTxWrittenMask = 0;
 		TWord m_readRX = 0;
 		TWord m_writtenTX = 0;
 
@@ -261,6 +265,8 @@ namespace dsp56k
 
 		bool m_fineLinkMode = false;
 		bool m_fastLinkRx = false;
+		bool m_onDemandTxWireSemantics = false;
+		bool m_onDemandRxWireSemantics = false;
 		bool m_fastLinkRxStarted = false;
 		std::function<bool()> m_rxDataAvailable;
 		std::function<void()> m_rxConsumeCallback;

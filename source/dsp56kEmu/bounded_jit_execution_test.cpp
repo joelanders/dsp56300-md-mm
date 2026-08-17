@@ -4,8 +4,8 @@
 #include "memory.h"
 #include "peripherals.h"
 
-#include <cstdio>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <new>
 #include <stdexcept>
@@ -325,22 +325,17 @@ namespace
 			"prewarmed block was not executable after compilation closed");
 
 		fixture.dsp.setPC(0x200);
-		const auto beforeInstructions = fixture.dsp.getInstructionCounter();
-		const auto beforeCycles = fixture.dsp.getCycles();
 		g_allocations.store(0, std::memory_order_relaxed);
 		g_measureAllocations.store(true, std::memory_order_relaxed);
-		const auto miss = fixture.dsp.executeBoundedJitBlock();
+		const auto interpreted = fixture.dsp.executeBoundedJitBlock();
 		g_measureAllocations.store(false, std::memory_order_relaxed);
-		require(miss.stop == DSP::BoundedJitExecutionStop::CacheMiss
-			&& miss.instructionDelta == 0 && miss.cycleCounterDelta == 0
-			&& fixture.dsp.getInstructionCounter() == beforeInstructions
-			&& fixture.dsp.getCycles() == beforeCycles
-			&& g_allocations.load(std::memory_order_relaxed) == 0
+		require(interpreted.stop == DSP::BoundedJitExecutionStop::BlockComplete && interpreted.instructionDelta == 1 && fixture.dsp.getPC().toWord() == 0x201 && g_allocations.load(std::memory_order_relaxed) == 0
 			&& fixture.dsp.isBoundedJitExecutionActive(),
-			"unseen realtime block allocated, executed, or destroyed ownership");
+				"unseen realtime PC did not use one allocation-free interpreter boundary");
 
 		require(fixture.dsp.setBoundedJitCompilationAllowed(true),
 			"failed to reopen preparation-time compilation");
+		fixture.dsp.setPC(0x200);
 		const auto prepared = fixture.dsp.executeBoundedJitBlock();
 		require(prepared.stop == DSP::BoundedJitExecutionStop::BlockComplete
 			&& prepared.instructionDelta == 2
@@ -386,6 +381,66 @@ namespace
 			"prepared fast vector did not acknowledge on its following source block");
 		require(interruptFixture.dsp.endBoundedJitExecution(),
 			"failed to end the unseen-vector bounded session");
+	}
+
+	void preparedVolatileProgramWritesUseTheAllocationFreeInterpreter()
+	{
+		Fixture fixture;
+		const auto first = fixture.assembler.assemble("move #$1,r1");
+		const auto second = fixture.assembler.assemble("move #$2,r1");
+		require(first.success() && second.success() && first.wordCount == 1 && second.wordCount == 1,
+				"failed to assemble volatile-program payloads");
+
+		fixture.install(0x200, "move #$1,r1");
+		fixture.install(0x201, "jmp $100");
+		TWord writer = 0x100;
+		writer = fixture.install(writer, "move r0,p:(r2)");
+		fixture.install(writer, "jmp $200");
+		const auto writerSuccessor = writer;
+		fixture.dsp.regs().r[0].var = second.word[0];
+		fixture.dsp.regs().r[2].var = 0x200;
+		fixture.dsp.setPC(0x200);
+		fixture.begin();
+
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete,
+				"failed to compile the future volatile program address");
+		fixture.dsp.setPC(0x100);
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					fixture.dsp.getJit().isVolatileP(0x200),
+				"preparation-time program write was not isolated as volatile");
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					fixture.dsp.getPC().toWord() == 0x200,
+				"program-write successor did not reach the volatile instruction");
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					fixture.dsp.getPC().toWord() == 0x201,
+				"failed to compile the isolated volatile instruction");
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					fixture.dsp.getPC().toWord() == 0x100 && fixture.dsp.setBoundedJitCompilationAllowed(false),
+				"failed to close compilation after volatile-path preparation");
+
+		fixture.dsp.regs().r[0].var = first.word[0];
+		g_allocations.store(0, std::memory_order_relaxed);
+		g_measureAllocations.store(true, std::memory_order_relaxed);
+		const auto write = fixture.dsp.executeBoundedJitBlock();
+		const auto writeReachedSuccessor = fixture.dsp.getPC().toWord() == writerSuccessor;
+		const auto branch = fixture.dsp.executeBoundedJitBlock();
+		const auto interpreted = fixture.dsp.executeBoundedJitBlock();
+		g_measureAllocations.store(false, std::memory_order_relaxed);
+		require(write.stop == DSP::BoundedJitExecutionStop::BlockComplete && writeReachedSuccessor &&
+					fixture.memory.get(MemArea_P, 0x200) == first.word[0] &&
+					branch.stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					interpreted.stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					interpreted.instructionDelta == 1 && fixture.dsp.getPC().toWord() == 0x201 &&
+					fixture.dsp.regs().r[1].toWord() == 1 && g_allocations.load(std::memory_order_relaxed) == 0,
+				"known volatile program write did not use the allocation-free interpreter");
+
+		require(fixture.dsp.setBoundedJitCompilationAllowed(true),
+				"failed to reopen compilation after a volatile program write");
+		fixture.dsp.setPC(0x200);
+		require(fixture.dsp.executeBoundedJitBlock().stop == DSP::BoundedJitExecutionStop::BlockComplete &&
+					fixture.dsp.regs().r[1].toWord() == 1,
+				"reopened preparation did not refresh the volatile native block");
+		require(fixture.dsp.endBoundedJitExecution(), "failed to end volatile-program bounded session");
 	}
 
 	void waitStopAndResetRemainBounded()
@@ -510,6 +565,7 @@ int main()
 			activationOwnsOneFixedBlockAndRestoresTheExactConfiguration();
 			measuredDynamicBlocksMatchTheSameOrdinaryJitConfiguration();
 			prewarmedOnlyModeRejectsAnUnseenBlockWithoutLosingOwnership();
+			preparedVolatileProgramWritesUseTheAllocationFreeInterpreter();
 			waitStopAndResetRemainBounded();
 			callbacksCannotReenterOrSilentlyChangeTheOwnedConfiguration();
 		}

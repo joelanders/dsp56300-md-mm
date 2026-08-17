@@ -323,6 +323,11 @@ namespace
 			require(parked.stop == DSP::PacedJitExecutionStop::Waiting
 				&& parked.instructionDelta == 0 && fixture.dsp.regs().r[0].toWord() == 0,
 				"zero-budget paced WAIT was not passive");
+			const auto cyclesBeforeProbe = fixture.dsp.getCycles();
+			const auto zeroAdvance = fixture.dsp.executePacedJitSlice(1, 0);
+			require(zeroAdvance.stop == DSP::PacedJitExecutionStop::Waiting && zeroAdvance.instructionDelta == 0 &&
+						zeroAdvance.cycleCounterDelta == 0 && fixture.dsp.getCycles() == cyclesBeforeProbe,
+					"zero-advance paced WAIT probe invented counter progress");
 			require(fixture.dsp.injectInterrupt(Vba_NMI), "failed to queue paced WAIT wake");
 			const auto wake = fixture.dsp.executePacedJitSlice(1);
 			require(wake.stop == DSP::PacedJitExecutionStop::BudgetExhausted

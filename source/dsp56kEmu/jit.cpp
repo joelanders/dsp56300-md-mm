@@ -2,9 +2,9 @@
 
 #include "dsp.h"
 #include "jitblock.h"
+#include "jitblockemitter.h"
 #include "jitdspmode.h"
 #include "jitprofilingsupport.h"
-#include "jitblockemitter.h"
 
 #include "asmjit/core/jitruntime.h"
 
@@ -49,7 +49,8 @@ namespace dsp56k
 		static_assert(!checkOverlap(g_funcArgGPs, g_regGPTemps), "GP temp registers must not overlap with function argument GPs");
 		static_assert(!checkOverlap(g_funcArgGPs, g_nonVolatileGPs), "function argument registers cannot be non-volatile");
 
-		// these are important as we do not have to push anything on the stack for simple functions if we can use volatiles only
+		// these are important as we do not have to push anything on the stack for simple functions if we can use
+		// volatiles only
 		static_assert(!contains(g_nonVolatileGPs, *g_regGPTemps.begin()), "first temp must be volatile");
 		static_assert(!contains(g_nonVolatileGPs, regDspPtr), "register for DSP pointer must be volatile");
 		static_assert(!contains(g_nonVolatileGPs, g_dspPoolGps[0]), "first pool reg must be volatile");
@@ -165,7 +166,8 @@ namespace dsp56k
 
 	void Jit::addLoop(TWord _begin, TWord _end)
 	{
-		// duplicated entries are allowed as the same code might be generated in multiple chains because it is run in different DSP modes. But in this case, the loop end must be identical
+		// duplicated entries are allowed as the same code might be generated in multiple chains because it is run in
+		// different DSP modes. But in this case, the loop end must be identical
 		const auto itBegin = m_loops.find(_begin);
 
 		if(itBegin != m_loops.end())
@@ -253,6 +255,17 @@ namespace dsp56k
 		static_cast<void>(ensureProgramAddress(_offset));
 	}
 
+	bool Jit::requiresRealtimeInterpreter(const TWord _pc) const noexcept
+	{
+		return isVolatileP(_pc) || (_pc != 0x00ffffffu && isVolatileP(_pc + 1));
+	}
+
+	void Jit::refreshVolatileProgramAddresses()
+	{
+		for (const auto address : m_volatileP)
+			notifyProgramMemWrite(address);
+	}
+
 	void Jit::run(const TWord _pc) noexcept
 	{
 		const auto* block = m_currentChain->getBlockUnsafe(_pc);
@@ -338,6 +351,11 @@ namespace dsp56k
 			return;
 		if(!m_dsp.jitCompilationAllowed())
 		{
+			if (isVolatileP(pMemWriteAddr))
+			{
+				m_dsp.deferVolatileJitProgramWrite(pMemWriteAddr);
+				return;
+			}
 			// Destruction/recycling can allocate through cache containers. Preserve
 			// the architectural write, fail the bounded visit, and defer JIT cache
 			// invalidation until preparation explicitly reopens compilation.

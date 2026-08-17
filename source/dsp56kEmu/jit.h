@@ -7,8 +7,8 @@
 #include "types.h"
 
 #include <set>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #include "debuggerinterface.h"
 
@@ -56,6 +56,11 @@ namespace dsp56k
 		bool ensureProgramAddress(const TWord _offset);
 		bool canExecuteProgramAddressWithoutCompilation(TWord _offset) const noexcept;
 		void notifyProgramMemWrite(const TWord _offset);
+		// A program word observed changing during preparation is isolated from
+		// linked blocks. Once compilation closes, execute that word through the
+		// allocation-free interpreter instead of running a stale native block.
+		bool requiresRealtimeInterpreter(TWord _pc) const noexcept;
+		void refreshVolatileProgramAddresses();
 
 		void run(TWord _pc) noexcept;
 		void runCheckPMemWrite(TWord _pc) noexcept;
@@ -88,8 +93,7 @@ namespace dsp56k
 		const auto& getVolatileP()  { return m_volatileP; }
 		auto* getProfilingSupport() const { return m_profiling.get(); }
 
-		bool isVolatileP(const TWord _pc) const
-		{
+		bool isVolatileP(const TWord _pc) const noexcept {
 			return m_volatileP.find(_pc) != m_volatileP.end();
 		}
 

@@ -198,6 +198,14 @@ namespace dsp56k
 		for( int i=0; i<eNumSectors; ++i )
 			m_sectorLocked[i] = false;
 	}
+
+	void InstructionCache::pflush()
+	{
+		// PFLUSH invalidates every sector, including locked sectors, and clears
+		// the corresponding lock state.
+		for (TSectorIdx sector = 0; sector < eNumSectors; ++sector)
+			flushSector(sector);
+	}
 	// _____________________________________________________________________________
 	// pflushun
 	//

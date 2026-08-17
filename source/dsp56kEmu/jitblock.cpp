@@ -1,7 +1,7 @@
+#include "jitblock.h"
 #include "dsp.h"
 #include "interrupts.h"
 #include "jitemitter.h"
-#include "jitblock.h"
 
 #include "jitblockinfo.h"
 #include "jitblockruntimedata.h"
@@ -99,7 +99,8 @@ namespace dsp56k
 
 			const auto flags = Opcodes::getFlags(instA, instB);
 
-			// a jsr in a fast interrupt modifies the MR because it disables scaling mode bits, loop flag and sixteen-bit arithmetic mode
+			// a jsr in a fast interrupt modifies the MR because it disables scaling mode bits, loop flag and
+			// sixteen-bit arithmetic mode
 			if(isFastInterrupt && (written & RegisterMask::SSL) != RegisterMask::None)
 				written |= RegisterMask::MR;
 
@@ -121,7 +122,8 @@ namespace dsp56k
 				readsM |= readAfterWrite;
 			}
 
-			// while an M register change causes a mode change, we can continue this block as long as that M register is not read in a subsequent instruction
+			// while an M register change causes a mode change, we can continue this block as long as that M register is
+			// not read in a subsequent instruction
 			if((writesM & readsM) != RegisterMask::None)
 			{
 				if(numInstructions)
@@ -131,7 +133,8 @@ namespace dsp56k
 				}
 			}
 
-			// for a volatile P address, if you have some code, break now. if not, generate this one op, and then return.
+			// for a volatile P address, if you have some code, break now. if not, generate this one op, and then
+			// return.
 			if (_volatileP.find(pc) != _volatileP.end() || 
 				(_volatileP.find(pc+1) != _volatileP.end() && Opcodes::getOpcodeLength(opA, instA, instB) == 2))
 			{
@@ -419,8 +422,9 @@ namespace dsp56k
 		{
 			if(info.terminationReason == JitBlockInfo::TerminationReason::Branch && !info.hasFlag(JitBlockInfo::Flags::ModeChange))
 			{
-				// if the last instruction of a JIT block is a branch to an address known at compile time, and this branch is fixed, i.e. is not dependent
-				// on a condition: Store that address to be able to call the next JIT block from the current block without having to have a transition to the C++ code
+				// if the last instruction of a JIT block is a branch to an address known at compile time, and this
+				// branch is fixed, i.e. is not dependent on a condition: Store that address to be able to call the next
+				// JIT block from the current block without having to have a transition to the C++ code
 
 				const auto branchTarget = info.branchTarget;
 
@@ -493,8 +497,18 @@ namespace dsp56k
 			if(m_config.maxDoIterations)
 			{
 				assert(asmjit::Support::isPowerOf2(m_config.maxDoIterations));
-				m_asm.test_(_regLC, asmjit::Imm(m_config.maxDoIterations-1));
+				if (m_config.maxDoIterations == 1)
+				{
+					// LC & (1 - 1) is always zero. AArch64 cannot encode TST
+					// with an immediate zero, and the bounded one-iteration
+					// contract requires this block-exit path unconditionally.
+					m_asm.jmp(skip);
+				}
+				else
+				{
+					m_asm.test_(_regLC, asmjit::Imm(m_config.maxDoIterations-1));
 				m_asm.jz(skip);
+				}
 			}
 
 #ifdef HAVE_ARM64
@@ -549,7 +563,8 @@ namespace dsp56k
 
 			JitOps ops(*this, _rt, fastInterruptMode);
 
-			// It is important that this code does not allocate any temp registers inside the branches. thefore, we prewarm everything
+			// It is important that this code does not allocate any temp registers inside the branches. thefore, we
+			// prewarm everything
 			RegGP temp(*this);
 
 			const auto& sr = r32(m_dspRegPool.get(PoolReg::DspSR, true, true));
@@ -653,8 +668,9 @@ namespace dsp56k
 		{
 			regPC = r32(m_dspRegPool.get(PoolReg::DspPC, true, false));
 
-			// we can keep our PC reg if its volatile. If It's not, it will be destroyed on stack.popAll() below => we need to copy it to a safe place
-			// Also, we need to make sure that our PC reg is not the first function argument because we replace it with the Jit*
+			// we can keep our PC reg if its volatile. If It's not, it will be destroyed on stack.popAll() below => we
+			// need to copy it to a safe place Also, we need to make sure that our PC reg is not the first function
+			// argument because we replace it with the Jit*
 			if(JitStackHelper::isNonVolatile(regPC) || r64(regPC) == g_funcArgGPs[0])
 			{
 				scratch.acquire();
@@ -671,8 +687,9 @@ namespace dsp56k
 			regLC = r32(m_dspRegPool.get(PoolReg::DspLC, true, false));
 
 			// Basically the same rules that we use for the PC reg above apply to LC too:
-			// we can keep our LC reg if its volatile. If It's not, it will be destroyed on stack.popAll() below => we need to copy it to a safe place
-			// Also, we need to make sure that our LC reg is not the first function argument because we replace it with the Jit*
+			// we can keep our LC reg if its volatile. If It's not, it will be destroyed on stack.popAll() below => we
+			// need to copy it to a safe place Also, we need to make sure that our LC reg is not the first function
+			// argument because we replace it with the Jit*
 			if(JitStackHelper::isNonVolatile(regLC) || r64(regLC) == g_funcArgGPs[0])
 			{
 				std::vector<RegGP> temps;

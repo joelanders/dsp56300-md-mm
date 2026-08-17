@@ -14,7 +14,10 @@
 #include "dsp56kBase/logging.h"
 #define LOGDMA(S) LOG(S)
 #else
-#define LOGDMA(S) do{}while(0)
+#define LOGDMA(S)                                                                                                      \
+	do                                                                                                                 \
+	{                                                                                                                  \
+	}while(0)
 #endif
 
 constexpr bool g_delayedDmaTransfer = true;
@@ -26,8 +29,8 @@ namespace dsp56k
 		using RequestSource = DmaChannel::RequestSource;
 
 		/*
-		Unfortunately the doc is a bit unclear here, at the moment we assume that DMA does never instantly trigger if it is enabled.
-		It needs the request from the peripheral and acts if its state **changes**
+		Unfortunately the doc is a bit unclear here, at the moment we assume that DMA does never instantly trigger if it
+		is enabled. It needs the request from the peripheral and acts if its state **changes**
 
 		"
 		DMA Channel Enable
@@ -36,8 +39,9 @@ namespace dsp56k
 		single-line, or single-word DMA transfer in the transfer modes that use a requesting
 		device as a trigger."
 
-		For DE based triggers, it says  **triggers a ... transfer**, but for requests it says **enables a .... transfer**, assuming that
-		enabling means just setting it up so that its ready for transfer, but not immediately executing one
+		For DE based triggers, it says  **triggers a ... transfer**, but for requests it says **enables a ....
+		transfer**, assuming that enabling means just setting it up so that its ready for transfer, but not immediately
+		executing one
 		*/
 
 		bool checkTrigger(Peripherals56303& _p, const RequestSource _src)
@@ -99,15 +103,15 @@ namespace dsp56k
 
 	void DmaChannel::setDCO(const TWord _count)
 	{
-		if (m_dco == _count)
-			return;
+		const bool firstWrite = !m_dcoWritten;
 		m_dco = _count;
+		m_dcoWritten = true;
 		LOGDMA("DMA set DCO" << m_index << " = " << HEX(_count));
 		// If DCO is set after DCR(DE=1)+DSR+DDR but before we armed, complete arming now.
 		// If already armed, the working counters were initialized from the old DCO value; we
 		// leave them as-is to mirror real hardware (writing DCO mid-transfer doesn't reset
 		// the working counters).
-		if (!m_armed && bitvalue(m_dcr, De))
+		if (firstWrite && !m_armed && bitvalue(m_dcr, De))
 			arm();
 	}
 
@@ -139,10 +143,10 @@ namespace dsp56k
 		if (!bitvalue(m_dcr, De))
 			return;
 
-		// Some firmwares (e.g. DSP B) write DCR with DE=1 BEFORE configuring
-		// DSR/DDR. In that case we cannot complete arming yet — wait for the missing
-		// register to be written. setDSR/setDDR will retry arm() on first write.
-		if (!m_dsrWritten || !m_ddrWritten)
+		// A channel's working address and counter state is one configuration unit.
+		// Firmware may write DCR with DE set before any of those registers, so defer
+		// initial arming until all three have received their first programmed value.
+		if (!m_dsrWritten || !m_ddrWritten || !m_dcoWritten)
 			return;
 
 		if(bitvalue(m_dcr, D3d))
@@ -156,7 +160,10 @@ namespace dsp56k
 		else
 		{
 			m_dcohInit = m_dco >> 12;
-			m_dcolInit = m_dco & 0xff;
+			// DSP56303FM 11.2.4: dual-counter DCOH and DCOL are both
+			// 12-bit fields. Truncating DCOL to eight bits halves the firmware's
+			// 0x1ff (512-word) receive windows.
+			m_dcolInit = m_dco & 0xfff;
 
 			m_dcoh = m_dcohInit;
 			m_dcol = m_dcolInit;
@@ -179,7 +186,8 @@ namespace dsp56k
 			}
 			else
 			{
-				// "When the needed resources are available, each word transfer performed by the DMA takes at least two core clock cycles"
+				// "When the needed resources are available, each word transfer performed by the DMA takes at least two
+				// core clock cycles"
 				m_pendingTransfer = std::max(1, static_cast<int32_t>((m_dco + 1) << 1));
 //				m_pendingTransfer = 1;
 				m_peripherals.setDelayCycles(m_pendingTransfer);
@@ -468,6 +476,11 @@ namespace dsp56k
 		else
 		{
 			_dst += _dor;
+			// Transfer modes that retain DE begin a fresh block on the next
+			// request. Reload the working counters from their programmed values;
+			// the final offset above returns the address to the configured base.
+			m_dcoh = m_dcohInit;
+			m_dcol = m_dcolInit;
 			_dst &= 0xffffff;
 			return true;
 		}
@@ -575,8 +588,6 @@ namespace dsp56k
 
 		if(bitvalue(m_dcr, D3d))
 		{
-			memWrite(areaD, m_ddr, memRead(areaS, m_dsr));
-
 			const auto dam = getDAM();
 			const auto addressGenMode = (dam >> 3) & 7;
 			const auto addrModeSelect = (dam >> 2) & 1;
@@ -586,6 +597,25 @@ namespace dsp56k
 
 			auto blockFinished = false;
 
+			auto &targetOther = addrModeSelect == 0 ? m_ddr : m_dsr;
+
+			const auto incrementOther = [&](const bool _lineComplete) {
+				switch (addressGenMode)
+				{
+				case 4:
+					break;
+				case 5:
+					targetOther = (targetOther + 1) & 0xffffff;
+					break;
+				default:
+					if (_lineComplete)
+						targetOther = (targetOther + m_dma.getDOR(addressGenMode)) & 0xffffff;
+					else
+						targetOther = (targetOther + 1) & 0xffffff;
+					break;
+				}
+			};
+
 			auto increment = [&](TWord& _target)
 			{
 				const auto prev = _target;
@@ -593,6 +623,7 @@ namespace dsp56k
 				if(m_dcol == 0)
 				{
 					m_dcol = m_dcolInit;
+					incrementOther(true);
 
 					if(m_dcom == 0)
 					{
@@ -620,22 +651,25 @@ namespace dsp56k
 				{
 					_target++;
 					--m_dcol;
+					incrementOther(false);
 				}
 
 				_target &= 0xffffff;
 //				LOG("DMA" << m_index << " address change " << HEX(prev) << " => " << HEX(_target));
 			};
 
-			if(addressGenMode == 4)	// No Update
+			const auto isLineTransfer = getTransferMode() == TransferMode::LineTriggerRequestClearDE;
+			for (;;)
 			{
+				memWrite(areaD, m_ddr, memRead(areaS, m_dsr));
+				const bool lineComplete = m_dcol == 0;
 				if(addrModeSelect == 0)	// Source: Three-Dimensional / Destination: Defined by DAM[5-3]
 					increment(m_dsr);
 				else					// the other way around
 					increment(m_ddr);
-				return blockFinished;
+				if (!isLineTransfer || lineComplete || blockFinished)
+					break;
 			}
-
-			assert(false && "three-dimensional DMA modes are not supported yet");
 
 			return blockFinished;
 		}
@@ -696,19 +730,40 @@ namespace dsp56k
 			return true;
 		}
 
-		if(agmS == AddressGenMode::SingleCounterApostInc && agmD == AddressGenMode::DualCounterDOR1)
+		if((agmS == AddressGenMode::SingleCounterApostInc || agmS == AddressGenMode::SingleCounterAnoUpdate) &&
+			agmD <= AddressGenMode::DualCounterDOR3)
 		{
-			// 2D mode, can be either line or word
-
 			const auto tm = getTransferMode();
 			const auto isLineTransfer = tm == TransferMode::LineTriggerRequestClearDE;
+			const auto dor = m_dma.getDOR(static_cast<TWord>(agmD));
 
 			do
 			{
 				memWrite(areaD, m_ddr, memRead(areaS, m_dsr));
-				++m_dsr;
+				if (agmS == AddressGenMode::SingleCounterApostInc)
+					++m_dsr;
 
-				if(dualModeIncrement(m_ddr, m_dma.getDOR(1)))
+				if(dualModeIncrement(m_ddr, dor))
+					return true;
+			} while (isLineTransfer && m_dcol != m_dcolInit);
+
+			return false;
+		}
+
+		if (agmS <= AddressGenMode::DualCounterDOR3 &&
+			(agmD == AddressGenMode::SingleCounterAnoUpdate || agmD == AddressGenMode::SingleCounterApostInc))
+		{
+			const auto tm = getTransferMode();
+			const auto isLineTransfer = tm == TransferMode::LineTriggerRequestClearDE;
+			const auto dor = m_dma.getDOR(static_cast<TWord>(agmS));
+
+			do
+			{
+				memWrite(areaD, m_ddr, memRead(areaS, m_dsr));
+				if (agmD == AddressGenMode::SingleCounterApostInc)
+					++m_ddr;
+
+				if (dualModeIncrement(m_dsr, dor))
 					return true;
 			}
 			while(isLineTransfer && m_dcol != m_dcolInit);

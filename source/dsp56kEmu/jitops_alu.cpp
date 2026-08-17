@@ -45,7 +45,8 @@ namespace dsp56k
 
 			copyBitToCCR(alu, 56, CCRB_C);
 
-//			ccr_clear(CCR_V);						// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
+			//			ccr_clear(CCR_V);						// I did not manage to make the ALU overflow in the
+			//simulator, apparently that SR bit is only used for other ops
 		}
 
 		m_dspRegs.mask56(alu);
@@ -154,7 +155,8 @@ namespace dsp56k
 
 		m_dspRegs.mask56(aluD);
 
-		ccr_clear(CCR_V);	// TODO: Set if overflow has occurred in the A or B result or the MSB of the destination operand is changed as a result of the instruction�s left shift.
+		ccr_clear(CCR_V); // TODO: Set if overflow has occurred in the A or B result or the MSB of the destination
+						  // operand is changed as a result of the instruction�s left shift.
 		ccr_dirty(ab, aluD, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -279,7 +281,8 @@ namespace dsp56k
 
 		DspValue r(m_block);
 		decode_sss_read(r, sss);
-		m_asm.and_(r.get(), asmjit::Imm(0x3f));	// "In the control register S1: bits 5�0 (LSB) are used as the #ii field, and the rest of the register is ignored." TODO: this is missing in the interpreter!
+		m_asm.and_(r.get(), asmjit::Imm(0x3f)); // "In the control register S1: bits 5�0 (LSB) are used as the #ii field, and the
+									   // rest of the register is ignored." TODO: this is missing in the interpreter!
 		const ShiftReg shiftReg(m_block);
 		m_asm.mov(r32(shiftReg), r32(r));
 		r.release();
@@ -310,7 +313,8 @@ namespace dsp56k
 
 		DspValue r(m_block);
 		decode_sss_read(r, sss);
-		m_asm.and_(r.get(), asmjit::Imm(0x3f));	// "In the control register S1: bits 5�0 (LSB) are used as the #ii field, and the rest of the register is ignored." TODO: this is missing in the interpreter!
+		m_asm.and_(r.get(), asmjit::Imm(0x3f)); // "In the control register S1: bits 5�0 (LSB) are used as the #ii field, and the
+									   // rest of the register is ignored." TODO: this is missing in the interpreter!
 		const ShiftReg shifter(m_block);
 		m_asm.mov(r32(shifter), r32(r));
 		r.release();
@@ -336,7 +340,8 @@ namespace dsp56k
 
 #ifdef HAVE_ARM64
 			m_asm.subs(d, d, _v);
-			ccr_update_ifNotCarry(CCRB_C);		// we, THAT is unexpected: On ARM, carry means unsigned >= while it means unsigned < on 56k and intel
+			ccr_update_ifNotCarry(CCRB_C); // we, THAT is unexpected: On ARM, carry means unsigned >= while it means
+										   // unsigned < on 56k and intel
 #else
 			m_asm.sub(d, _v);
 			ccr_update_ifCarry(CCRB_C);
@@ -466,7 +471,8 @@ namespace dsp56k
 				else
 				{
 					// fractional multiplication requires one post-shift to be correct
-					m_asm.add(r64(_s1), r64(_s1));	// add r,r is faster than shl r,1 on Haswell, can run on more ports and has a TP of 0.25 vs 0.5
+					m_asm.add(r64(_s1), r64(_s1)); // add r,r is faster than shl r,1 on Haswell, can run on more ports
+												   // and has a TP of 0.25 vs 0.5
 
 					if(_accumulate && _negate)
 					{
@@ -696,7 +702,8 @@ namespace dsp56k
 		m_dspRegs.mask56(d);
 
 		// Update SR
-		// detect overflow by sign-extending the actual result and comparing VS the non-sign-extended one. We've got overflow if they are different
+		// detect overflow by sign-extending the actual result and comparing VS the non-sign-extended one. We've got
+		// overflow if they are different
 		m_asm.cmp(dOld, d.get());
 
 		ccr_update_ifNotZero(CCRB_V);
@@ -1057,33 +1064,30 @@ namespace dsp56k
 		const auto sss = getFieldValue(Normf, Field_sss, op);
 		const auto D = getFieldValue(Normf, Field_D, op);
 
-		AluRef alu(m_block, D, true, true);
-		alu.get();	// force to lock already now
-
-		DspValue src(m_block);
-		decode_sss_read(src, sss);
-
 		const ShiftReg shifter(m_block);
+		{
+			DspValue src(m_block);
+		decode_sss_read(src, sss);
 		m_asm.mov(r32(shifter), r32(src));
+		}
 
-		const auto asl = m_asm.newLabel();
-		const auto end = m_asm.newLabel();
-
-		m_asm.bitTest(shifter, 23);
-		m_asm.jnz(asl);
-
-		// ASR
-		alu_asr(D, D, &shifter);
-		m_asm.jmp(end);
-
-		// ASL
-		m_asm.bind(asl);
-		m_asm.shl(r32(shifter), asmjit::Imm(8));
+		// Both runtime arms may touch pooled registers such as SR. Use the shared
+		// branch helper so dirty state is materialized and the pool is released at
+		// each control-flow edge before either arm performs its ALU update.
+		If(
+			m_block, m_blockRuntimeData,
+			[&](const asmjit::Label &_toFalse) {
+				m_asm.bitTest(shifter, 23);
+		m_asm.jnz(_toFalse);
+			},
+			[&] { alu_asr(D, D, &shifter); },
+			[&] {
+				m_asm.shl(r32(shifter), asmjit::Imm(8));
 		m_asm.neg(shifter);
 		m_asm.shr(r32(shifter), asmjit::Imm(8));
 		alu_asl(D,D, &shifter);
-
-		m_asm.bind(end);
+			},
+			true, true, true);
 	}
 
 	void JitOps::op_Or_SD(TWord op)

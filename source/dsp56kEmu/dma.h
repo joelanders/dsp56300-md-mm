@@ -164,6 +164,7 @@ namespace dsp56k
 		TWord m_dcr = 0;
 		bool m_dsrWritten = false;
 		bool m_ddrWritten = false;
+		bool m_dcoWritten = false;
 		bool m_armed = false;
 
 		TWord m_dcoh = 0;

@@ -3,7 +3,7 @@
 #include "dsp.h"
 #include "interrupts.h"
 
-#if 1
+#if 0
 #define LOGESSI(S)		LOG("ESSI" << m_index << ' ' << S)
 #else
 #define LOGESSI(S)
@@ -95,6 +95,15 @@ namespace dsp56k
 
 		if(!tem)
 			return;
+		const bool onDemand = m_onDemandTxWireSemantics && m_crb.test(RegCRBbits::CRB_MOD) && getTxWordCount() == 0;
+		if (onDemand && (m_writtenTX & tem) != tem)
+		{
+			m_sr.set(RegSSISRbits::SSISR_TDE);
+			m_sr.clear(RegSSISRbits::SSISR_TFS);
+			dmaTrigger(static_cast<uint32_t>(DmaChannel::RequestSource::Essi0TransmitData));
+			if ((m_writtenTX & tem) != tem)
+				return;
+		}
 		// Scheduled ticks are preflighted by clockTickEnabled() so TX and RX
 		// remain atomic. This second check covers direct priming through writeCRB().
 		if(txTickWouldCompleteFrame() && !canAcceptTxFrame())
@@ -120,7 +129,7 @@ namespace dsp56k
 			m_txSlotCounter = 0;
 			++m_txFrameCounter;
 
-			if (m_crb.test(RegCRBbits::CRB_TLIE))
+			if (!onDemand && m_crb.test(RegCRBbits::CRB_TLIE))
 				injectInterrupt(Vba_ESSI0transmitlastslot);
 		}
 
@@ -159,7 +168,12 @@ namespace dsp56k
 		if(m_fastLinkRx && m_rxDataAvailable)
 		{
 			const auto hasData = m_rxDataAvailable();
-			if(hasData)
+			if (m_onDemandRxWireSemantics)
+			{
+				if (!hasData)
+					return;
+			}
+			else if(hasData)
 				m_fastLinkRxStarted = true;
 			else if(m_fastLinkRxStarted)
 				return;
@@ -598,6 +612,10 @@ namespace dsp56k
 		if(!tem)
 			return;
 
+		// Preserve whether this slot shifted newly supplied data or retransmitted
+		// retained registers after an underrun. External serial wiring can use this
+		// hardware fact to discard only pre-window idle traffic.
+		m_lastTxWrittenMask = m_writtenTX & tem;
 		m_txFrame[m_txSlotCounter] = m_tx;
 
 //		m_tx.fill(0);
@@ -620,4 +638,4 @@ namespace dsp56k
 
 		m_periph.getDMA().trigger(static_cast<DmaChannel::RequestSource>(_trigger + m_index * off));
 	}
-};
+}; // namespace dsp56k

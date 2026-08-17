@@ -1,6 +1,6 @@
+#include "hdi08.h"
 #include "dsp.h"
 #include "interrupts.h"
-#include "hdi08.h"
 
 #include <cassert>
 
@@ -493,7 +493,7 @@ namespace dsp56k
 		if(_retention == HostTxRetention::SingleRegister)
 			m_transmitDataAlwaysEmpty = false;
 		else if(_retention == HostTxRetention::BoundedFifo)
-			m_transmitDataAlwaysEmpty = true;
+			m_transmitDataAlwaysEmpty = false;
 		return true;
 	}
 
@@ -626,4 +626,4 @@ namespace dsp56k
 			return false;
 		return m_dma->hasTrigger(m_dmaReqSourceReceive);
 	}
-};
+}; // namespace dsp56k
