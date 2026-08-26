@@ -5,6 +5,10 @@
 #include "opcodetypes.h"
 #include "types.h"
 
+#include <initializer_list>
+#include <memory>
+#include <type_traits>
+
 namespace dsp56k
 {
 	class DspValue;
@@ -158,7 +162,23 @@ namespace dsp56k
 
 		bool hasMmuSupport() const;
 
-		static void assignFuncArgs(const std::vector<JitRegGP>& _target, const std::vector<JitRegGP>& _source, const std::function<void(uint32_t, JitRegGP, JitRegGP)>&& _assignFunc);
+		template<typename Callback>
+		static void assignFuncArgs(const std::initializer_list<JitRegGP> _target,
+			const std::initializer_list<JitRegGP> _source, Callback&& _assignFunc)
+		{
+			using CallbackType = std::remove_reference_t<Callback>;
+			assignFuncArgsImpl(_target, _source, std::addressof(_assignFunc),
+				[](const void* const _context, const uint32_t _index,
+					const JitRegGP _dst, const JitRegGP _src)
+				{
+					(*static_cast<const CallbackType*>(_context))(_index, _dst, _src);
+				});
+		}
+
+		using AssignFunc = void (*)(const void*, uint32_t, JitRegGP, JitRegGP);
+		static void assignFuncArgsImpl(std::initializer_list<JitRegGP> _target,
+			std::initializer_list<JitRegGP> _source, const void* _context,
+			AssignFunc _assignFunc);
 
 		JitBlock& m_block;
 	};

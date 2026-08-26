@@ -7,6 +7,9 @@
 #include "jithelper.h"
 #include "jitregtracker.h"
 
+#include <algorithm>
+#include <array>
+
 constexpr bool g_debugMemoryWrites = false;
 
 namespace dsp56k
@@ -312,20 +315,17 @@ namespace dsp56k
 
 		auto p = getMemAreaPtr(_dst, _area, _offset, std::move(_ref));
 
-		if(!hasMmuSupport())
+		if(asmjit::Support::isPowerOf2(m_block.dsp().memory().size(_area)))
 		{
-#ifdef HAVE_X86_64
-			if(asmjit::Support::isPowerOf2(m_block.dsp().memory().size(_area)))
-			{
-				// just return garbage in case memory is read from an invalid address
-				m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().size(_area)-1)));
-			}
-			else
-#endif
-			{
-				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().size(_area)));
-				m_block.asm_().jge(skip.get());
-			}
+			// Mirroring is part of the logical power-of-two memory semantics, not a
+			// fallback-allocation detail. Apply it when the host MMU mapping is active
+			// too; otherwise an oversized dynamic address reads the MMU scratch page.
+			m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().size(_area)-1)));
+		}
+		else if(!hasMmuSupport())
+		{
+			m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().size(_area)));
+			m_block.asm_().jge(skip.get());
 		}
 		readDspMemory(_dst, p);
 
@@ -347,20 +347,15 @@ namespace dsp56k
 
 		const SkipLabel skip(m_block.asm_());
 
-		if(!hasMmuSupport())
+		if (asmjit::Support::isPowerOf2(m_block.dsp().memory().sizeXY()))
 		{
-#ifdef HAVE_X86_64
-			if (asmjit::Support::isPowerOf2(m_block.dsp().memory().sizeXY()))
-			{
-				// just return garbage in case memory is read from an invalid address
-				m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().sizeXY() - 1)));
-			}
-			else
-#endif
-			{
-				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().sizeXY()));
-				m_block.asm_().jge(skip.get());
-			}
+			// Match scalar reads on both MMU-backed and fallback memory.
+			m_block.asm_().and_(r32(_offset), asmjit::Imm(asmjit::Imm(m_block.dsp().memory().sizeXY() - 1)));
+		}
+		else if(!hasMmuSupport())
+		{
+			m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().sizeXY()));
+			m_block.asm_().jge(skip.get());
 		}
 
 		auto px = getMemAreaPtr(_dstX, MemArea_X, _offset, noRef());
@@ -537,6 +532,16 @@ namespace dsp56k
 
 	void Jitmem::writeDspMemory(const JitRegGP& _offset, const DspValue& _srcX, const DspValue& _srcY) const
 	{
+		// A dynamic long-memory store writes both X and Y at the same effective address.
+		// Honor memoryWritesCallCpp here just as the scalar overload does; otherwise L:
+		// stores silently bypass Memory::dspWrite and any debugger/host write observer.
+		if(m_block.getConfig().memoryWritesCallCpp || g_debugMemoryWrites)
+		{
+			writeDspMemory(MemArea_X, _offset, _srcX, noRef());
+			writeDspMemory(MemArea_Y, _offset, _srcY, noRef());
+			return;
+		}
+
 		const SkipLabel skip(m_block.asm_());
 
 		if(!hasMmuSupport())
@@ -649,6 +654,7 @@ namespace dsp56k
 
 	void Jitmem::readPeriph(DspValue& _dst, const EMemArea _area, TWord _offset, const Instruction _inst) const
 	{
+		m_block.markPeripheralAccess();
 		_offset |= 0xff0000;
 
 		auto* periph = m_block.dsp().getPeriph(_area);
@@ -686,6 +692,7 @@ namespace dsp56k
 
 	void Jitmem::readPeriph(DspValue& _dst, const EMemArea _area, const JitReg32& _offset, Instruction _inst) const
 	{
+		m_block.markPeripheralAccess();
 		{
 			const FuncArg r0(m_block, 0);
 			const FuncArg r1(m_block, 1);
@@ -737,6 +744,7 @@ namespace dsp56k
 
 	void Jitmem::writePeriph(const EMemArea _area, const JitReg32& _offset, const DspValue& _value) const
 	{
+		m_block.markPeripheralAccess();
 		const FuncArg r0(m_block, 0);
 		const FuncArg r1(m_block, 1);
 		const FuncArg r2(m_block, 2);
@@ -768,6 +776,7 @@ namespace dsp56k
 
 	void Jitmem::writePeriph(const EMemArea _area, const TWord& _offset, const DspValue& _value) const
 	{
+		m_block.markPeripheralAccess();
 		const FuncArg r0(m_block, 0);
 		const FuncArg r1(m_block, 1);
 		const FuncArg r2(m_block, 2);
@@ -843,41 +852,29 @@ namespace dsp56k
 		return m_block.dsp().memory().hasMmuSupport();
 	}
 
-	void Jitmem::assignFuncArgs(const std::vector<JitRegGP>& _target, const std::vector<JitRegGP>& _source, const std::function<void(uint32_t, JitRegGP, JitRegGP)>&& _assignFunc)
+	void Jitmem::assignFuncArgsImpl(
+		const std::initializer_list<JitRegGP> _target,
+		const std::initializer_list<JitRegGP> _source,
+		const void* const _context, const AssignFunc _assignFunc)
 	{
 		assert(_target.size() == _source.size());
-
-		std::unordered_map<uint32_t, JitRegGP> remainingSources;
-		std::unordered_map<uint32_t, JitRegGP> remainingTargets;
-
-		for(size_t i=0; i<_source.size(); ++i)
-			remainingSources.insert({static_cast<uint32_t>(i), _source[i]});
-
-		for(size_t i=0; i<_target.size(); ++i)
-			remainingTargets.insert({static_cast<uint32_t>(i), _target[i]});
+		static constexpr size_t MaxArguments = 8;
+		assert(_target.size() <= MaxArguments);
+		std::array<bool, MaxArguments> remainingSources{};
+		std::fill_n(remainingSources.begin(), _source.size(), true);
+		const auto* const targets = _target.begin();
+		const auto* const sources = _source.begin();
 
 		auto equals = [&](const JitRegGP& _a, const JitRegGP& _b)
 		{
 			return r64(_a) == r64(_b);
 		};
 
-		auto isTarget = [&](const JitRegGP& _reg)
-		{
-			for (const auto& t : remainingTargets)
-			{
-				if(equals(t.second, _reg))
-					return true;
-			}
-			return false;
-		};
-
 		auto isSource = [&](const JitRegGP& _reg)
 		{
-			for (const auto& s : remainingSources)
-			{
-				if(equals(s.second, _reg))
+			for(size_t i = 0; i < _source.size(); ++i)
+				if(remainingSources[i] && equals(sources[i], _reg))
 					return true;
-			}
 			return false;
 		};
 
@@ -891,26 +888,25 @@ namespace dsp56k
 		{
 			assignedSomething = false;
 
-			for(auto it = remainingSources.begin(); it != remainingSources.end();)
+			for(size_t index = 0; index < _source.size(); ++index)
 			{
-				const auto index = it->first;
-				const auto& source = it->second;
+				if(!remainingSources[index])
+					continue;
 
-				if(equals(_target[index], _source[index]) || !isSource(_target[index]))
+				if(equals(targets[index], sources[index])
+					|| !isSource(targets[index]))
 				{
-					_assignFunc(index, _target[index], _source[index]);
-					it = remainingSources.erase(it);
-					remainingTargets.erase(index);
+					_assignFunc(_context, static_cast<uint32_t>(index),
+						targets[index], sources[index]);
+					remainingSources[index] = false;
 					assignedSomething = true;
-				}
-				else
-				{
-					++it;
 				}
 			}
 		}
 
-		assert(remainingTargets.empty() && remainingSources.empty());
+		assert(std::none_of(remainingSources.begin(),
+			remainingSources.begin() + _source.size(),
+			[](const bool _active) { return _active; }));
 	}
 
 	Jitmem::MemoryRef Jitmem::getMemAreaPtr(const EMemArea _area, const TWord _offset, MemoryRef&& _ref, bool _supportIndexedAddressing) const

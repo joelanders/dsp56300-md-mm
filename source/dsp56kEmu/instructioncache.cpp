@@ -199,6 +199,16 @@ namespace dsp56k
 			m_sectorLocked[i] = false;
 	}
 	// _____________________________________________________________________________
+	// pflush
+	//
+	void InstructionCache::pflush()
+	{
+		// flush the entire cache, including locked sectors; all lock bits are cleared
+		for( TSectorIdx s=0; s<eNumSectors; ++s )
+			flushSector( s );
+	}
+
+	// _____________________________________________________________________________
 	// pflushun
 	//
 	void InstructionCache::pflushun()

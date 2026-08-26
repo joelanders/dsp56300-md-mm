@@ -346,6 +346,14 @@ namespace dsp56k
 		m_dsp.notifyProgramMemWrite(pMemWriteAddr);
 	}
 
+	const JitBlockInfo* Jit::getBlockInfo(const TWord _pc) const noexcept
+	{
+		if(!m_currentChain)
+			return nullptr;
+		const auto* b = m_currentChain->getBlock(_pc);
+		return b ? &b->getInfo() : nullptr;
+	}
+
 	void Jit::checkModeChange() noexcept
 	{
 		JitDspMode mode;
@@ -370,7 +378,7 @@ namespace dsp56k
 			m_currentChain->setMaxUsedPAddress(m_maxUsedPAddress);
 		}
 
-		m_dsp.setJitEntries(m_currentChain->getFuncs().data());
+		m_dsp.setJitEntries(m_currentChain->getFuncs().data(), m_currentChain->getFuncs().size());
 	}
 
 	void Jit::onDebuggerAttached(DebuggerInterface& _debugger) const
@@ -427,7 +435,10 @@ namespace dsp56k
 	JitBlockRuntimeData* Jit::acquireBlockRuntimeData()
 	{
 		if(m_blockRuntimeDatas.empty())
-			return new JitBlockRuntimeData();
+		{
+			auto* const result = new JitBlockRuntimeData();
+			return result;
+		}
 
 		auto* r = m_blockRuntimeDatas.back();
 		m_blockRuntimeDatas.pop_back();
@@ -440,11 +451,19 @@ namespace dsp56k
 		m_blockRuntimeDatas.push_back(_b);
 	}
 
+	void Jit::preallocateBlockRuntimeData(const size_t _count)
+	{
+		while(m_blockRuntimeDatas.size() < _count)
+		{
+			m_blockRuntimeDatas.push_back(new JitBlockRuntimeData());
+		}
+	}
+
 	void Jit::onFuncsResized(const JitBlockChain& _chain) const
 	{
 		if(&_chain == m_currentChain)
 		{
-			m_dsp.setJitEntries(_chain.getFuncs().data());
+			m_dsp.setJitEntries(_chain.getFuncs().data(), _chain.getFuncs().size());
 		}
 	}
 }

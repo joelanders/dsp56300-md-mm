@@ -1,8 +1,7 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
-#include <functional>
-#include <set>
 #include <vector>
 
 #include "jittypes.h"
@@ -38,7 +37,6 @@ namespace dsp56k
 		
 		void pushAllUsed(asmjit::BaseNode* _baseNode);
 
-		void call(const std::function<void()>& _execCall);
 		void call(const void* _funcAsPtr);
 
 		static bool isFuncArg(const JitRegGP& _gp, uint32_t _maxIndex = 255);
@@ -98,7 +96,7 @@ namespace dsp56k
 
 		std::vector<PushedReg> m_pushedRegs;
 		std::vector<JitReg> m_usedRegs;
-		std::set<uint32_t> m_usedFuncArgs;
+		uint32_t m_usedFuncArgs = 0;
 	};
 	
 	class PushAllUsed

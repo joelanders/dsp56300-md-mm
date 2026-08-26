@@ -21,7 +21,8 @@ namespace dsp56k
 			LoopEnd,
 			InstructionLimit,
 			ModeChange,
-			WaitInstruction
+			WaitInstruction,
+			InvalidInstruction
 		};
 
 		enum class Flags
@@ -30,6 +31,7 @@ namespace dsp56k
 			WritesSRbeforeRead	= 0x01,
 			ModeChange			= 0x02,
 			IsLoopBodyBegin		= 0x04,
+			PeripheralAccess	= 0x08,
 		};
 
 		auto hasFlag(const Flags _flag) const

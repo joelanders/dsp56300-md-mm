@@ -320,7 +320,7 @@ namespace dsp56k
 
 		void writeControlRegister(TWord _val)
 		{
-			LOG("Write ESAI CR " << HEX(_val));
+			LOG_DIAGNOSTIC("Write ESAI CR " << HEX(_val));
 			m_cr = _val;
 		}
 

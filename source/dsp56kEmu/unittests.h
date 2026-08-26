@@ -110,7 +110,6 @@ namespace  dsp56k
 		void sub();
 		void subl();
 		void tfr();
-		void tfr_signextend();
 		void tcc();
 
 		void move();
@@ -124,14 +123,7 @@ namespace  dsp56k
 		void cmp_xxxx();
 		void subr();
 		void mpyi();
-		void maci_xxxx();
 		void mpy_su();
-		void macsu_unsigned();
-		void rnd_scalingModes();
-		void limit_transfer_test();
-		void max_ccr();
-		void max_parallel();
-		void ymem_parallel_write();
 		void tst();
 		void nop();
 

@@ -427,7 +427,7 @@ namespace dsp56k
 
 	inline void DSP::op_Pflush(const TWord op)
 	{
-		errNotImplemented("PFLUSH");		
+		cache.pflush();
 	}
 	inline void DSP::op_Pflushun(const TWord op)
 	{

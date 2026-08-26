@@ -10,7 +10,6 @@
 #include "timers.h"
 #include "types.h"
 #include <array>
-#include <atomic>
 
 namespace dsp56k
 {
@@ -112,15 +111,21 @@ namespace dsp56k
 		virtual void terminate() = 0;
 
 		void setDelayCycles(uint32_t _delayCycles) noexcept;
+		void setCycleDeadline(uint32_t _delayCycles) noexcept;
+		void clearCycleDeadline() noexcept { m_hasCycleDeadline = false; }
 
 		void resetDelayCycles(const uint64_t _instructionCount, const uint32_t _delayCycles) noexcept
 		{
-			m_delayCycles.store(_delayCycles, std::memory_order_relaxed);
-			m_targetClock.store(_instructionCount + _delayCycles, std::memory_order_relaxed);
+			m_delayCycles = _delayCycles;
+			m_targetClock = _instructionCount + _delayCycles;
 		}
 
-		uint32_t getDelayCycles() const { return m_delayCycles.load(std::memory_order_relaxed); }
-		auto getTargetClock() const { return m_targetClock.load(std::memory_order_relaxed); }
+		uint32_t getDelayCycles() const { return m_delayCycles; }
+		auto getTargetClock() const { return m_targetClock; }
+		bool isDue(const uint64_t _instructions, const uint64_t _cycles) const
+		{
+			return _instructions >= m_targetClock || (m_hasCycleDeadline && _cycles >= m_targetCycle);
+		}
 
 		// the trampoline inlines the "is a peripheral due" test into its exec loop and needs the address of
 		// the counter. A relaxed load of an aligned 64 bit atomic is a plain load, which is what it emits.
@@ -130,8 +135,10 @@ namespace dsp56k
 
 	private:
 		DSP* m_dsp = nullptr;
-		std::atomic<uint32_t> m_delayCycles{0};		// advisory pacing hint, read cross-thread by DSP exec
-		std::atomic<uint64_t> m_targetClock{0};
+		uint32_t m_delayCycles = 0;
+		uint64_t m_targetClock = 0;
+		uint64_t m_targetCycle = 0;
+		bool m_hasCycleDeadline = false;
 		PeripheralType m_type;
 	};
 
@@ -187,6 +194,9 @@ namespace dsp56k
 		HDI08& getHI08()				{ return m_hi08; }
 		const Timers& getTimers() const	{ return m_timers; }
 
+		EssiPort& getPortC()			{ return m_portC; }		// ESSI0 pins as GPIO
+		EssiPort& getPortD()			{ return m_portD; }		// ESSI1 pins as GPIO
+
 		void setSymbols(Disassembler& _disasm) const override;
 
 		void terminate() override;
@@ -198,6 +208,8 @@ namespace dsp56k
 		Essi m_essi1;
 		HDI08 m_hi08;
 		Timers m_timers;
+		EssiPort m_portC;
+		EssiPort m_portD;
 	};
 
 	class Peripherals56367;

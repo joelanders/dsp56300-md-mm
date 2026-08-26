@@ -113,7 +113,7 @@ namespace dsp56k
 	void Timers::writeTLR(int _index, TWord _val)
 	{
 		m_timers[_index].m_tlr = _val;
-		LOG("Write Timer " << _index << " TLR: " << HEX(_val));
+		LOG_DIAGNOSTIC("Write Timer " << _index << " TLR: " << HEX(_val));
 	}
 
 	void Timers::writeTCPR(int _index, TWord _val)
@@ -125,19 +125,19 @@ namespace dsp56k
 	void Timers::writeTCR(int _index, TWord _val)
 	{
 		m_timers[_index].m_tcr = _val;
-		LOG("Write Timer " << _index << " TCR: " << HEX(_val));
+		LOG_DIAGNOSTIC("Write Timer " << _index << " TCR: " << HEX(_val));
 	}
 
 	void Timers::writeTPLR(TWord _val)
 	{
 		m_tplr = _val;
-		LOG("Write Timer TPLR " << ": " << HEX(_val));
+		LOG_DIAGNOSTIC("Write Timer TPLR " << ": " << HEX(_val));
 	}
 
 	void Timers::writeTPCR(TWord _val)
 	{
 		m_tpcr = _val;
-		LOG("Write Timer TPCR " << ": " << HEX(_val));
+		LOG_DIAGNOSTIC("Write Timer TPCR " << ": " << HEX(_val));
 	}
 
 	void Timers::setDSP(const DSP* _dsp)

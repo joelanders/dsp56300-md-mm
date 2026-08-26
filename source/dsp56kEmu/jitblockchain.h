@@ -108,8 +108,6 @@ namespace dsp56k
 		MmuArray<JitCacheEntry> m_jitCache;
 		MmuArray<TJitFunc> m_jitFuncs;
 
-		std::map<TWord, JitBlockRuntimeData*> m_generatingBlocks;
-
 		std::unique_ptr<AsmJitLogger> m_logger;
 		std::unique_ptr<AsmJitErrorHandler> m_errorHandler;
 

@@ -198,15 +198,16 @@ namespace dsp56k
 
 	template <typename T> PushRegs<T>::~PushRegs()
 	{
-		for (const auto& r : m_pushedRegs)
-			m_block.stack().pop(r);
+		while(m_pushedRegCount > 0)
+			m_block.stack().pop(m_pushedRegs[--m_pushedRegCount]);
 	}
 
 	template <typename T> void PushRegs<T>::push(const T& _reg)
 	{
 		if(!_reg.isValid() || JitStackHelper::isNonVolatile(_reg))
 			return;
-		m_pushedRegs.push_front(_reg);
+		assert(m_pushedRegCount < m_pushedRegs.size());
+		m_pushedRegs[m_pushedRegCount++] = _reg;
 		m_block.stack().push(_reg);
 	}
 

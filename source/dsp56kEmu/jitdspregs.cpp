@@ -419,7 +419,8 @@ namespace dsp56k
 #endif
 	}
 
-	void JitDspRegs::modifySS(const std::function<void(const JitReg64&)>& _func, bool _read, bool _write) const
+	void JitDspRegs::modifySSImpl(const void* const _context,
+		const ModifySSFunc _func, const bool _read, const bool _write) const
 	{
 		const RegScratch ssIndex(m_block);
 		getSP(r32(ssIndex));
@@ -434,14 +435,14 @@ namespace dsp56k
 		if(_read && !_write)
 		{
 			m_asm.move(ptrReg, ptr);
-			_func(r64(ptrReg.get()));
+			_func(_context, r64(ptrReg.get()));
 		}
 		else
 		{
 			const RegGP ss(m_block);
 			if (_read)
 				m_asm.move(ss, ptr);
-			_func(r64(ss.get()));
+			_func(_context, r64(ss.get()));
 			if(_write)
 				m_asm.mov(ptr, ss);
 		}
@@ -451,7 +452,7 @@ namespace dsp56k
 			const RegGP ss(m_block);
 			if (_read)
 				m_asm.move(ss, ptr);
-			_func(r64(ss.get()));
+			_func(_context, r64(ss.get()));
 			if(_write)
 				m_asm.mov(ptr, ss);
 #endif

@@ -50,7 +50,10 @@ namespace dsp56k
 			if(e.singleOpCache)
 			{
 				for (const auto& it : *e.singleOpCache)
-					release(it.second);
+				{
+					if(it.second)
+						release(it.second);
+				}
 
 				delete e.singleOpCache;
 				e.singleOpCache = nullptr;
@@ -144,8 +147,7 @@ namespace dsp56k
 //					LOG("Returning single-op " << HEX(opA) << " at PC " << HEX(_pc));
 					assert(cacheEntry.block == nullptr);
 
-					cacheEntry.block = it->second;
-					cacheEntry.removeSingleOp(it);
+					cacheEntry.block = cacheEntry.takeSingleOp(it);
 
 					occupyArea(cacheEntry.block);
 
@@ -188,17 +190,14 @@ namespace dsp56k
 			// single op cached entries that are calling the child block need to go, too. They have been created at a time when _block was not a volatile P block yet
 			if(e.singleOpCache)
 			{
-				for(auto it = e.singleOpCache->begin(); it != e.singleOpCache->end();)
+				for(auto it = e.singleOpCache->begin(); it != e.singleOpCache->end(); ++it)
 				{
 					auto* b = it->second;
-					if (b->getChild() == _block->getPCFirst() || b->getNonBranchChild() == _block->getPCFirst())
+					if (b && (b->getChild() == _block->getPCFirst()
+						|| b->getNonBranchChild() == _block->getPCFirst()))
 					{
 						release(b);
-						e.singleOpCache->erase(it++);
-					}
-					else
-					{
-						++it;
+						it->second = nullptr;
 					}
 				}
 			}
@@ -219,11 +218,9 @@ namespace dsp56k
 			auto& cacheEntry = m_jitCache[first];
 			const auto op = _block->getSingleOpCacheKey();
 
-			if(!cacheEntry.containsSingleOp(op))
+			if(cacheEntry.addSingleOp(op, _block))
 			{
 //				LOG("Caching single-op block " << HEX(op) << " at PC " << HEX(first));
-
-				cacheEntry.addSingleOp(op, _block);
 				return;
 			}
 		}
@@ -352,25 +349,27 @@ namespace dsp56k
 		}
 
 		emitter->codeHolder.setErrorHandler(m_errorHandler.get());
-		emitter->codeHolder.init(m_jit.getRuntime()->environment());
-		emitter->codeHolder.attach(&emitter->emitter);
+		const auto initError = emitter->init(m_jit.getRuntime()->environment());
+		if(initError)
+		{
+			const auto* const errString = asmjit::DebugUtils::errorAsString(initError);
+			LOG("JIT emitter init failed: " << initError << " - " << errString
+				<< "PC " << HEX(_pc));
+			m_jit.releaseEmitter(emitter);
+			return nullptr;
+		}
 
 		auto* b = m_jit.acquireBlockRuntimeData();
 
 		m_errorHandler->setBlock(b);
 
-		m_generatingBlocks.insert(std::make_pair(_pc, b));
-
 		if(!emitter->block.emit(*b, this, _pc, m_jitCache, m_jit.getVolatileP(), m_jit.getLoops(), m_jit.getLoopEnds(), m_jit.getProfilingSupport()))
 		{
 			LOG("FATAL: code generation failed for PC " << HEX(_pc));
 			m_jit.releaseBlockRuntimeData(b);
-			m_generatingBlocks.erase(_pc);
 			m_jit.releaseEmitter(emitter);
 			return nullptr;
 		}
-
-		m_generatingBlocks.erase(_pc);
 
 		if(m_jit.getConfig().enableOptimizer)
 		{
@@ -388,6 +387,7 @@ namespace dsp56k
 		{
 			const auto* const errString = asmjit::DebugUtils::errorAsString(err);
 			LOG("JIT failed: " << err << " - " << errString << "PC " << HEX(_pc));
+			m_jit.releaseBlockRuntimeData(b);
 			m_jit.releaseEmitter(emitter);
 			return nullptr;
 		}
@@ -438,12 +438,7 @@ namespace dsp56k
 		if (_block == nullptr)
 			return false;
 
-		for (const auto& it : m_generatingBlocks)
-		{
-			if (it.second == _block)
-				return true;
-		}
-		return false;
+		return _block->isGenerating();
 	}
 
 	bool JitBlockChain::ensureSize(const size_t _address)

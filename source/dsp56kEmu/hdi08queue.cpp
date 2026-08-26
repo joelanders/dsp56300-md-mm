@@ -91,18 +91,8 @@ namespace dsp56k
 
 			if(d & FlagUpdate)
 			{
-				// Deliver the flag change through the pending-host-flags latch (applied when the DSP next
-				// reads its status register) and refuse to move on to the next flag until the DSP has
-				// consumed this one. This preserves flag PULSES: firmware announces an address by pulsing
-				// HF0 1->0, and the DSP has to catch the HF0=1 edge on one of its own reads (it raises HF3
-				// in response). Writing flags straight to the register, or overwriting a pending value the
-				// DSP has not read yet, collapses the pulse and the DSP never enters its address-receive
-				// state. Non-blocking: if the previous flag is still pending we leave this entry in place
-				// and retry on the next exec().
-				// Defer the flag change while (a) the previous flag is still pending (the DSP has not observed
-				// it yet - preserves the pulse) or (b) the DSP still has unread words in its RX from the
-				// previous phase (changing the flag now would re-tag those words - this is the old "wait for
-				// RX empty" guard). Retry on the next exec() (a DSP read pumps us via the callbacks).
+				// Apply queued flag transitions in order. Defer while an earlier transition or receive word
+				// remains pending so that adjacent updates cannot collapse or retag unread data.
 				bool defer = false;
 				for (auto* hdi08 : m_hdi08)
 				{

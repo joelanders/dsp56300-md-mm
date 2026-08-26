@@ -11,6 +11,49 @@
 
 namespace dsp56k
 {
+	namespace
+	{
+		uint32_t getEssiWordBits(const uint32_t _cra)
+		{
+			switch ((_cra & Essi::RegCRAbits::CRA_WL) >> Essi::RegCRAbits::CRA_WL0)
+			{
+			case 0: return 8;
+			case 1: return 12;
+			case 2: return 16;
+			case 3: return 24;
+			case 4:
+			case 5: return 32;
+			default: return 24;
+			}
+		}
+
+		// DSP56303UM Fig. 7-3 defines the internally generated ESSI word
+		// period as 2 * (PM+1) * (PSR ? 1 : 8) * wordLength core cycles.
+		uint32_t getEssiSlotCycles(const uint32_t _cra)
+		{
+			const uint32_t pm = (_cra & Essi::RegCRAbits::CRA_PM) + 1;
+			const uint32_t fixedPrescale = (_cra & (1U << Essi::RegCRAbits::CRA_PSR)) ? 1 : 8;
+			return uint32_t(2) * pm * fixedPrescale * getEssiWordBits(_cra);
+		}
+
+		// A word period LONGER than the base tick becomes a base-tick divider (the base tick
+		// can only SLOW an ESSI). A shorter period returns 0 here and goes on the fine
+		// schedule instead (see Essi::writeCRA). Rounds to the nearest whole base tick.
+		uint32_t getEssiInternalSlotDivider(const uint32_t _cra, const uint32_t _baseCyclesPerSlot)
+		{
+			if (!_baseCyclesPerSlot)
+				return 0;
+
+			const uint64_t slotCycles = getEssiSlotCycles(_cra);
+
+			if (slotCycles <= _baseCyclesPerSlot)
+				return 0;
+
+			const uint64_t baseTicks = (slotCycles + (_baseCyclesPerSlot / 2)) / _baseCyclesPerSlot;
+			return baseTicks > 1 ? static_cast<uint32_t>(baseTicks - 1) : 0;
+		}
+	}
+
 	Essi::Essi(Peripherals56303& _peripheral, const uint32_t _essiIndex)
 		: m_periph(_peripheral)
 		, m_index(_essiIndex)
@@ -32,11 +75,27 @@ namespace dsp56k
 
 	void Essi::execTX()
 	{
+		if(m_clockGate && !m_clockGate())
+			return;
+
 		const auto tem = m_crb.testMask(RegCRBbits::CRB_TE);
 
 		if(!tem)
 			return;
 
+		// DSP56303 On-Demand mode (MOD=1, DC=0) does not generate a frame sync
+		// until every enabled TX register has fresh data. Keep TDE asserted and
+		// service a request-DMA channel that may have been armed after TDE rose.
+		const bool onDemand = m_onDemandTxWireSemantics
+			&& m_crb.test(RegCRBbits::CRB_MOD) && getTxWordCount() == 0;
+		if(onDemand && (m_writtenTX & tem) != tem)
+		{
+			m_sr.set(RegSSISRbits::SSISR_TDE);
+			m_sr.clear(RegSSISRbits::SSISR_TFS);
+			dmaTrigger(static_cast<uint32_t>(DmaChannel::RequestSource::Essi0TransmitData));
+			if((m_writtenTX & tem) != tem)
+				return;
+		}
 		// note that this transfers the data in TX that has been written to it before
 		writeSlotToFrame();
 
@@ -57,7 +116,8 @@ namespace dsp56k
 			m_txSlotCounter = 0;
 			++m_txFrameCounter;
 
-			if (m_crb.test(RegCRBbits::CRB_TLIE))
+			// TLIE is disabled in DC=0 On-Demand mode.
+			if (!onDemand && m_crb.test(RegCRBbits::CRB_TLIE))
 				injectInterrupt(Vba_ESSI0transmitlastslot);
 		}
 
@@ -75,10 +135,32 @@ namespace dsp56k
 
 	void Essi::execRX()
 	{
+		if(m_clockGate && !m_clockGate())
+			return;
+
 		const auto rem = m_crb.test(RegCRBbits::CRB_RE);
 
 		if(!rem)
 			return;
+		// A synchronous fast link has no receive edge without a transmitted word.
+		// Strict On-Demand receivers enforce that from reset; legacy users retain the
+		// existing bootstrap behavior until their first real word arrives.
+		if(m_fastLinkRx && m_rxDataAvailable)
+		{
+			const bool pending = m_rxDataAvailable();
+			if(m_onDemandRxWireSemantics)
+			{
+				if(!pending)
+					return;
+			}
+			else
+			{
+				if(pending)
+					m_fastLinkRxStarted = true;
+				if(m_fastLinkRxStarted && !pending)
+					return;
+			}
+		}
 
 		readSlotFromFrame();
 
@@ -289,6 +371,11 @@ namespace dsp56k
 		if(!m_readRX)
 			m_sr.clear(RegSSISRbits::SSISR_RDF, RegSSISRbits::SSISR_ROE);
 
+		// A read of RX consumes the pending word end-to-end; the wired transport may need to
+		// dispose of staged state along with the RDF clear above (see setRxConsumeCallback).
+		if(m_rxConsumeCallback)
+			m_rxConsumeCallback();
+
 		return m_rx[0];
 	}
 
@@ -370,6 +457,24 @@ namespace dsp56k
 	{
 		LOGESSI("Write CRA " << "= " << HEX(_val));
 		m_cra = _val;
+
+		if(!m_fineLinkMode)
+			return;
+
+		// Derive the slot rate from CRA using the documented clock formula.
+		// Slower ports use a base divider; faster ports use the fine schedule.
+		auto& clock = m_periph.getEssiClock();
+		const uint32_t base = clock.getCyclesPerSample();
+		const uint32_t slotCycles = getEssiSlotCycles(_val);
+
+		clock.setEsaiDivider(this, getEssiInternalSlotDivider(_val, base));
+
+		const uint32_t finePeriod = (slotCycles && base && slotCycles < base) ? slotCycles : 0;
+		clock.setEsaiFinePeriod(this, finePeriod);
+
+		// A fast link RX has no independent clock; execRX() must only advance when the
+		// master transmits (honored via m_rxDataAvailable when the transport wires it).
+		m_fastLinkRx = (finePeriod != 0);
 	}
 
 	void Essi::writeCRB(TWord _val)
@@ -494,6 +599,10 @@ namespace dsp56k
 		if(!tem)
 			return;
 
+		// Retain whether this slot shifted newly supplied TX data or retransmitted
+		// the previous register value on underrun. The transport may use this
+		// hardware status to model a burst-gated external wire.
+		m_lastTxWrittenMask = m_writtenTX & tem;
 		m_txFrame[m_txSlotCounter] = m_tx;
 
 //		m_tx.fill(0);

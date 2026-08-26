@@ -50,9 +50,10 @@ namespace dsp56k
 
 			switch (eaMode)
 			{
-			case MMM_RnMinusNn:			// 000 (Rn)-Nn	
-			case MMM_RnPlusNn:			// 001 (Rn)+Nn	
-			case MMM_RnPlusNnNoUpdate:	// 101 (Rn+Nn)	
+			// (Rn)-Nn and (Rn)+Nn are post-update modes. DSP56300FM
+			// Appendix A explicitly includes post offset-by-N in the normal
+			// timing case; only offset-by-N and predecrement pay +pru.
+			case MMM_RnPlusNnNoUpdate:	// 101 (Rn+Nn)
 			case MMM_MinusRn:			// 111 -(Rn)
 				c += cycles.pru;
 				break;

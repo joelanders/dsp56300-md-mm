@@ -15,6 +15,10 @@
 #include "utils.h"
 #include "opcodeanalysis.h"
 
+#include <memory>
+#include <type_traits>
+#include <utility>
+
 namespace dsp56k
 {
 	class Jit;
@@ -241,7 +245,7 @@ namespace dsp56k
 		template<Instruction Inst, bool Accumulate> void op_Mpy_su(TWord op);
 		void op_Mpyi(TWord op);
 		void op_Mpyr_S1S2D(TWord op)			{ alu_multiply(op); }
-		void op_Mpyri(TWord op)					{ errNotImplemented(op); }
+		void op_Mpyri(TWord op);
 		void op_Neg(TWord op);
 		void op_Nop(TWord op);
 		void op_Norm(TWord op)					{ errNotImplemented(op); }
@@ -251,7 +255,7 @@ namespace dsp56k
 		void op_Or_xx(TWord op);
 		void op_Or_xxxx(TWord op);
 		void op_Ori(TWord op);
-		void op_Pflush(TWord op)				{ errNotImplemented(op); }
+		void op_Pflush(TWord op);
 		void op_Pflushun(TWord op);
 		void op_Pfree(TWord op);
 		void op_Plock(TWord op);
@@ -583,6 +587,7 @@ namespace dsp56k
 		TWord getOpWordA() const { return m_opWordA; }
 		TWord getOpWordB();
 		void getOpWordB(DspValue& _dst);
+		void getSignedOpWordB(DspValue& _dst);
 
 		// ALU
 		void unsignedImmediateToAlu(const JitReg64& _r, const uint8_t _i) const;
@@ -631,8 +636,26 @@ namespace dsp56k
 		template<Instruction Inst> void movep_qqea(TWord op, EMemArea _area);
 		template<Instruction Inst> void movep_sqq(TWord op, EMemArea _area);
 
-		void copy24ToDDDDDD(TWord _dddddd, bool _usePooledTemp, const std::function<void(DspValue&)>& _readCallback, bool _readReg = false);
-		template<Instruction Inst> void copy24ToDDDDDD(TWord opA, TWord _dddddd, bool _usePooledTemp, const std::function<void(DspValue&)>& _readCallback);
+		template<typename Callback>
+		void copy24ToDDDDDD(const TWord _dddddd, const bool _usePooledTemp,
+			Callback&& _readCallback, const bool _readReg = false)
+		{
+			using CallbackType = std::remove_reference_t<Callback>;
+			copy24ToDDDDDDImpl(_dddddd, _usePooledTemp,
+				std::addressof(_readCallback),
+				[](const void* const _context, DspValue& _value)
+				{
+					(*static_cast<const CallbackType*>(_context))(_value);
+				}, _readReg);
+		}
+		template<Instruction Inst, typename Callback>
+		void copy24ToDDDDDD(TWord opA, TWord _dddddd,
+			bool _usePooledTemp, Callback&& _readCallback);
+
+		using ReadCallback = void (*)(const void*, DspValue&);
+		void copy24ToDDDDDDImpl(TWord _dddddd, bool _usePooledTemp,
+			const void* _context, ReadCallback _readCallback,
+			bool _readReg = false);
 
 		// loops
 		void do_exec(const DspValue& _lc, TWord _addr);

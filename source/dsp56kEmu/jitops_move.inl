@@ -280,7 +280,9 @@ namespace dsp56k
 			});
 		}
 	}
-	template<Instruction Inst> void JitOps::copy24ToDDDDDD(const TWord _opA, const TWord _dddddd, bool _usePooledTemp, const std::function<void(DspValue&)>& _readCallback)
+	template<Instruction Inst, typename Callback>
+	void JitOps::copy24ToDDDDDD(const TWord _opA, const TWord _dddddd,
+		const bool _usePooledTemp, Callback&& _readCallback)
 	{
 		const auto regWrite = getRegisterDDDDDD(_dddddd);
 
@@ -293,6 +295,7 @@ namespace dsp56k
 
 		const auto readWrite = (writeMask & read) != RegisterMask::None;
 
-		copy24ToDDDDDD(_dddddd, _usePooledTemp, _readCallback, readWrite);
+		copy24ToDDDDDD(_dddddd, _usePooledTemp,
+			std::forward<Callback>(_readCallback), readWrite);
 	}
 }

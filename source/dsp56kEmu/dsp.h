@@ -32,7 +32,9 @@ namespace dsp56k
 	class DSP;
 	
 	using TInstructionFunc = void (DSP::*)(TWord _op);
-	
+
+	void dspMmCleanGndSinStep(DSP* _dsp) noexcept;
+
 	template<typename Ta, typename Tb> void dspExecPeripherals(DSP* _dsp) noexcept;
 
 	static constexpr bool g_useJIT = g_jitSupported;
@@ -45,9 +47,11 @@ namespace dsp56k
 		friend class UnitTests;
 		friend class JitDspRegs;
 		friend class JitOps;
+		friend class JitBlock;
 		friend class Jit;
 		friend class AotRuntime;
 		friend class DebuggerInterface;
+		friend void dspMmCleanGndSinStep(DSP* _dsp) noexcept;
 
 		// _____________________________________________________________________________
 		// types
@@ -103,19 +107,29 @@ namespace dsp56k
 		Jit								m_jit;
 		SRegs							reg;							// this is the base pointer that is used to access all surrounding members
 		uint64_t						m_instructions = 0;
+		uint64_t						m_maxWaitInstructions = 0;	// cooperative WAIT bound; 0 = blocking
 		uint64_t						m_cycles = 0;
 		ProcessingMode					m_processingMode = Default;
 		TInterruptFunc					m_interruptFunc;
 
 		const TJitFunc*					m_jitEntries = nullptr;
+		TWord							m_jitEntriesSize = 0;	// number of valid entries in m_jitEntries, see execJit()
+		bool							m_invalidPCReported = false;
 		CCRCache						ccrCache;
 
-		// The lock-free ring buffer's counters are now atomic (release/acquire), so it is correct on ARM too -
-		// the old #ifdef HAVE_ARM64 workaround that forced the blocking (Lock=true) variant here is gone.
-		RingBuffer<TWord, 1024, false>				m_pendingInterrupts;	// TODO: array is way too large
+#ifdef HAVE_ARM64
+        // Our lock free ring buffer does not work properly on aarch4 :-O
+        // https://www.arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/
+		RingBuffer<TWord, 1024, true>				m_pendingInterrupts;	// TODO: array is way too large
+		RingBuffer<TWord, 32, true>					m_pendingExternalInterrupts;
+#else
+        RingBuffer<TWord, 1024, false>				m_pendingInterrupts;    // TODO: array is way too large
 		RingBuffer<TWord, 32, false>				m_pendingExternalInterrupts;
+#endif
 
 		std::vector<std::function<void()>>			m_customInterrupts;
+		std::function<bool()>						m_externalInterruptAbort;	// see setExternalInterruptAbortPredicate
+		std::function<void(TWord)>					m_interruptServicedCallback;	// see setInterruptServicedCallback
 
 		Opcodes							m_opcodes;
 
@@ -155,6 +169,14 @@ namespace dsp56k
 		std::array<SRegState,Reg_COUNT>	m_prevRegStates;
 
 		TraceMode m_trace = Disabled;
+		bool m_mmCleanGndSin = false;
+		struct MmCleanGndSinState
+		{
+			std::array<TWord, 16> lane0{};
+			std::array<TWord, 16> lane1{};
+			bool pending = false;
+		};
+		MmCleanGndSinState m_mmCleanGndSinState;
 
 		std::string		m_asm;
 		Disassembler	m_disasm;
@@ -178,22 +200,75 @@ namespace dsp56k
 
 		TReg24	getPC							() const									{ return reg.pc; }
 
+		// Optional per-core frame correction. Disabled by default.
+		void setMmCleanGndSin(const bool _enabled) noexcept { m_mmCleanGndSin = _enabled; }
+		bool mmCleanGndSin() const noexcept { return m_mmCleanGndSin; }
+
 		ASMJIT_FORCE_INLINE void exec() noexcept
 		{
 			if(g_useJIT)
 				execJit();
 			else
+			{
+				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
+					dspMmCleanGndSinStep(this);
 				execInterpreter();
+			}
+		}
+
+		ASMJIT_FORCE_INLINE void execInlinePeripheralCheck() noexcept
+		{
+			if(g_useJIT)
+				execJitImpl<true>();
+			else
+			{
+				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
+					dspMmCleanGndSinStep(this);
+				execInterpreter();
+			}
 		}
 
 		ASMJIT_FORCE_INLINE void execJit() noexcept
 		{
-			m_interruptFunc(this);
+			execJitImpl<false>();
+		}
+
+		template<bool InlinePeripheralCheck>
+		ASMJIT_FORCE_INLINE void execJitImpl() noexcept
+		{
+			if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
+				dspMmCleanGndSinStep(this);
+
+			// Optional dispatcher specialization: the ordinary peripheral callback
+			// immediately returns when its exact instruction/cycle deadline is not
+			// due. Preserve the checkpoint but perform that same test inline so the
+			// common no-op case avoids an indirect C++ call. Any pending interrupt,
+			// alternate processing mode, or due peripheral still takes the original
+			// callback path.
+			if constexpr(InlinePeripheralCheck)
+			{
+				if(m_interruptFunc != m_execPeripheralsFunc
+					|| perif[0]->isDue(m_instructions, m_cycles))
+					m_interruptFunc(this);
+			}
+			else
+				m_interruptFunc(this);
 
 			const auto pc = getPC().toWord();
 			LOGJITPC(pc);
-			// must go through the trampoline: it establishes regDspPtr, which blocks no longer set up
-			// themselves. A direct call here leaves regDspPtr at whatever the caller happened to have.
+
+			// SAFETY NET: the JIT dispatch table only spans valid P memory. A PC outside of it (a jump/jsr to a
+			// garbage address, caused by corrupt emulated data or a genuine emulation bug) would index the table
+			// out of bounds and call whatever pointer happens to lie behind it - usually a null pointer, i.e. a
+			// host process crash with no diagnosis. Trap it instead: one compare against a member that shares the
+			// cache line with m_jitEntries, branch never taken in normal operation.
+			if(ASMJIT_UNLIKELY(g_jitPcGuard && pc >= m_jitEntriesSize))
+			{
+				onInvalidPC(pc);
+				return;
+			}
+
+			// The trampoline establishes regDspPtr, which blocks no longer set up themselves.
 			m_jit.getTrampoline().execOne(&reg, pc, m_jitEntries[pc]);
 		}
 
@@ -217,7 +292,7 @@ namespace dsp56k
 		{
 			// this is a super hot function and for some reason the compiler insists of doing all the stack frame work
 			// before this early out. To fix this, we move the remaining code into a helper func below, marked as noinline
-			if (ASMJIT_LIKELY(perif[0]->getTargetClock() > m_instructions))
+			if (ASMJIT_LIKELY(!perif[0]->isDue(m_instructions, m_cycles)))
 				return;
 
 			execPeripherals<Ta, Tb>();
@@ -262,6 +337,11 @@ namespace dsp56k
 		const uint64_t&		getInstructionCounter		() const	{ return m_instructions; }
 		const uint64_t&		getCycles					() const	{ return m_cycles; }
 
+		// Cooperative WAIT bound for a single-thread scheduler hosting multiple DSPs. When non-zero,
+		// op_Wait returns control after burning this many instructions without an interrupt, so a
+		// sibling DSP on the same thread can run and produce the awaited condition. 0 (default) =
+		// the original blocking WAIT (correct when the DSP owns its own thread).
+		void				setMaxWaitInstructions		(uint64_t _n)	{ m_maxWaitInstructions = _n; }
 		const char*			getASM						(TWord wordA, TWord wordB);
 		const std::string&	getASM						() const							{ return m_asm; }
 
@@ -280,6 +360,20 @@ namespace dsp56k
 
 		void			injectExternalInterrupt			(const TWord _vba);
 		void			processExternalInterrupts		();
+
+		// Optional abort predicate for injectExternalInterrupt's producer-side wait. The external
+		// interrupt ring is drained only by the DSP thread (processExternalInterrupts); if that thread
+		// is halted or wedged and the ring fills, a host thread pushing another interrupt would spin
+		// forever in waitNotFull. When this predicate is set and returns true (e.g. host teardown), the
+		// push is abandoned instead of hanging. Default: unset -> the original unconditional wait, so
+		// the shipping single-owner synths are unaffected.
+		void			setExternalInterruptAbortPredicate(std::function<bool()> _p) { m_externalInterruptAbort = std::move(_p); }
+
+		// Optional per-dispatch notification: called from execInterrupt with the serviced vector, used
+		// by the HDI08 host-command arbitration to release its HCP-priority hold exactly when the
+		// host-command vector dispatches. Default: unset -> shipping synths take one always-false
+		// branch per interrupt (behaviour-neutral).
+		void			setInterruptServicedCallback	(std::function<void(TWord)> _cb) { m_interruptServicedCallback = std::move(_cb); }
 
 		bool			hasPendingInterrupts			() const
 		{
@@ -338,8 +432,11 @@ namespace dsp56k
 		Jit&			getJit							() { return m_jit; }
 		const Jit&		getJit							() const { return m_jit; }
 
-		void			setJitEntries					(const TJitFunc* _funcs)			{ m_jitEntries = _funcs; }
+		void			setJitEntries					(const TJitFunc* _funcs, const size_t _count)	{ m_jitEntries = _funcs; m_jitEntriesSize = static_cast<TWord>(_count); }
 		const auto&		getJitEntries					() const			{ return m_jitEntries; }
+
+		// called when the PC left the JIT dispatch table, i.e. it is not a valid P memory address anymore. Halts this DSP.
+		ASMJIT_NOINLINE void onInvalidPC(TWord _pc) noexcept;
 
 		const auto&		getInterruptFunc				() const			{ return m_interruptFunc; }
 		auto			getExecPeripheralsFunc			() const			{ return m_execPeripheralsFunc; }

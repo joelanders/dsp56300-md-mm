@@ -40,28 +40,35 @@ namespace dsp56k
 			return singleOpCache->find(_key);
 		}
 
-		bool containsSingleOp(const uint64_t _key) const
+		JitBlockRuntimeData* takeSingleOp(const SingleOpMapIt& _it)
 		{
-			return singleOpCache != nullptr && singleOpCache->find(_key) != singleOpCache->end();
+			if(!singleOpCache || _it == singleOpCache->end())
+				return nullptr;
+			auto* const block = _it->second;
+			// Keep the map node as an empty slot. Self-modifying code repeatedly
+			// alternates between executing and caching the same instruction; erasing
+			// here forced a map-node allocation every time the block returned.
+			_it->second = nullptr;
+			return block;
 		}
 
-		void removeSingleOp(const SingleOpMapIt& _it)
-		{
-			if(!singleOpCache)
-				return;
-			singleOpCache->erase(_it);
-		}
-
-		void addSingleOp(const uint64_t _key, JitBlockRuntimeData* _block)
+		bool addSingleOp(const uint64_t _key, JitBlockRuntimeData* _block)
 		{
 			if(!singleOpCache)
 				singleOpCache = new SingleOpMap();
-			singleOpCache->insert(std::make_pair(_key, _block));
+			const auto [it, inserted] = singleOpCache->insert(std::make_pair(_key, _block));
+			if(inserted)
+				return true;
+			if(it->second != nullptr)
+				return false;
+			it->second = _block;
+			return true;
 		}
 
 		bool isValid(const SingleOpMapIt& _it) const
 		{
-			return singleOpCache != nullptr && _it != singleOpCache->end();
+			return singleOpCache != nullptr && _it != singleOpCache->end()
+				&& _it->second != nullptr;
 		}
 
 		JitBlockRuntimeData* block = nullptr;

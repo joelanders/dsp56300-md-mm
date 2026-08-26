@@ -137,8 +137,6 @@ namespace dsp56k
 		void extractDCOHML(TWord& _h, TWord& _m, TWord& _l) const;
 
 	private:
-		void arm();
-
 		void memCopy(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
 		void memFill(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
 		void memCopyToFixedDest(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
@@ -162,9 +160,6 @@ namespace dsp56k
 		TWord m_ddr = 0;
 		TWord m_dco = 0;
 		TWord m_dcr = 0;
-		bool m_dsrWritten = false;
-		bool m_ddrWritten = false;
-		bool m_armed = false;
 
 		TWord m_dcoh = 0;
 		TWord m_dcom = 0;
@@ -213,7 +208,7 @@ namespace dsp56k
 
 		uint32_t exec() noexcept;
 		void setActiveChannel(TWord _channel);
-		void clearActiveChannel();
+		void clearActiveChannel(TWord _channel);
 
 		bool hasTrigger(DmaChannel::RequestSource _source) const;
 		bool trigger(DmaChannel::RequestSource _source) const;

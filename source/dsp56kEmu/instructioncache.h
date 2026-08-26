@@ -49,6 +49,8 @@ namespace dsp56k
 
 		void	pfree		();
 
+		void	pflush		();
+
 		void	pflushun	();
 
 		TWord	fetch		( Memory& _mem, TWord _address, bool burstEnabled );

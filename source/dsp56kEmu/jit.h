@@ -48,6 +48,17 @@ namespace dsp56k
 			m_currentChain->exec(_pc);
 		}
 
+		// Make sure _pc can be dispatched, i.e. that the JIT dispatch table covers it. Only has an effect for the
+		// non-MMU fallback array, which is grown on demand; the MMU-backed array already spans all of P memory.
+		// Used by DSP::onInvalidPC to tell "table not grown yet" (recoverable) from "PC outside P memory" (a bug).
+		bool ensurePcDispatchable(const TWord _pc) const
+		{
+			if(!m_currentChain)
+				return false;
+			m_currentChain->setMaxUsedPAddress(_pc);
+			return _pc < m_currentChain->getFuncSize();
+		}
+
 		static Jit* toJitPtr(DspRegs* _regs);
 		void notifyProgramMemWrite(const TWord _offset);
 
@@ -87,6 +98,7 @@ namespace dsp56k
 		void destroyToRecreate(TWord _pc);
 
 		void checkModeChange() noexcept;
+		const JitBlockInfo* getBlockInfo(TWord _pc) const noexcept;
 
 		void onDebuggerAttached(DebuggerInterface& _debugger) const;
 
@@ -98,6 +110,8 @@ namespace dsp56k
 
 		JitBlockRuntimeData* acquireBlockRuntimeData();
 		void releaseBlockRuntimeData(JitBlockRuntimeData* _b);
+		// Populate the free pool to at least _count objects.
+		void preallocateBlockRuntimeData(size_t _count);
 
 		void onFuncsResized(const JitBlockChain& _chain) const;
 
