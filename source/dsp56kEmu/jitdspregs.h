@@ -6,6 +6,9 @@
 #include "registers.h"
 #include "types.h"
 
+#include <memory>
+#include <type_traits>
+
 namespace dsp56k
 {
 	class JitBlock;
@@ -67,7 +70,16 @@ namespace dsp56k
 
 		void getSS(const JitReg64& _dst) const;
 		void setSS(const JitReg64& _src) const;
-		void modifySS(const std::function<void(const JitReg64&)>& _func, bool _read, bool _write) const;
+		template<typename Callback>
+		void modifySS(Callback&& _func, const bool _read, const bool _write) const
+		{
+			using CallbackType = std::remove_reference_t<Callback>;
+			modifySSImpl(std::addressof(_func),
+				[](const void* const _context, const JitReg64& _reg)
+				{
+					(*static_cast<const CallbackType*>(_context))(_reg);
+				}, _read, _write);
+		}
 
 		void mask56(const JitRegGP& _alu) const;
 		void mask48(const JitRegGP& _alu) const;
@@ -81,6 +93,10 @@ namespace dsp56k
 		void reset();
 
 	private:
+		using ModifySSFunc = void (*)(const void*, const JitReg64&);
+		void modifySSImpl(const void* _context, ModifySSFunc _func,
+			bool _read, bool _write) const;
+
 		JitDspRegPool& pool() const;
 
 		void load24(DspValue& _dst, const TReg24& _src) const;

@@ -1160,7 +1160,18 @@ namespace dsp56k
 	}
 	inline void DSP::op_Mpyri(const TWord op)
 	{
-		errNotImplemented("MPYRI");
+		// MPYRI (+/-)#xxxx,S,D  -  multiply immediate with rounding.
+		// Identical to MPYI (op_Mpyi) apart from the convergent rounding of the result,
+		// exactly as MPYR (op_Mpyr_SD) is MPY (op_Mpy_SD) plus alu_rnd.
+		const bool	ab		= getFieldValue<Mpyri,Field_d>(op);
+		const bool	negate	= getFieldValue<Mpyri,Field_k>(op);
+		const TWord qq		= getFieldValue<Mpyri,Field_qq>(op);
+
+		const TReg24 s		= TReg24(immediateDataExt<Mpyri>());
+		const TReg24 reg	= decode_qq_read(qq);
+
+		alu_mpy( ab, reg, s, negate, false );
+		alu_rnd( ab );
 	}
 	inline void DSP::op_Neg(const TWord op)
 	{

@@ -556,7 +556,9 @@ namespace dsp56k
 		}
 	}
 
-	void JitOps::copy24ToDDDDDD(const TWord _dddddd, const bool _usePooledTemp, const std::function<void(DspValue&)>& _readCallback, bool _readReg)
+	void JitOps::copy24ToDDDDDDImpl(const TWord _dddddd,
+		const bool _usePooledTemp, const void* const _context,
+		const ReadCallback _readCallback, const bool _readReg)
 	{
 		DspValue writeRef = decode_dddddd_ref(_dddddd, _readReg, true);
 
@@ -565,7 +567,7 @@ namespace dsp56k
 			const auto myReg = writeRef.getDspReg().dspReg();
 
 			writeRef.reinterpretAs(DspValue::DspReg24, 24);
-			_readCallback(writeRef);
+			_readCallback(_context, writeRef);
 
 			// read callback might return an immediate that we have to write in regular fashion
 			if(writeRef.isImmediate())
@@ -588,7 +590,7 @@ namespace dsp56k
 		else if(writeRef.isRegValid() && writeRef.getBitCount() == 24)
 		{
 			const auto myReg = writeRef.getDspReg().dspReg();
-			_readCallback(writeRef);
+			_readCallback(_context, writeRef);
 
 			// read callback might return an immediate that we have to write in regular fashion
 			if(writeRef.isImmediate())
@@ -609,7 +611,7 @@ namespace dsp56k
 			writeRef.release();
 
 			DspValue r(m_block, _usePooledTemp);
-			_readCallback(r);
+			_readCallback(_context, r);
 			decode_dddddd_write(_dddddd, r);
 		}
 	}

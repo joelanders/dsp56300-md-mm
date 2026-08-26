@@ -30,8 +30,10 @@ namespace dsp56k
 
 		TWord dspRead() const
 		{
-			// DSP will only get a bit if is configued as an input
-			return (m_hostWrite & ~m_direction) & m_control;
+			// reading the data register returns the pin state: the host-driven level for
+			// input pins, the DSP's own output latch for output pins
+			const auto hostIn = m_hostInputSource ? m_hostInputSource() : m_hostWrite;
+			return ((hostIn & ~m_direction) | (m_dspWrite & m_direction)) & m_control;
 		}
 
 		TWord hostRead() const
@@ -43,6 +45,13 @@ namespace dsp56k
 		void setCallbackDspWrite(CallbackDspWrite&& _callback)
 		{
 			m_callbackDspWrite = std::move(_callback);
+		}
+
+		// External logic (e.g. a clock wired to an input pin) can supply the host-side pin
+		// state dynamically instead of latching it via hostWrite. Called from the DSP thread.
+		void setHostInputSource(std::function<TWord()>&& _source)
+		{
+			m_hostInputSource = std::move(_source);
 		}
 
 		void setCallbackDirChanged(CallbackConfigChanged&& _callback)
@@ -86,6 +95,38 @@ namespace dsp56k
 
 		CallbackDspWrite m_callbackDspWrite = []{};
 		CallbackConfigChanged m_callbackConfigChanged = []{};
+		std::function<TWord()> m_hostInputSource;
+	};
+
+	class EssiPort final : public Gpio
+	{
+		/*
+		 * DSP56303 ESSI ports C and D (PCRx/PRRx/PDRx):
+		 * Port Control 0 and Port Direction 0 = GPIO input
+		 * Port Control 0 and Port Direction 1 = GPIO output
+		 * Port Control 1                      = pin is configured for ESSI
+		 * i.e. the base class' "GPIO enabled" mask is the INVERSE of the control register.
+		 */
+	public:
+		EssiPort()
+		{
+			// reset state: PCR = 0 = all pins are GPIO
+			Gpio::setControl(0xffffff);
+		}
+
+		void setControl(const TWord _control) override
+		{
+			m_essiControl = _control;
+			Gpio::setControl(~_control & 0xffffff);
+		}
+
+		const TWord& getControl() const override
+		{
+			return m_essiControl;
+		}
+
+	private:
+		TWord m_essiControl = 0;
 	};
 
 	class EsaiPortC final : public Gpio

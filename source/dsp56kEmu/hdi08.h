@@ -60,6 +60,7 @@ namespace dsp56k
 		};
 
 		using CallbackTx = std::function<void()>;
+		using CallbackHostPumpWake = std::function<void()>;
 		using CallbackRx = std::function<void()>;
 		using CallbackHostStateChanged = std::function<void()>;
 
@@ -67,7 +68,6 @@ namespace dsp56k
 
 		TWord readControlRegister() const
 		{
-			// HF2/HF3 live here and are written by the DSP thread; the UC thread polls this during boot.
 			return m_hcr.load(std::memory_order_acquire);
 		}
 
@@ -134,6 +134,13 @@ namespace dsp56k
 			m_transmitDataAlwaysEmpty = _alwaysEmpty;
 		}
 
+		// Buffered TX queues words up to the ring capacity. The default retains
+		// the original single-latch replacement behavior.
+		void setTransmitDataBuffered(bool _buffered)
+		{
+			m_transmitDataBuffered = _buffered;
+		}
+
 		static void setSymbols(Disassembler& _disasm);
 
 		void injectTXInterrupt();
@@ -151,6 +158,11 @@ namespace dsp56k
 		void setWriteTxCallback(const CallbackTx& _callback)
 		{
 			m_callbackTx = _callback;
+		}
+
+		void setHostPumpWakeCallback(const CallbackHostPumpWake& _callback)
+		{
+			m_callbackHostPumpWake = _callback;
 		}
 
 		void setRXRateLimit(uint32_t _rateLimit)
@@ -174,13 +186,43 @@ namespace dsp56k
 				m_callbackHostStateChanged = [] {};
 		}
 
+		// Optional DSP56303 host-port arbitration. Disabled by default. It
+		// preserves command priority, retained HRX reads, and native CVR command
+		// dispatch across an asynchronous host/DSP boundary.
+		void setHostCommandArbitration(bool _enable);
+
+		// Queue a CVR host command for normal interrupt dispatch.
+		void writeHostCommand(TWord _vba);
+
+		// Notify the port when an interrupt vector is serviced.
+		void onInterruptDispatched(TWord _vba);
+
+		bool hostCommandArbitration() const { return m_hostCommandArbitration; }
+
+		// A command remains busy through interrupt return.
+		bool hostCommandBusy() const
+		{
+			return m_hostCommandArbitration &&
+				(m_hostCommandPending.load(std::memory_order_acquire) ||
+				 m_hostCommandInFlight.load(std::memory_order_acquire));
+		}
+
 	private:
+		// Suppress mainline HRX consumption while a command can preempt it.
+		bool hostCommandHoldActive() const;
+
+		// Detect interrupt return and release a queued command.
+		void pollHostCommandCompletion();
+
+		// Publish and inject a host-command vector.
+		void dispatchHostCommandNow(TWord _vba);
+
 		bool dmaTriggerReceive() const;
 		bool dmaTriggerTransmit() const;
 		bool hasDmaReceiveTrigger() const;
 
 		TWord m_hsr = 0;
-		std::atomic<TWord> m_hcr{0};		// HF2/HF3: DSP thread writes, UC thread reads (boot HF3 handshake)
+		std::atomic<TWord> m_hcr{0};
 		TWord m_hpcr = 0;
 		RingBuffer<TWord, 8192, true> m_dataRX;
 		RingBuffer<TWord, 8192, true> m_dataTX;
@@ -190,15 +232,31 @@ namespace dsp56k
 		TWord m_hdr = 0;
 		TWord m_hddr = 0;
 		bool m_transmitDataAlwaysEmpty = true;
+		bool m_transmitDataBuffered = false;
 		CallbackTx m_callbackTx;
+		CallbackHostPumpWake m_callbackHostPumpWake;
 		CallbackRx m_callbackRx = [] {};
 		CallbackHostStateChanged m_callbackHostStateChanged = [] {};
 		uint32_t m_rxRateLimit;		// minimum number of instructions between two RX interrupts
 		bool m_waitServeRXInterrupt = false;
-		std::atomic<int32_t> m_pendingHostFlags01{-1};	// pulse latch: UC/queue thread sets, DSP thread reads+clears
+		std::atomic<int32_t> m_pendingHostFlags01{-1};
 
 		DmaChannel::RequestSource m_dmaReqSourceReceive;
 		DmaChannel::RequestSource m_dmaReqSourceTransmit;
 		Dma* m_dma;
+
+		// Host-port arbitration state shared by the host and DSP threads.
+		bool	m_hostCommandArbitration = false;	// config gate (A1-A4)
+		std::atomic<bool>	m_hostCommandPending{false};	// A2: HCP/HRDF hold, A4: command armed
+		std::atomic<TWord>	m_hostCommandVba{0};			// A2/A4: the pending host-command vector (2xHV)
+		TWord	m_lastRXValue = 0;					// A3: last valid word presented in HRX
+
+		// Completion state is DSP-thread-only; the phase and one queued command
+		// are shared atomically with the host thread.
+		TWord	m_hcReturnSsIndex = 0;				// stack index at dispatch; handler has returned at <=
+		bool	m_hcEntered = false;				// observed the handler raise the stack (long interrupt)
+		std::atomic<bool>	m_hostCommandInFlight{false};	// command vector dispatched; handler not yet returned
+		std::atomic<bool>	m_hostCommandHasQueued{false};	// a second command is waiting behind the in-flight one
+		std::atomic<TWord>	m_hostCommandQueuedVba{0};
 	};
 }

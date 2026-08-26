@@ -919,12 +919,7 @@ namespace dsp56k
 
 	void JitOps::op_Max(TWord)
 	{
-		// MAX only writes the destination accumulator B; A is a read-only source.
-		// Take A as a read-only temp copy (NOT an AluRef, which defaults to write=true):
-		// a writeback of A here gets latched and, when MAX carries a parallel move into A
-		// (e.g. the coef builder's `max a,b  x1,a`, $20AE1D), the deferred A
-		// writeback clobbers that move in the parallel-op epilog. See unittest max_parallel().
-		AluReg a(m_block, 0, true);
+		AluRef a(m_block, 0, true);
 		AluReg b(m_block, 1, false);
 
 		signextend56to64(a);
@@ -939,6 +934,7 @@ namespace dsp56k
 #endif
 		ccr_update_ifLess(CCRB_C);
 
+		m_dspRegs.mask56(a);
 		m_dspRegs.mask56(b);
 	}
 
@@ -984,21 +980,6 @@ namespace dsp56k
 		m_dspRegs.mask56(refB);
 	}
 
-	void JitOps::op_Mpyi(TWord op)
-	{
-		const bool	ab = getFieldValue<Mpyi, Field_d>(op);
-		const bool	negate = getFieldValue<Mpyi, Field_k>(op);
-		const TWord qq = getFieldValue<Mpyi, Field_qq>(op);
-
-		DspValue s(m_block);
-		getOpWordB(s);
-
-		DspValue reg(m_block);
-		decode_qq_read(reg, qq, true);
-
-		alu_mpy(ab, reg, s, negate, false, false, false, false);
-	}
-
 	void JitOps::op_Maci_xxxx(TWord op)
 	{
 		const bool	ab = getFieldValue<Maci_xxxx, Field_d>(op);
@@ -1006,12 +987,47 @@ namespace dsp56k
 		const TWord qq = getFieldValue<Maci_xxxx, Field_qq>(op);
 
 		DspValue s(m_block);
-		getOpWordB(s);
+		getSignedOpWordB(s);
 
 		DspValue reg(m_block);
 		decode_qq_read(reg, qq, true);
 
 		alu_mpy(ab, reg, s, negate, true, false, false, false);
+	}
+
+	void JitOps::op_Mpyi(TWord op)
+	{
+		const bool	ab = getFieldValue<Mpyi, Field_d>(op);
+		const bool	negate = getFieldValue<Mpyi, Field_k>(op);
+		const TWord qq = getFieldValue<Mpyi, Field_qq>(op);
+
+		DspValue s(m_block);
+		getSignedOpWordB(s);
+
+		DspValue reg(m_block);
+		decode_qq_read(reg, qq, true);
+
+		alu_mpy(ab, reg, s, negate, false, false, false, false);
+	}
+
+	void JitOps::op_Mpyri(TWord op)
+	{
+		// MPYRI (+/-)#xxxx,S,D  -  multiply immediate with rounding.
+		// Mirror of op_Mpyi (MPYI) with the rounding flag of alu_mpy set, matching the
+		// interpreter's op_Mpyri (alu_mpy + alu_rnd). getSignedOpWordB() fetches the immediate
+		// extension word and advances m_opSize to 2, which also keeps the JIT block emitter
+		// in sync over this two-word instruction.
+		const bool	ab = getFieldValue<Mpyri, Field_d>(op);
+		const bool	negate = getFieldValue<Mpyri, Field_k>(op);
+		const TWord qq = getFieldValue<Mpyri, Field_qq>(op);
+
+		DspValue s(m_block);
+		getSignedOpWordB(s);
+
+		DspValue reg(m_block);
+		decode_qq_read(reg, qq, true);
+
+		alu_mpy(ab, reg, s, negate, false, false, false, true);
 	}
 
 	void JitOps::op_Neg(TWord op)
@@ -1038,37 +1054,44 @@ namespace dsp56k
 		//     ASR S,D
 		// else
 		//     ASL -S,D
+		//
+		// The two arms MUST branch through the If() helper: a hand-rolled jnz/jmp/bind with the
+		// register pool live emits the pool's first-touch loads (e.g. of SR) into whichever arm is
+		// compiled first, so the other arm runs on an unloaded host register and the block-exit
+		// spill writes host garbage into the emulated register - a nondeterminism source, not just
+		// a wrong value (SR bits 8-23 could differ per run, changing the scaling
+		// mode and thus MAC/limiting results downstream).
 
 		const auto sss = getFieldValue(Normf, Field_sss, op);
 		const auto D = getFieldValue(Normf, Field_D, op);
 
-		AluRef alu(m_block, D, true, true);
-		alu.get();	// force to lock already now
-
-		DspValue src(m_block);
-		decode_sss_read(src, sss);
-
+		// The shift count lives in the ShiftReg (pushed/restored host register, not pool-managed on
+		// x64), so it survives the pool release that If() performs before branching.
 		const ShiftReg shifter(m_block);
-		m_asm.mov(r32(shifter), r32(src));
+		{
+			DspValue src(m_block);
+			decode_sss_read(src, sss);
+			m_asm.mov(r32(shifter), r32(src));
+		}
 
-		const auto asl = m_asm.newLabel();
-		const auto end = m_asm.newLabel();
-
-		m_asm.bitTest(shifter, 23);
-		m_asm.jnz(asl);
-
-		// ASR
-		alu_asr(D, D, &shifter);
-		m_asm.jmp(end);
-
-		// ASL
-		m_asm.bind(asl);
-		m_asm.shl(r32(shifter), asmjit::Imm(8));
-		m_asm.neg(shifter);
-		m_asm.shr(r32(shifter), asmjit::Imm(8));
-		alu_asl(D,D, &shifter);
-
-		m_asm.bind(end);
+		If(m_block, m_blockRuntimeData,
+			[&](const asmjit::Label& _toFalse)
+			{
+				m_asm.bitTest(shifter, 23);
+				m_asm.jnz(_toFalse);
+			},
+			[&]	// S[23] == 0: ASR
+			{
+				alu_asr(D, D, &shifter);
+			},
+			[&]	// S[23] == 1: ASL by the negated count
+			{
+				m_asm.shl(r32(shifter), asmjit::Imm(8));
+				m_asm.neg(shifter);
+				m_asm.shr(r32(shifter), asmjit::Imm(8));
+				alu_asl(D, D, &shifter);
+			},
+			true, true, true);
 	}
 
 	void JitOps::op_Or_SD(TWord op)

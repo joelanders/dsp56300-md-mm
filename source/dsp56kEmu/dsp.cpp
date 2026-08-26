@@ -2,8 +2,13 @@
 
 #include "dsp.h"
 
-#include <iomanip>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <thread>
 
 #include "registers.h"
 #include "types.h"
@@ -40,6 +45,70 @@ namespace dsp56k
 
 	Jumptable g_jumptable;
 
+	// Optional, host-selected correction for nominal-rate frame conversion.
+	// The state qualification keeps the generic DSP path unchanged when disabled.
+	void dspMmCleanGndSinStep(DSP* _dsp) noexcept
+	{
+		auto& state = _dsp->m_mmCleanGndSinState;
+
+		const auto pc = _dsp->getPC().toWord();
+		const auto& r = _dsp->regs();
+		const auto word = [](const auto& _v)
+		{
+			return static_cast<TWord>(_v.var) & 0xffffff;
+		};
+		auto& mem = _dsp->memory();
+
+		if(pc == 0x973)
+		{
+			const auto voiceBase = word(r.r[6]);
+			const bool validVoiceBase = voiceBase >= 0x500 && voiceBase <= 0x700 &&
+				((voiceBase - 0x500) & 0xff) == 0;
+			const auto voiceIndex = validVoiceBase ? (voiceBase - 0x500) >> 8 : 0xffffff;
+			const auto sampleRateControl = validVoiceBase
+				? mem.get(MemArea_Y, voiceBase + 0x12) & 0xffffff : 0xffffff;
+			const auto machineProgram = validVoiceBase
+				? mem.get(MemArea_Y, 0x120 + voiceIndex) & 0xffffff : 0xffffff;
+			const auto pitch = validVoiceBase
+				? mem.get(MemArea_X, voiceBase + 0x01) & 0xffffff : 0;
+			// Match the nominal converter setting while excluding deliberate
+			// sample-rate reduction.
+			const int64_t nominalUnrounded = static_cast<int64_t>(pitch) * 96 - 0x7fe0;
+			const auto nominalRatio = nominalUnrounded > 0
+				? static_cast<TWord>(((nominalUnrounded + 0x2000) / 0x4000) * 0x4000)
+				: 0;
+			const auto ratioDelta = sampleRateControl > nominalRatio
+				? sampleRateControl - nominalRatio : nominalRatio - sampleRateControl;
+			state.pending = false;
+			// Apply only to the qualified nominal-rate second pass.
+			if(word(r.r[2]) != 0x00000f || word(r.r[3]) != 0x00000f ||
+				word(r.r[4]) != 0x000091 || machineProgram != 0x000001 ||
+				ratioDelta > 0x200)
+				return;
+
+			bool nonzero = false;
+			for(TWord i = 0; i < 16; ++i)
+			{
+				state.lane0[i] = mem.get(MemArea_X, 0x000001 + i) & 0xffffff;
+				state.lane1[i] = mem.get(MemArea_X, 0x000012 + i) & 0xffffff;
+				nonzero |= state.lane0[i] != 0 || state.lane1[i] != 0;
+			}
+			state.pending = nonzero;
+			return;
+		}
+
+		// Accept both dispatcher boundaries used by the supported execution modes.
+		if((pc != 0x3a9 && pc != 0x979) || !state.pending)
+			return;
+
+		for(TWord i = 0; i < 16; ++i)
+		{
+			mem.set(MemArea_X, i, state.lane0[i]);
+			mem.set(MemArea_X, 0x10 + i, state.lane1[i]);
+		}
+		state.pending = false;
+	}
+
 	void dspExecDefaultPreventInterrupt(DSP* _dsp) noexcept
 	{
 		_dsp->execDefaultPreventInterrupt();
@@ -51,6 +120,7 @@ namespace dsp56k
 	{
 		_dsp->execInterrupts();
 	}
+
 	template <typename Ta, typename Tb> void dspExecPeripherals(DSP* _dsp) noexcept
 	{
 		_dsp->execPeriph<Ta, Tb>();
@@ -151,11 +221,25 @@ namespace dsp56k
 		
 		m_instructions = 0;
 		m_cycles = 0;
+		m_mmCleanGndSinState = {};
 		m_jit.resetHW();
 	}
 
 	void DSP::execInterrupts()
 	{
+		// M3 hardening: never read front() on an empty queue. execInterrupts is entered via
+		// m_interruptFunc == dspExecInterrupts, which is normally set only when an interrupt is
+		// pending; but the WAIT cooperative-yield path and a masked-then-drained interrupt can leave
+		// it armed with the queue empty. front() on an empty ring returns a STALE vector (a wrapped
+		// read of an already-popped slot) which, if masked, spins here without restoring peripheral
+		// processing - freezing the DSP's clocks. Fall back to peripherals instead.
+		if(m_pendingInterrupts.empty())
+		{
+			m_interruptFunc = m_execPeripheralsFunc;
+			m_execPeripheralsFunc(this);
+			return;
+		}
+
 		const auto interrupt = m_pendingInterrupts.front();
 
 		if(interrupt >= Vba_End)
@@ -178,7 +262,19 @@ namespace dsp56k
 		const auto vba = interrupt;
 
 		if(isInterruptMasked(vba))
+		{
+			// The pending interrupt is currently masked (the program raised the IPL above its
+			// priority). Do NOT freeze peripheral processing while it waits to be unmasked: keep
+			// the DSP's peripherals (ESSI clock, DMA, timers) advancing, otherwise a program that
+			// raises the IPL and then polls a peripheral-driven condition (e.g. DSP1's main loop
+			// polling DMA0 progress at IPL 3 with a masked DMA0 interrupt pending) deadlocks - the
+			// awaited peripheral event can never occur because m_interruptFunc stays parked here
+			// and never runs the peripherals. Re-checked every step; serviced the moment the IPL
+			// drops. (Latent since peripherals were gated behind interrupt servicing; exposed by
+			// the deterministic single-thread MD scheduler, which lands the injection at IPL 3.)
+			m_execPeripheralsFunc(this);
 			return;
+		}
 
 		// it is important that the processing mode is switched first before popping the vector to prevent a possible race condition in hasPendingInterrupt()
 		{
@@ -193,6 +289,12 @@ namespace dsp56k
 	{
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
+
+		// Host-command arbitration release hook (HDI08 A2): the moment a vector is serviced, notify a
+		// registered consumer so it can lift its HCP-priority mainline hold for this exact vector.
+		// Unset by default -> no effect for the shipping synths.
+		if(m_interruptServicedCallback)
+			m_interruptServicedCallback(vba);
 
 #if DSP56300_DEBUGGER
 		if(m_debugger)
@@ -282,6 +384,47 @@ namespace dsp56k
 	{
 		for(size_t i=0; i<perif.size(); ++i)
 			perif[i]->terminate();
+	}
+
+	void DSP::onInvalidPC(const TWord _pc) noexcept
+	{
+		// execJit() bounds-checks the PC against the SIZE OF THE DISPATCH TABLE, which is what makes indexing it
+		// safe. That is not the same as "outside P memory": the table is an MmuArray, and in the non-MMU fallback
+		// build it is grown ON DEMAND, so a perfectly legitimate high PC can land here simply because the table has
+		// not been grown that far yet. Grow it and return - the PC is unchanged, so the next execJit() dispatches
+		// it normally. (With the MMU-backed array the table always spans sizeP() and this never triggers.)
+		if(_pc < mem.sizeP() && m_jit.ensurePcDispatchable(_pc))
+			return;
+
+		// The PC really did leave the range of valid P memory. Executing from here is impossible, and indexing the
+		// JIT dispatch table with it would call a garbage/null function pointer, killing the host process. Report
+		// once, report enough state to diagnose the invalid transition, then halt this DSP.
+		// NOTE: this is a SAFETY NET only. Reaching this point always means there is a real bug elsewhere (either
+		// in the emulation or in the guest program/data being fed to it).
+		if(!m_invalidPCReported)
+		{
+			m_invalidPCReported = true;
+
+			const auto sp = static_cast<uint32_t>(reg.sp.var) & 0x3f;
+
+			std::fprintf(stderr, "[DSP] INVALID PC %06x (valid P memory is 0 - %06x), DSP halted. sr=%06x sp=%u omr=%06x mode=%d instructions=%llu\n",
+				_pc, mem.sizeP() ? mem.sizeP() - 1 : 0,
+				static_cast<uint32_t>(reg.sr.var) & 0xffffff, sp,
+				static_cast<uint32_t>(reg.omr.var) & 0xffffff, static_cast<int>(m_processingMode),
+				static_cast<unsigned long long>(m_instructions));
+
+			// the system stack tells us where we came from: each entry is SSH:SSL = PC<<24 | SR
+			for(uint32_t i=0; i<=sp && i<16; ++i)
+			{
+				const auto e = static_cast<uint64_t>(reg.ss[i].var) & 0xffffffffffffULL;
+				std::fprintf(stderr, "[DSP]   ss[%u] pc=%06x sr=%06x\n", i, static_cast<uint32_t>(e >> 24), static_cast<uint32_t>(e & 0xffffff));
+			}
+			std::fflush(stderr);
+		}
+
+		// halted: do not execute anything anymore, but keep the thread alive so that the rest of the machine (and the
+		// user) can observe the state instead of getting a segfault. Sleep to not burn a core.
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 
 	void DSP::setDebugger(DebuggerInterface* _debugger)
@@ -394,6 +537,7 @@ namespace dsp56k
 		perif[0]->reset();
 		if(perif[1] != perif[0])
 			perif[1]->reset();
+		m_mmCleanGndSinState = {};
 	}
 
 	void DSP::jsr(const TReg24& _val)
@@ -1255,15 +1399,31 @@ namespace dsp56k
 
 	bool DSP::isInterruptMasked(const TWord _vba) const
 	{
-		const auto prio = _vba < Vba_IRQA ? 3 : 2;
 		const auto minPrio = mr().var & 0x3;
+
+		const auto prio = _vba < Vba_IRQA ? 3 : 2;
 
 		return prio < minPrio;
 	}
 
 	void DSP::injectExternalInterrupt(const TWord _vba)
 	{
-		m_pendingExternalInterrupts.waitNotFull();
+		if(m_externalInterruptAbort)
+		{
+			// Abortable wait: the ring is drained only by this DSP's thread; if it is halted/wedged the
+			// producer would otherwise spin here forever (hanging a host teardown join). Abandon the
+			// push when the predicate fires. Single-producer, so "not full" stays true until we push.
+			while(m_pendingExternalInterrupts.full())
+			{
+				if(m_externalInterruptAbort())
+					return;
+				std::this_thread::yield();
+			}
+		}
+		else
+		{
+			m_pendingExternalInterrupts.waitNotFull();
+		}
 		m_pendingExternalInterrupts.push_back(_vba);
 	}
 
@@ -1338,25 +1498,7 @@ namespace dsp56k
 		_ss << "  hit=   " << logReg(Reg_HIT, -6) << "   miss=   " << logReg(Reg_MISS, -6) << " replace=" << logReg(Reg_REPLACE,-6) << std::endl;
 		_ss << "  cyc=   " << logReg(Reg_CYC, -6) << "   ictr=   " << logReg(Reg_ICTR, -6) << std::endl;
 		_ss << " cnt1=   " << logReg(Reg_CNT1, -6) << "   cnt2=   " << logReg(Reg_CNT2, -6) << " cnt3=   " << logReg(Reg_CNT3,-6) << "  cnt4=   " << logReg(Reg_CNT4,-6) << std::endl;
-/*
-   x=       $000000000000    y=       $000000000000
-   a=     $00000000000051    b=     $00000000000000
-               x1=$000000   x0=$000000   r7=$000000 n7=$000000 m7=$ffffff
-               y1=$000000   y0=$000000   r6=$000000 n6=$000000 m6=$ffffff
-  a2=    $00   a1=$000000   a0=$000051   r5=$000000 n5=$000000 m5=$ffffff
-  b2=    $00   b1=$000000   b0=$000000   r4=$000000 n4=$000000 m4=$ffffff
-                                         r3=$000000 n3=$000000 m3=$ffffff
-  pc=$000102   sr=$c00300  omr=$00030e   r2=$000000 n2=$000000 m2=$ffffff
-  la=$ffffff   lc=$000000                r1=$000100 n1=$000000 m1=$ffffff
- ssh=$000000  ssl=$000000   sp=$000000   r0=$000151 n0=$000000 m0=$ffffff
-  ep=$000000   sz=$000000   sc=$000000  vba=$000000
-iprc=$000000 iprp=$000000  bcr=$212421  dcr=$000000
-aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
-  hit=   000000   miss=   000000 replace=000000
-  cyc=   001027   ictr=   000259
- cnt1=   000000   cnt2=   000000 cnt3=   000000  cnt4=   000000
-*/
-	}
+		}
 
 	void DSP::errNotImplemented(const char* _opName)
 	{
@@ -1459,20 +1601,50 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 
 	void DSP::op_Wait(const TWord)
 	{
+		const uint64_t waitStart = m_instructions;
+
 		while(m_pendingInterrupts.empty())
 		{
-			auto delay = perif[0]->getTargetClock();
+			uint64_t delay;
 
-			if (delay > m_instructions)
-				delay = std::max(delay - m_instructions, static_cast<uint64_t>(PeripheralsProcessingStepSize));
-			else
+			if(m_maxWaitInstructions)
+			{
+				// Cooperative mode (single-thread multi-DSP scheduler): step in small increments,
+				// pumping peripherals each step. Do NOT fast-forward to the next peripheral event:
+				// a large jump advances m_cycles far but pumps the cycle-mode ESSI clock only once
+				// (it catches up only one cyclesPerSample per pump), and yielding mid-jump would
+				// leave the clock permanently behind, freezing frame production.
 				delay = PeripheralsProcessingStepSize;
+			}
+			else
+			{
+				delay = perif[0]->getTargetClock();
+
+				if (delay > m_instructions)
+					delay = std::max(delay - m_instructions, static_cast<uint64_t>(PeripheralsProcessingStepSize));
+				else
+					delay = PeripheralsProcessingStepSize;
+			}
 
 //			LOG("Delay " << delay);
 			m_instructions += delay;
 			m_cycles += delay;
 
 			m_execPeripheralsFunc(this);
+
+			// Cooperative yield: if this WAIT has burned its budget with no interrupt, the awaited
+			// condition likely depends on a sibling DSP that cannot run while we block this thread.
+			// Return control (the DSP proceeds past WAIT); a guest idling in a WAIT poll loop
+			// simply re-enters it next time. Resume NORMAL peripheral processing, NOT interrupt
+			// servicing: m_pendingInterrupts is empty (loop condition), and execInterrupts reads
+			// m_pendingInterrupts.front() unconditionally - on an empty queue it reads a stale
+			// vector and, if masked, spins without restoring execPeripheralsFunc, freezing the
+			// DSP's peripherals while it keeps retiring ops.
+			if(m_maxWaitInstructions && (m_instructions - waitStart) >= m_maxWaitInstructions)
+			{
+				m_interruptFunc = m_execPeripheralsFunc;
+				return;
+			}
 		}
 
 		m_interruptFunc = &dspExecInterrupts;

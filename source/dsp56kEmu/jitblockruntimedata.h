@@ -45,6 +45,7 @@ namespace dsp56k
 		{
 			m_generating = _generating;
 		}
+		bool isGenerating() const { return m_generating; }
 
 		static uint64_t getSingleOpCacheKey(TWord _opA, TWord _opB);
 

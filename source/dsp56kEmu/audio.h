@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <array>
 #include <cstring> // memcpy
 
 #include "dsp56kBase/fastmath.h"
@@ -92,7 +91,10 @@ namespace dsp56k
 
 			[[nodiscard]] uint32_t size() const					{ return m_slotCount; }
 			bool empty() const									{ return 0 == size(); }
-			void clear()										{ m_slotCount = 0; }
+			void clear()
+			{
+				m_slotCount = 0;
+			}
 			void resize(const uint32_t _size)					{ m_slotCount = _size; }
 
 			void copyTo(Frame& _target) const

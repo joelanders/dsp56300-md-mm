@@ -1,5 +1,6 @@
 #include "esaiclock.h"
 
+#include <cstdlib>
 #include <ios>
 
 #include "dsp.h"
@@ -16,10 +17,48 @@ namespace dsp56k
 
 	uint32_t EsxiClock::exec() noexcept
 	{
-		const auto diff = *m_dspInstructionCounter - m_lastClock;
+		auto scheduleDelay = [this](const uint32_t _delay)
+		{
+			m_nextCycleDeadline = _delay;
+			return _delay >> static_cast<uint32_t>(m_clockSource);
+		};
+		const auto ic = *m_dspInstructionCounter;
+		const auto diff = ic - m_lastClock;
+
+		// Fine-scheduled ESSIs run at their CRA-derived slot period independently
+		// of the audio base tick. Track the nearest deadline without changing the
+		// legacy base-tick path when no fine schedule is active.
+		uint32_t fineDelay = static_cast<uint32_t>(m_cyclesPerSample);
+		if(m_hasFineEsais)
+		{
+			for (auto& e : m_esais)
+			{
+				if (!e.finePeriod)
+					continue;
+				while (static_cast<uint64_t>(ic - e.fineLastClock) >= e.finePeriod)
+				{
+					e.fineLastClock += e.finePeriod;
+					if(e.esai->hasEnabledTransmitters())
+					{
+						e.esai->execTX();
+					}
+					if(e.esai->hasEnabledReceivers())
+					{
+						e.esai->execRX();
+					}
+				}
+				const auto rem = static_cast<uint32_t>(e.finePeriod - (ic - e.fineLastClock));
+				if (rem < fineDelay)
+					fineDelay = rem;
+			}
+		}
 
 		if(diff < m_cyclesPerSample)
-			return (static_cast<uint32_t>(m_cyclesPerSample - diff)) >> static_cast<uint32_t>(m_clockSource);	// see explanation at end of this func
+		{
+			const auto baseRem = static_cast<uint32_t>(m_cyclesPerSample - diff);
+			const auto delay = fineDelay < baseRem ? fineDelay : baseRem;
+			return scheduleDelay(delay);
+		}
 
 		m_lastClock += m_cyclesPerSample;
 
@@ -40,6 +79,9 @@ namespace dsp56k
 
 		for (auto& e : m_esais)
 		{
+			if(e.finePeriod)		// serviced on the fine schedule above; not on the base tick
+				continue;
+
 			if(e.esai->hasEnabledTransmitters() && advanceClock(e.tx))
 				processTx[txCount++] = e.esai;
 
@@ -51,7 +93,10 @@ namespace dsp56k
 		for(size_t i=0; i<rxCount; ++i) processRx[i]->execRX();
 
 		if(diff >= (m_cyclesPerSample<<1))
+		{
+			m_nextCycleDeadline = 0;
 			return 0;
+		}
 
 		const auto delay = static_cast<uint32_t>((m_cyclesPerSample << 1) - diff);
 
@@ -59,7 +104,18 @@ namespace dsp56k
 		// peripherals are processed via instruction counts. Return only half of the cycles in this case
 		static_assert(static_cast<uint32_t>(ClockSource::Instructions) == 0);
 		static_assert(static_cast<uint32_t>(ClockSource::Cycles) == 1);
-		return delay >> static_cast<uint32_t>(m_clockSource);
+		// Never return a delay longer than the soonest fine-link deadline, else a
+		// free-running link ESSI would stall until the next base tick.
+		const auto nextDelay = fineDelay < delay ? fineDelay : delay;
+		return scheduleDelay(nextDelay);
+	}
+
+	bool EsxiClock::usesExactCycleDeadline() const
+	{
+		// Exact cycle-domain deadlines are opt-in; other integrations retain
+		// their instruction-domain polling contract.
+		return m_exactCycleDeadlineEnabled && m_hasFineEsais
+			&& m_clockSource == ClockSource::Cycles;
 	}
 
 	void EsxiClock::setPCTL(const TWord _val)
@@ -177,7 +233,7 @@ namespace dsp56k
 			// dsp_frequency = m_extClock * mf / pd and samplerate = m_extClock/256
 
 			const auto speedMhz = static_cast<double>(m_speedHz) / 1000000.0f * m_speedPercent / 100.0f;
-			LOG("Clock speed changed to: " << speedMhz << " Mhz, EXTAL=" << m_externalClockFrequency << " Hz, PCTL=" << HEX(m_pctl) << ", mf=" << HEX(mf) << ", pd=" << HEX(pd) << ", df=" << HEX(df) << " => cycles per sample=" << std::dec << cyclesPerSample << ", predefined samplerate=" << m_samplerate);
+			LOG_DIAGNOSTIC("Clock speed changed to: " << speedMhz << " Mhz, EXTAL=" << m_externalClockFrequency << " Hz, PCTL=" << HEX(m_pctl) << ", mf=" << HEX(mf) << ", pd=" << HEX(pd) << ", df=" << HEX(df) << " => cycles per sample=" << std::dec << cyclesPerSample << ", predefined samplerate=" << m_samplerate);
 		}
 		else
 		{
@@ -214,6 +270,59 @@ namespace dsp56k
 
 		if(m_periph.hasDSP())
 			m_periph.setDelayCycles(0);
+	}
+
+	void EsxiClock::setEsaiFinePeriod(Esxi* _esai, const uint32_t _finePeriod)
+	{
+		// Anchor the fine phase at "now" so enabling fine-link mode does not emit an
+		// initial catch-up burst (fork parity: EsxiClock::setEsaiFinePeriod).
+		uint64_t now = m_dspInstructionCounter ? *m_dspInstructionCounter : 0;
+
+
+		bool found = false;
+
+		for (auto& entry : m_esais)
+		{
+			if(entry.esai == _esai)
+			{
+				entry.finePeriod = _finePeriod;
+				entry.fineLastClock = now;
+				found = true;
+				break;
+			}
+		}
+
+		if(!found)
+		{
+			m_esais.emplace_back(EsaiEntry{ _esai });
+			m_esais.back().finePeriod = _finePeriod;
+			m_esais.back().fineLastClock = now;
+		}
+
+		m_hasFineEsais = false;
+		for (const auto& entry : m_esais)
+		{
+			if(entry.finePeriod)
+			{
+				m_hasFineEsais = true;
+				break;
+			}
+		}
+	}
+
+	bool EsxiClock::shiftEsaiFineAnchor(const Esxi* _esai, const int64_t _cycles)
+	{
+		// Shift a fine-mode port's clock anchor. Positive values delay its next
+		// slot; negative values advance it.
+		for (auto& entry : m_esais)
+		{
+			if(entry.esai == _esai && entry.finePeriod)
+			{
+				entry.fineLastClock = static_cast<uint64_t>(static_cast<int64_t>(entry.fineLastClock) + _cycles);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool EsxiClock::setEsaiCounter(const Esxi* _esai, const int _counterTX, const int _counterRX)

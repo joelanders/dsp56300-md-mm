@@ -5,6 +5,7 @@
 #include "esxi.h"
 #include "types.h"
 
+#include <functional>
 #include <string>
 
 namespace dsp56k
@@ -174,6 +175,42 @@ namespace dsp56k
 		bool getReceiveFrameSync() const				{ return m_sr.test(SSISR_RFS); }
 		bool getTransmitFrameSync() const				{ return m_sr.test(SSISR_TFS); }
 
+		TWord getLastTxWrittenMask() const				{ return m_lastTxWrittenMask; }
+
+		// An ESSI running on an EXTERNAL clock only shifts when the clock master actually
+		// drives it. The gate is polled per slot tick; returning false skips both transmit
+		// and receive for that tick (no data movement, no DMA requests, no status changes).
+		void setClockGate(std::function<bool()>&& _gate)	{ m_clockGate = std::move(_gate); }
+
+		// Opt in to CRA-derived clocking for links that can run faster than the
+		// audio base tick. Disabled by default.
+		void setFineLinkMode(bool _enabled)					{ m_fineLinkMode = _enabled; }
+
+		// DC=0 On-Demand links have no wire edge until the transmitter has fresh
+		// data, and a synchronous receiver has no edge while its input is empty.
+		// These are independent, opt-in transport properties so all existing ESSI
+		// users retain their legacy behavior by default.
+		void setOnDemandTxWireSemantics(bool _enabled)	{ m_onDemandTxWireSemantics = _enabled; }
+		void setOnDemandRxWireSemantics(bool _enabled)	{ m_onDemandRxWireSemantics = _enabled; }
+
+		// A synchronous receiver advances only when its clock master has a word
+		// available. An unset callback preserves the legacy behavior.
+		void setRxDataAvailableCallback(std::function<bool()> _cb)	{ m_rxDataAvailable = std::move(_cb); }
+
+		// True once writeCRA (in fine-link mode) derived a sub-base-tick word period. Drives
+		// the skip-on-empty RX; also exposed for diagnostics / tests.
+		bool isFastLinkRx() const							{ return m_fastLinkRx; }
+
+		// The transport destroyed a word at arrival because RX still held an uncollected
+		// word (receiver overrun, DSP56303UM Table 7-5: the shift->RX transfer fails, the
+		// OLD word is kept). Only the status flag is set, exactly as silicon does. Inert
+		// unless a transport calls it.
+		void setReceiverOverrun()							{ m_sr.set(SSISR_ROE); }
+
+		// Optionally notify the transport when an architectural RX read consumes
+		// the pending word. Unset is inert.
+		void setRxConsumeCallback(std::function<void()> _cb)	{ m_rxConsumeCallback = std::move(_cb); }
+
 		void setDSP(DSP* _dsp);
 
 		void setSymbols(Disassembler& _disasm) const;
@@ -237,10 +274,22 @@ namespace dsp56k
 		TWord m_rxFrameCounter = 0;
 		TWord m_txSlotCounter = 0;
 		TWord m_txFrameCounter = 0;
+		TWord m_lastTxWrittenMask = 0;
 		TWord m_readRX = 0;
 		TWord m_writtenTX = 0;
 
 		TxFrame m_txFrame;
 		RxFrame m_rxFrame;
+
+		std::function<bool()> m_clockGate;
+
+		// Fine-clocked link state; inert unless setFineLinkMode(true).
+		bool m_fineLinkMode = false;				// opt-in: writeCRA derives CRA word period + fine schedule
+		bool m_fastLinkRx = false;					// CRA-derived word period < base => fast TDM link RX
+		bool m_onDemandTxWireSemantics = false;		// MOD=1/DC=0 TX waits for fresh enabled registers
+		bool m_onDemandRxWireSemantics = false;		// fast RX skips empty from reset
+		bool m_fastLinkRxStarted = false;			// link delivered >=1 word; skip-on-empty active only after (boot-deadlock break)
+		std::function<bool()> m_rxDataAvailable;	// transport reports a pending RX word (synchronous link)
+		std::function<void()> m_rxConsumeCallback;	// RX read consumes the transport's staged word(s) end-to-end
 	};
 }

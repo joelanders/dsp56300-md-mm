@@ -295,6 +295,8 @@ namespace dsp56k
 			{
 				m_opcodes.findNonParallelOpcodeInfo(_op);		// retry here to help debugging
 				assert(0 && "illegal instruction");
+				emit(Nop, 0);	// release safety net: an undecodable opcode renders as NOP instead of
+				return;			// null-dereferencing 'oi' (see jitblock.cpp getInfo InvalidInstruction)
 			}
 
 			emit(oi->m_instruction, _op);
@@ -306,6 +308,8 @@ namespace dsp56k
 		{
 			m_opcodes.findParallelMoveOpcodeInfo(_op);		// retry here to help debugging
 			assert(0 && "illegal instruction");
+			emit(Nop, 0);	// release safety net: an undecodable opcode renders as NOP instead of
+			return;			// null-dereferencing 'oiMove' (see jitblock.cpp getInfo InvalidInstruction)
 		}
 
 		const OpcodeInfo* oiAlu = nullptr;
@@ -316,7 +320,9 @@ namespace dsp56k
 			if(!oiAlu)
 			{
 				m_opcodes.findParallelAluOpcodeInfo(_op);	// retry here to help debugging
-				assert(0 && "invalid instruction");						
+				assert(0 && "invalid instruction");
+				emit(Nop, 0);	// release safety net: an undecodable opcode renders as NOP instead of
+				return;			// null-dereferencing 'oiAlu' (see jitblock.cpp getInfo InvalidInstruction)
 			}
 		}
 
@@ -424,10 +430,6 @@ namespace dsp56k
 
 	void JitOps::errNotImplemented(TWord op)
 	{
-		// Print the offending opcode before aborting so the failure can be
-		// triaged from a log without a debugger attached.
-		fprintf(stderr, "*** JIT errNotImplemented: opcode=$%06X\n", op);
-		fflush(stderr);
 		assert(0 && "instruction not implemented");
 	}
 
@@ -735,6 +737,11 @@ namespace dsp56k
 		}
 	}
 
+	void callDSPPflush(DSP* const _dsp, const TWord op)
+	{
+		_dsp->op_Pflush(op);
+	}
+
 	void callDSPPflushun(DSP* const _dsp, const TWord op)
 	{
 		_dsp->op_Pflushun(op);
@@ -748,6 +755,11 @@ namespace dsp56k
 	void callDSPPlock(DSP* const _dsp, const TWord ea)
 	{
 		_dsp->cachePlock(ea);
+	}
+
+	void JitOps::op_Pflush(TWord op)
+	{
+		callDSPFunc(&callDSPPflush, op);
 	}
 
 	void JitOps::op_Pflushun(TWord op)

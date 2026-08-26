@@ -67,6 +67,7 @@ namespace dsp56k
 		void increaseUint64(const asmjit::Operand& _count, const uint64_t& _target);
 
 		const JitConfig& getConfig() const { return m_config; }
+		void markPeripheralAccess();
 
 		AddressingMode getAddressingMode(uint32_t _aguIndex) const;
 		const JitDspMode* getMode() const;

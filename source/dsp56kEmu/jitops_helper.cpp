@@ -144,9 +144,31 @@ namespace dsp56k
 	{
 		DspValue pc(m_block);
 
-		if (m_fastInterruptMode != FastInterruptMode::None)
+		if (m_fastInterruptMode == FastInterruptMode::Static)
 		{
 			pc = m_block.dspRegPool().read(PoolReg::DspPC);
+		}
+		else if (m_fastInterruptMode == FastInterruptMode::Dynamic)
+		{
+			// A dynamic fast-interrupt block may also execute as part of the normal program
+			// flow (e.g. boot code that jumps into the vector area). Push the interrupted PC
+			// only when a fast interrupt is actually being serviced; in normal flow a JSR
+			// pushes its return address as everywhere else - otherwise the subroutine's RTS
+			// returns to the JSR itself, looping forever.
+			pc.temp(DspValue::Temp24);
+			m_asm.mov(r32(pc.get()), asmjit::Imm(m_pcCurrentOp + m_opSize));
+
+			{
+				const RegGP processingMode(m_block);
+				getDspProcessingMode(r64(processingMode));
+				m_asm.cmp(processingMode, DSP::ProcessingMode::FastInterrupt);
+
+				const SkipLabel skip(m_asm);
+				m_asm.jnz(skip);
+
+				const DspValue interruptedPC = m_block.dspRegPool().read(PoolReg::DspPC);
+				m_asm.mov(r32(pc.get()), r32(interruptedPC.get()));
+			}
 		}
 		else
 		{
@@ -215,6 +237,20 @@ namespace dsp56k
 	void JitOps::getOpWordB(DspValue& _dst)
 	{
 		_dst.set(getOpWordB(), DspValue::Immediate24);
+	}
+
+	void JitOps::getSignedOpWordB(DspValue& _dst)
+	{
+		const auto word = getOpWordB();
+		_dst.set(word, DspValue::Immediate24);
+
+		// DspValue::imm24() exposes an unsigned TWord, so a negative 24-bit
+		// immediate must use the register path before host multiplication.
+		if(word & 0x00800000)
+		{
+			_dst.toTemp();
+			signextend24to64(r64(_dst));
+		}
 	}
 
 	void JitOps::getXY0(DspValue& _dst, const uint32_t _aluIndex, bool _signextend) const

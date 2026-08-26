@@ -39,7 +39,7 @@ namespace dsp56k
 			m_address = _val;
 			m_initialPC = _val;
 
-			LOG("DSP Boot: " << m_remaining << " words, initial PC " << HEX(m_address));
+			LOG_DIAGNOSTIC("DSP Boot: " << m_remaining << " words, initial PC " << HEX(m_address));
 
 			// r0 is used as counter, r1 holds the initial PC
 			m_dsp.regs().r[0].var = static_cast<int32_t>(m_address + m_remaining);
@@ -56,7 +56,7 @@ namespace dsp56k
 			++m_address;
 			if(0 == --m_remaining)
 			{
-				LOG("DSP Boot: finished");
+				LOG_DIAGNOSTIC("DSP Boot: finished");
 				m_state = State::Finished;
 				return true;
 			}

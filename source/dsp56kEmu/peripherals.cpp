@@ -5,6 +5,9 @@
 #include "dsp.h"
 #include "interrupts.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace dsp56k
 {
 	namespace
@@ -112,10 +115,14 @@ namespace dsp56k
 
 	void IPeripherals::setDelayCycles(const uint32_t _delayCycles) noexcept
 	{
-		// Pacing hint only (advisory); atomic-relaxed so a concurrent DSP-thread read is torn-free, ordering irrelevant.
-		const auto d = std::min(m_delayCycles.load(std::memory_order_relaxed), _delayCycles);
-		m_delayCycles.store(d, std::memory_order_relaxed);
-		m_targetClock.store(m_dsp->getInstructionCounter() + d, std::memory_order_relaxed);
+		m_delayCycles = std::min(m_delayCycles, _delayCycles);
+		m_targetClock = m_dsp->getInstructionCounter() + m_delayCycles;
+	}
+
+	void IPeripherals::setCycleDeadline(const uint32_t _delayCycles) noexcept
+	{
+		m_targetCycle = m_dsp->getCycles() + _delayCycles;
+		m_hasCycleDeadline = true;
 	}
 
 	// _____________________________________________________________________________
@@ -174,6 +181,13 @@ namespace dsp56k
 		case Essi::ESSI1_TSMB:		return m_essi1.readTSMB();
 		case Essi::ESSI1_RSMA:		return m_essi1.readRSMA();
 		case Essi::ESSI1_RSMB:		return m_essi1.readRSMB();
+
+		case Essi::ESSI_PDRC:		return m_portC.dspRead();
+		case Essi::ESSI_PRRC:		return m_portC.getDirection();
+		case Essi::ESSI_PCRC:		return m_portC.getControl();
+		case Essi::ESSI_PDRD:		return m_portD.dspRead();
+		case Essi::ESSI_PRRD:		return m_portD.getDirection();
+		case Essi::ESSI_PCRD:		return m_portD.getControl();
 
 		case XIO_PCTL:				return m_essiClock.getPCTL();
 
@@ -284,6 +298,13 @@ namespace dsp56k
 		case Essi::ESSI1_RSMA:		m_essi1.writeRSMA(_val);				return;
 		case Essi::ESSI1_RSMB:		m_essi1.writeRSMB(_val);				return;
 
+		case Essi::ESSI_PDRC:		m_portC.dspWrite(_val);					return;
+		case Essi::ESSI_PRRC:		m_portC.setDirection(_val);				return;
+		case Essi::ESSI_PCRC:		m_portC.setControl(_val);				return;
+		case Essi::ESSI_PDRD:		m_portD.dspWrite(_val);					return;
+		case Essi::ESSI_PRRD:		m_portD.setDirection(_val);				return;
+		case Essi::ESSI_PCRD:		m_portD.setControl(_val);				return;
+
 		case XIO_PCTL:				m_essiClock.setPCTL(_val);				return;
 
 		case Timers::M_TCSR0:		m_timers.writeTCSR	(0, _val);	return;		// TIMER0 Control/Status Register
@@ -347,10 +368,22 @@ namespace dsp56k
 
 	uint32_t Peripherals56303::exec() noexcept
 	{
-		auto delay = m_essiClock.exec();
-		delay = std::min(delay, m_hi08.exec());
-		delay = std::min(delay, m_timers.exec());
-		delay = std::min(delay, m_dma.exec());
+		auto essiDelay = m_essiClock.exec();
+		if(m_essiClock.usesExactCycleDeadline())
+		{
+			setCycleDeadline(m_essiClock.getNextCycleDeadline());
+			// The remaining sources express instruction-domain delays. Do not mix
+			// their units with the ESSI's cycle-domain serial edge.
+			essiDelay = MaxDelayCycles;
+		}
+		else
+		{
+			clearCycleDeadline();
+		}
+		const auto hdiDelay = m_hi08.exec();
+		const auto timerDelay = m_timers.exec();
+		const auto dmaDelay = m_dma.exec();
+		const auto delay = std::min({essiDelay, hdiDelay, timerDelay, dmaDelay});
 		return delay;
 	}
 

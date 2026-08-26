@@ -27,6 +27,19 @@ namespace dsp56k
 
 	JitBlock::~JitBlock() = default;
 
+	void JitBlock::markPeripheralAccess()
+	{
+		// Normal block compilation assigns this in emit(). The instruction-level
+		// JIT unit harness emits operations directly, without a cache/runtime entry;
+		// it still needs to compile peripheral branches, but has no block metadata to
+		// annotate. In Release builds the old assert disappeared and the following
+		// dereference crashed while building BCLR (ea).
+		if(!m_currentJitBlockRuntimeData)
+			return;
+		m_currentJitBlockRuntimeData->m_info.addFlag(
+			JitBlockInfo::Flags::PeripheralAccess);
+	}
+
 	void JitBlock::getInfo(JitBlockInfo& _info, const DSP& _dsp, const TWord _pc, const JitConfig& _config, const MmuArray<JitCacheEntry>& _cache, const std::set<TWord>& _volatileP, const std::map<TWord, TWord>& _loopStarts, const std::set<TWord>& _loopEnds)
 	{
 		const auto& opcodes = _dsp.opcodes();
@@ -53,12 +66,12 @@ namespace dsp56k
 
 		if(_loopStarts.find(_pc - 2) != _loopStarts.end())
 		{
-			assert(_pc == hiword(_dsp.regs().ss[_dsp.ssIndex()]).toWord());
+			// Note: a loop body may also be compiled while the DSP is NOT currently executing
+			// that loop (the address is reachable as regular flow, or the block was invalidated
+			// by a program rewrite and recompiles later). The emitted loop epilogue verifies the
+			// loop state at runtime (jumpIfLoop compares against the hardware stack), so the
+			// flag is safe to set either way.
 			_info.addFlag(JitBlockInfo::Flags::IsLoopBodyBegin);
-		}
-		else
-		{
-			assert(_pc == 0 || _pc != hiword(_dsp.regs().ss[_dsp.ssIndex()]).toWord());
 		}
 
 		auto writesM = RegisterMask::None;
@@ -155,7 +168,29 @@ namespace dsp56k
 			if (writesSR && !readsSR)
 				_info.addFlag(JitBlockInfo::Flags::WritesSRbeforeRead);
 
-			numWords += Opcodes::getOpcodeLength(opA, instA, instB);
+			const auto opLen = Opcodes::getOpcodeLength(opA, instA, instB);
+
+			if(opLen == 0)
+			{
+				// The word at 'pc' decodes to no valid instruction (getOpcodeLength() == 0). Without
+				// this guard the analysis loop spins forever: numWords never advances, so the
+				// pc >= pcMax termination (and every other one) is never reached - a hard hang of the
+				// whole emulator. This can only happen if the DSP's PC lands on a non-opcode word (e.g.
+				// mid-instruction, via a corrupted control-flow landing). Count the word as one
+				// instruction so the block makes forward runtime progress and terminate the block here;
+				// emit() renders an undecodable word as a NOP.
+				static const bool logInvalid = std::getenv("DSP_LOG_INVALIDOP") != nullptr;
+				if(logInvalid)
+					fprintf(stderr, "[DSP_LOG_INVALIDOP] block start pc=%06x decodes to Invalid (op=%06x:%06x) -> NOP-terminated\n", pc, opA, opB);
+
+				numWords += 1;
+				++numInstructions;
+				numCycles += 1;
+				terminationReason = JitBlockInfo::TerminationReason::InvalidInstruction;
+				break;
+			}
+
+			numWords += opLen;
 			++numInstructions;
 			numCycles += calcCycles(instA, instB, pc, opA, _dsp.memory().getBridgedMemoryAddress(), 1);
 
@@ -275,8 +310,28 @@ namespace dsp56k
 		{
 			if(info.branchTarget == g_invalidAddress || info.branchIsConditional)
 			{
-				DspValue pc(*this, pcNext, DspValue::Immediate24);
-				m_dspRegPool.write(PoolReg::DspPC, pc);
+				// A dynamic fast-interrupt block executes both as normal flow and as a fast
+				// interrupt. Write the fallthrough PC only in normal flow: when servicing a
+				// fast interrupt this would clobber the interrupted PC, which a JSR inside
+				// the block pushes as its return address - a "jsset #n,x:pp,handler" style
+				// vector would then return INTO the following vector slot instead of into
+				// the interrupted code.
+				const auto pcReg = m_dspRegPool.get(PoolReg::DspPC, true, true);
+
+				const SkipLabel skip(m_asm);
+
+				if(fastInterruptMode == JitOps::FastInterruptMode::Dynamic)
+				{
+					const RegScratch s(*this);
+					if constexpr (sizeof(m_dsp.m_processingMode) == sizeof(uint32_t))
+						mem().mov(r64(s), reinterpret_cast<uint32_t&>(m_dsp.m_processingMode));
+					else
+						mem().mov(r32(s), reinterpret_cast<uint64_t&>(m_dsp.m_processingMode));
+					m_asm.cmp(r32(s), asmjit::Imm(DSP::ProcessingMode::FastInterrupt));
+					m_asm.jz(skip);
+				}
+
+				m_asm.mov(r32(pcReg), asmjit::Imm(pcNext));
 			}
 		}
 
@@ -458,13 +513,12 @@ namespace dsp56k
 		increaseCycleCount(asmjit::Imm(_rt.getEncodedCycleCount()));
 		m_asm.setCursor(m_asm.lastNode());
 
-		auto jumpIfLoop = [&](const asmjit::Label& _ifTrue, const JitReg32& _regPC, const JitReg32& _regLC, const JitReg32& _temp)
+			auto jumpIfLoop = [&](const asmjit::Label& _ifTrue, const JitReg32& _regPC, const JitReg32& _regLC, const JitReg32& _temp)
 		{
 			if (!isLoopBody)
 				return false;
 
 			const SkipLabel skip(m_asm);
-
 			if(m_config.maxDoIterations)
 			{
 				assert(asmjit::Support::isPowerOf2(m_config.maxDoIterations));

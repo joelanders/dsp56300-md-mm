@@ -158,8 +158,14 @@ namespace dsp56k
 	{
 		m_block.asm_().setCursor(_baseNode);
 
-		std::vector<JitReg> regsToPush;
-		regsToPush.reserve(m_usedRegs.size());
+		static constexpr size_t MaxRegsToPush = 32;
+		std::array<JitReg, MaxRegsToPush> regsToPush{};
+		size_t regsToPushCount = 0;
+		const auto append = [&](const JitReg& _reg)
+		{
+			assert(regsToPushCount < regsToPush.size());
+			regsToPush[regsToPushCount++] = _reg;
+		};
 
 		uint32_t bytesToPush = 0;
 		bool hasVectors = false;
@@ -171,7 +177,7 @@ namespace dsp56k
 			if(!isNonVolatile(reg))
 				continue;
 
-			regsToPush.push_back(reg);
+			append(reg);
 			bytesToPush += pushSize(reg);
 
 			if(reg.isVec())
@@ -185,7 +191,7 @@ namespace dsp56k
 
 		if(needsAlignment)
 		{
-			regsToPush.push_back(lastReg);
+			append(lastReg);
 			bytesToPush += pushSize(lastReg);
 		}
 
@@ -196,8 +202,9 @@ namespace dsp56k
 
 			int32_t offset = 0;
 
-			for (const auto & reg : regsToPush)
+			for(size_t i = 0; i < regsToPushCount; ++i)
 			{
+				const auto& reg = regsToPush[i];
 				const auto size = pushSize(reg);
 				const auto memPtr = ptr(g_stackReg, offset);
 				m_pushedRegs.push_back({m_pushedBytes - offset, reg});
@@ -214,8 +221,9 @@ namespace dsp56k
 		}
 		else
 		{
-			for (auto reg : regsToPush)
+			for(size_t i = 0; i < regsToPushCount; ++i)
 			{
+				const auto reg = regsToPush[i];
 				if(reg.isVec())
 					push(reg.as<JitReg128>());
 				else
@@ -226,14 +234,6 @@ namespace dsp56k
 	}
 	void JitStackHelper::call(const void* _funcAsPtr)
 	{
-		call([&]()
-		{
-			m_block.asm_().call(_funcAsPtr);
-		});
-	}
-
-	void JitStackHelper::call(const std::function<void()>& _execCall)
-	{
 		PushBeforeFunctionCall backup(m_block);
 
 		const auto usedSize = m_pushedBytes + g_functionCallSize;
@@ -243,7 +243,7 @@ namespace dsp56k
 
 		stackRegSub(offset);
 
-		_execCall();
+		m_block.asm_().call(_funcAsPtr);
 
 		stackRegAdd(offset);
 
@@ -352,22 +352,28 @@ namespace dsp56k
 
 	void JitStackHelper::reset()
 	{
+		assert(m_usedFuncArgs == 0);
 		m_usedRegs.clear();
 		m_pushedRegs.clear();
+		m_usedFuncArgs = 0;
 		m_pushedBytes = 0;
 		m_callCount = 0;
 	}
 
 	void JitStackHelper::registerFuncArg(const uint32_t _argIndex)
 	{
-		assert(m_usedFuncArgs.find(_argIndex) == m_usedFuncArgs.end());
-		m_usedFuncArgs.insert(_argIndex);
+		assert(_argIndex < std::size(g_funcArgGPs));
+		const auto bit = uint32_t{1} << _argIndex;
+		assert((m_usedFuncArgs & bit) == 0);
+		m_usedFuncArgs |= bit;
 	}
 
 	void JitStackHelper::unregisterFuncArg(const uint32_t _argIndex)
 	{
-		assert(m_usedFuncArgs.find(_argIndex) != m_usedFuncArgs.end());
-		m_usedFuncArgs.erase(_argIndex);
+		assert(_argIndex < std::size(g_funcArgGPs));
+		const auto bit = uint32_t{1} << _argIndex;
+		assert((m_usedFuncArgs & bit) != 0);
+		m_usedFuncArgs &= ~bit;
 	}
 
 	bool JitStackHelper::isUsedFuncArg(const JitRegGP& _reg) const
@@ -377,9 +383,10 @@ namespace dsp56k
 
 		const auto r = r64(_reg);
 
-		for (const auto idx : m_usedFuncArgs)
+		for(uint32_t idx = 0; idx < std::size(g_funcArgGPs); ++idx)
 		{
-			if(g_funcArgGPs[idx].equals(r))
+			if((m_usedFuncArgs & (uint32_t{1} << idx)) != 0
+				&& g_funcArgGPs[idx].equals(r))
 				return true;
 		}
 		return false;

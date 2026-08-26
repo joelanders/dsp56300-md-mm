@@ -36,5 +36,19 @@ while (false)
 
 #define LOGFMT(fmt, ...)	LOG(Logging::string_format(fmt,  ##__VA_ARGS__))
 
+// Normal emulation/setup diagnostics may be reachable from realtime processing.
+// Keep them compiled out unless a diagnostic build opts in explicitly.  The
+// disabled form deliberately does not reference S, so stream operands are not
+// evaluated and no stringstream is constructed.
+#ifndef DSP56K_DIAGNOSTIC_LOGGING
+#define DSP56K_DIAGNOSTIC_LOGGING 0
+#endif
+
+#if DSP56K_DIAGNOSTIC_LOGGING
+#define LOG_DIAGNOSTIC(S)	LOG(S)
+#else
+#define LOG_DIAGNOSTIC(S)	do {} while(false)
+#endif
+
 #define HEX(S)			std::hex << std::setfill('0') << std::setw(6) << S
 #define HEXN(S, n)		std::hex << std::setfill('0') << std::setw(n) << (uint32_t)S

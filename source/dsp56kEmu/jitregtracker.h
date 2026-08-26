@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <list>
 
 #include "jitdspregpool.h"
@@ -299,6 +300,7 @@ namespace dsp56k
 	class PushRegs
 	{
 	public:
+		static constexpr size_t Capacity = 32;
 		PushRegs(JitBlock& _block) : m_block(_block) {}
 		~PushRegs();
 
@@ -307,7 +309,8 @@ namespace dsp56k
 	protected:
 		JitBlock& m_block;
 	private:
-		std::list<T> m_pushedRegs;
+		std::array<T, Capacity> m_pushedRegs{};
+		size_t m_pushedRegCount = 0;
 	};
 
 	class PushXMMRegs : PushRegs<JitReg128>

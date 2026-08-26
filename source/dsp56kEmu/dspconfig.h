@@ -15,4 +15,12 @@ namespace dsp56k
 #else
 	constexpr bool g_jitSupported = false;
 #endif
+
+	// Safety net: validate the PC against the size of the JIT dispatch table before dispatching, see DSP::execJit().
+	// Costs one compare + never-taken branch per dispatch. Set to false to get the old (unchecked) behaviour.
+#ifdef DSP56K_NO_JIT_PC_GUARD
+	constexpr bool g_jitPcGuard = false;
+#else
+	constexpr bool g_jitPcGuard = true;
+#endif
 }

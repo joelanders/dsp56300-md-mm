@@ -30,10 +30,33 @@ namespace dsp56k
 	{
 	}
 
+	bool HDI08::hostCommandHoldActive() const
+	{
+		if(!m_hostCommandArbitration || !m_hostCommandPending.load(std::memory_order_acquire))
+			return false;
+
+		// The hold suppresses only mainline execution. Interrupt handlers already
+		// suspend the mainline and must retain access to their own input data
+		// (DSP56303UM section 6.6.1).
+		if(m_periph.getDSP().getProcessingMode() != DSP::Default)
+			return false;
+
+		// A masked command waits without holding HRX, avoiding a deadlock against
+		// a command that cannot yet dispatch.
+		return !m_periph.getDSP().isInterruptMasked(m_hostCommandVba.load(std::memory_order_relaxed));
+	}
+
 	TWord HDI08::readStatusRegister()
 	{
-		// Toggle HDI8 "Receive Data Full" bit
-		dsp56k::bitset<TWord, HSR_HRDF>(m_hsr, m_dataRX.empty() ? 0 : 1);
+		pollHostCommandCompletion();
+
+		// A dispatchable host command takes priority over a mainline HRX read.
+		const bool hrdf = !m_dataRX.empty() && !hostCommandHoldActive();
+		dsp56k::bitset<TWord, HSR_HRDF>(m_hsr, hrdf ? 1 : 0);
+
+		// Derive HCP on the DSP thread to avoid a cross-thread HSR update.
+		if(m_hostCommandArbitration)
+			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, m_hostCommandPending.load(std::memory_order_acquire) ? 1 : 0);
 
 		// Apply pending host flags, if applicable
 		const auto hf01 = m_pendingHostFlags01.load(std::memory_order_acquire);
@@ -51,10 +74,126 @@ namespace dsp56k
 		return m_hsr;
 	}
 
+	void HDI08::setHostCommandArbitration(const bool _enable)
+	{
+		m_hostCommandArbitration = _enable;
+
+		// Reset the serializer when arbitration is reconfigured.
+		m_hostCommandPending.store(false, std::memory_order_release);
+		m_hostCommandInFlight.store(false, std::memory_order_release);
+		m_hostCommandHasQueued.store(false, std::memory_order_release);
+		m_hcEntered = false;
+
+		if(_enable)
+		{
+			m_periph.getDSP().setInterruptServicedCallback([this](const TWord _vba)
+			{
+				onInterruptDispatched(_vba);
+			});
+		}
+	}
+
+	void HDI08::writeHostCommand(const TWord _vba)
+	{
+		// A CVR write raises HCP and dispatches through the normal interrupt path
+		// (DSP56303UM sections 6.6.1 and 6.7.2).
+		if(!m_hostCommandArbitration)
+		{
+			m_periph.getDSP().injectExternalInterrupt(_vba);
+			return;
+		}
+
+		// Serialize one additional command while a previous command is busy.
+		if(hostCommandBusy())
+		{
+			// Publish the value before its availability flag.
+			m_hostCommandQueuedVba.store(_vba, std::memory_order_relaxed);
+			m_hostCommandHasQueued.store(true, std::memory_order_release);
+			return;
+		}
+
+		dispatchHostCommandNow(_vba);
+	}
+
+	void HDI08::dispatchHostCommandNow(const TWord _vba)
+	{
+		// Publish the vector value before the pending flag and before interrupt
+		// injection, so the DSP thread observes a coherent command state. HCP is
+		// derived on the DSP thread to avoid a cross-thread read-modify-write.
+		m_hostCommandVba.store(_vba, std::memory_order_relaxed);
+		m_hostCommandPending.store(true, std::memory_order_release);
+		m_periph.getDSP().injectExternalInterrupt(_vba);
+	}
+
+	void HDI08::onInterruptDispatched(const TWord _vba)
+	{
+		if(!m_hostCommandPending.load(std::memory_order_acquire) ||
+			_vba != m_hostCommandVba.load(std::memory_order_relaxed))
+			return;
+		// Servicing the vector clears HCP and moves the command to in-flight.
+		// The stack level provides an on-thread interrupt-return signal.
+		m_hostCommandPending.store(false, std::memory_order_release);
+
+		m_hcReturnSsIndex = m_periph.getDSP().ssIndex();
+		m_hcEntered = false;
+		m_hostCommandInFlight.store(true, std::memory_order_release);
+	}
+
+	void HDI08::pollHostCommandCompletion()
+	{
+		if(!m_hostCommandInFlight.load(std::memory_order_relaxed))
+			return;
+
+		auto& dsp = m_periph.getDSP();
+		const auto mode = dsp.getProcessingMode();
+		const auto ss = dsp.ssIndex();
+
+		if(!m_hcEntered)
+		{
+			// A raised stack confirms entry into a long interrupt.
+			if(ss > m_hcReturnSsIndex)
+			{
+				m_hcEntered = true;
+			}
+			else if(mode == DSP::Default)
+			{
+				// A short interrupt completes within execInterrupt.
+				m_hostCommandInFlight.store(false, std::memory_order_release);
+				if(m_hostCommandHasQueued.load(std::memory_order_acquire))
+				{
+					m_hostCommandHasQueued.store(false, std::memory_order_relaxed);
+					dispatchHostCommandNow(m_hostCommandQueuedVba.load(std::memory_order_relaxed));
+				}
+			}
+			return;
+		}
+
+		// A long interrupt completes at its original stack level in default mode.
+		if(mode == DSP::Default && ss <= m_hcReturnSsIndex)
+		{
+			m_hostCommandInFlight.store(false, std::memory_order_release);
+			if(m_hostCommandHasQueued)
+			{
+				m_hostCommandHasQueued = false;
+				dispatchHostCommandNow(m_hostCommandQueuedVba);
+			}
+		}
+	}
+
 	uint32_t HDI08::exec() noexcept
 	{
-		if (!bittest(m_hpcr, HPCR_HEN)) 
+		pollHostCommandCompletion();
+
+		if (!bittest(m_hpcr, HPCR_HEN))
 			return IPeripherals::MaxDelayCycles;
+
+		// DMA service is cycle-stealing and is not subject to the RX interrupt
+		// rate limit (DSP56300FM section 10).
+		if(m_hostCommandArbitration && !m_dataRX.empty() && hasDmaReceiveTrigger() && !rxInterruptEnabled())
+		{
+			dmaTriggerReceive();
+			return m_dataRX.empty() ? IPeripherals::MaxDelayCycles : 0;
+		}
 
 		if (!m_waitServeRXInterrupt && !m_dataRX.empty() && (rxInterruptEnabled() || hasDmaReceiveTrigger()))
 		{
@@ -119,11 +258,18 @@ namespace dsp56k
 	{
 		m_periph.setDelayCycles(0);
 
+		pollHostCommandCompletion();
+
+		// Preserve the retained HRX value while a command has priority.
+		if(hostCommandHoldActive())
+			return m_lastRXValue;
+
 		if (m_dataRX.empty())
 		{
 			LOG("Empty read, PC=" << HEX(m_periph.getDSP().getPC().toWord()) << ", processingMode=" << m_periph.getDSP().getProcessingMode());
 			m_waitServeRXInterrupt = false;
-			return 0;
+			// Under arbitration, an empty HRX read returns its retained value.
+			return m_hostCommandArbitration ? m_lastRXValue : 0;
 		}
 
 		TWord res;
@@ -146,6 +292,7 @@ namespace dsp56k
 			break;
 		}
 
+		m_lastRXValue = res;	// A3: remember the value presented in HRX
 		return res;
 	}
 
@@ -239,13 +386,13 @@ namespace dsp56k
 
 	TWord HDI08::readHDDR() const
 	{
-		LOG("Read HDDR: " << HEX(m_hdr));
+		LOG_DIAGNOSTIC("Read HDDR: " << HEX(m_hdr));
 		return m_hddr;
 	}
 
 	void HDI08::writeHDDR(TWord _val)
 	{
-		LOG("Write HDDR: " << HEX(_val));
+		LOG_DIAGNOSTIC("Write HDDR: " << HEX(_val));
 		m_hddr = _val;
 	}
 
@@ -307,9 +454,8 @@ namespace dsp56k
 
 	void HDI08::writeTX(const TWord _val)
 	{
-		if(!m_transmitDataAlwaysEmpty && !m_dataTX.empty())
+		if(!m_transmitDataAlwaysEmpty && !m_dataTX.empty() && (!m_transmitDataBuffered || m_dataTX.full()))
 		{
-			LOG("Write HDI08 HOTX: Discarding " << HEX(m_dataTX.front()) << ", HOTX is full, replacing with " << HEX(_val));
 			m_dataTX.front() = _val;
 			return;
 		}
@@ -326,6 +472,8 @@ namespace dsp56k
 
 		if(m_callbackTx)
 			m_callbackTx();
+		if(m_callbackHostPumpWake)
+			m_callbackHostPumpWake();
 
 		m_periph.setDelayCycles(0);
 	}
@@ -357,20 +505,20 @@ namespace dsp56k
 
 		if(!hadTXInterrupt && hasTXInterrupt)
 		{
-			LOG("HTDE interrupt enabled");
+			LOG_DIAGNOSTIC("HTDE interrupt enabled");
 		}
 		else if(hadTXInterrupt && !hasTXInterrupt)
 		{
-			LOG("HTDE interrupt disabled");
+			LOG_DIAGNOSTIC("HTDE interrupt disabled");
 		}
 
 		if(!hadRXInterrupt && hasRXInterrupt)
 		{
-			LOG("RX interrupt enabled");
+			LOG_DIAGNOSTIC("RX interrupt enabled");
 		}
 		else if(hadRXInterrupt && !hasRXInterrupt)
 		{
-			LOG("RX interrupt disabled");
+			LOG_DIAGNOSTIC("RX interrupt disabled");
 		}
 	}
 
@@ -383,7 +531,7 @@ namespace dsp56k
 
 	void HDI08::writePortControlRegister(const TWord _val)
 	{
-		LOG("Write HDI08 HPCR " << HEX(_val));
+		LOG_DIAGNOSTIC("Write HDI08 HPCR " << HEX(_val));
 		m_hpcr = _val;
 		m_periph.setDelayCycles(0);
 	}

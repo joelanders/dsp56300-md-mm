@@ -381,7 +381,8 @@ namespace dsp56k
 
 	void Memory::memTranslateAddress(EMemArea& _area, const TWord& _addr) const
 	{
-		if(m_mmuBuffer->isValid())
+		// A failed or unsupported MMU mapping is represented by a null buffer.
+		if(hasMmuSupport())
 			return;
 
 //		if(_addr >= m_bridgedMemoryAddress)
