@@ -237,7 +237,6 @@ namespace dsp56k
 		bool							m_boundedJitCompilationAllowed = true;
 		bool							m_boundedJitCacheMiss = false;
 		bool m_boundedJitDeferredVolatileWrites = false;
-		TWord							m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		uint32_t						m_ownedJitMaxInstructions = 0;
 		uint32_t						m_ownedJitMaxDoIterations = 0;
 		uint64_t						m_pacedJitConfigGeneration = 0;
@@ -645,12 +644,6 @@ namespace dsp56k
 		{
 			if(m_pacedJitActive && m_boundedJitMode)
 				m_boundedJitCacheMiss = true;
-		}
-		void	deferJitProgramWrite			(TWord _address) noexcept
-		{
-			m_boundedJitDeferredProgramWrite = _address;
-			notifyJitCacheMiss();
-			notifyProgramMemWrite(_address);
 		}
 		void deferVolatileJitProgramWrite(TWord _address) noexcept
 		{

@@ -9,9 +9,16 @@ namespace dsp56k
 
 #define LOG_ERR_BASE(A,ERR)					\
 {											\
+	if(!Logging::isCurrentThreadLogEnabled())	\
+	{										\
+		assertf( A, "DSP 56300 error" );	\
+	}										\
+	else									\
+	{										\
 	std::stringstream ss;	ss << __func__ << "@" << __LINE__ << ": " << "DSP 56300 ERROR: " << ERR;		\
 	LOGTOCONSOLE( ss );						\
 	assertf( A, ss.str().c_str() );			\
+	}										\
 }
 
 // emulation errors

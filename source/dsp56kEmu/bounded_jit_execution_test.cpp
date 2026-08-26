@@ -358,27 +358,24 @@ namespace
 			&& interruptFixture.dsp.setBoundedJitCompilationAllowed(false)
 			&& interruptFixture.dsp.injectInterrupt(Vba_NMI),
 			"failed to prepare the unseen-vector cache-miss fixture");
-		const auto vectorMiss = interruptFixture.dsp.executeBoundedJitBlock();
-		require(vectorMiss.stop == DSP::BoundedJitExecutionStop::CacheMiss
-			&& vectorMiss.instructionDelta == 0 && vectorMiss.cycleCounterDelta == 0
-			&& interruptFixture.dsp.hasPendingInterrupts()
-			&& interruptFixture.dsp.getProcessingMode() == DSP::Default,
-			"unseen interrupt vector was consumed or acknowledged before compilation");
-		require(interruptFixture.dsp.setBoundedJitCompilationAllowed(true),
-			"failed to reopen vector preparation");
-		const auto preparedVector = interruptFixture.dsp.executeBoundedJitBlock();
-		require(preparedVector.stop == DSP::BoundedJitExecutionStop::BlockComplete
-			&& preparedVector.instructionDelta == 2
+		g_allocations.store(0, std::memory_order_relaxed);
+		g_measureAllocations.store(true, std::memory_order_relaxed);
+		const auto interpretedVector = interruptFixture.dsp.executeBoundedJitBlock();
+		g_measureAllocations.store(false, std::memory_order_relaxed);
+		require(interpretedVector.stop == DSP::BoundedJitExecutionStop::BlockComplete
+			&& interpretedVector.instructionDelta == 2
 			&& interruptFixture.dsp.hasPendingInterrupts()
 			&& interruptFixture.dsp.getProcessingMode()
-				== DSP::DefaultPreventInterrupt,
-			"retained interrupt vector did not compile with its exact fast chronology");
+				== DSP::DefaultPreventInterrupt
+			&& interruptFixture.dsp.getPC().toWord() == 0x100
+			&& g_allocations.load(std::memory_order_relaxed) == 0,
+			"unseen interrupt vector did not use the allocation-free interpreter");
 		const auto vectorFollowup = interruptFixture.dsp.executeBoundedJitBlock();
 		require(vectorFollowup.stop == DSP::BoundedJitExecutionStop::BlockComplete
 			&& vectorFollowup.instructionDelta != 0
 			&& !interruptFixture.dsp.hasPendingInterrupts()
 			&& interruptFixture.dsp.getProcessingMode() == DSP::Default,
-			"prepared fast vector did not acknowledge on its following source block");
+			"interpreted fast vector did not resume its following source block");
 		require(interruptFixture.dsp.endBoundedJitExecution(),
 			"failed to end the unseen-vector bounded session");
 	}
@@ -441,6 +438,66 @@ namespace
 					fixture.dsp.regs().r[1].toWord() == 1,
 				"reopened preparation did not refresh the volatile native block");
 		require(fixture.dsp.endBoundedJitExecution(), "failed to end volatile-program bounded session");
+	}
+
+	void firstRealtimeProgramWriteInvalidatesWithoutAllocation()
+	{
+		constexpr TWord WriterPC = 0x100;
+		constexpr TWord TargetPC = 0x200;
+		Fixture fixture;
+		const auto replacement = fixture.assembler.assemble("move #$2,r1");
+		require(replacement.success() && replacement.wordCount == 1,
+			"failed to assemble realtime program replacement");
+
+		TWord writerEnd = WriterPC;
+		writerEnd = fixture.install(writerEnd, "move r0,p:(r2)");
+		fixture.install(writerEnd, "jmp $200");
+		fixture.install(TargetPC, "move #$1,r1");
+		fixture.install(TargetPC + 1, "jmp $200");
+		fixture.dsp.regs().r[0].var = replacement.word[0];
+		fixture.dsp.regs().r[2].var = TargetPC;
+		fixture.dsp.setPC(WriterPC);
+		fixture.begin();
+
+		require(fixture.dsp.getJit().ensureProgramAddress(WriterPC)
+			&& fixture.dsp.getJit().ensureProgramAddress(TargetPC),
+			"failed to size the realtime program-write dispatch table");
+		fixture.dsp.getJit().create(WriterPC, false);
+		fixture.dsp.getJit().create(TargetPC, false);
+		require(fixture.dsp.setBoundedJitCompilationAllowed(false),
+			"failed to prewarm and close the realtime program-write fixture");
+
+		g_allocations.store(0, std::memory_order_relaxed);
+		g_measureAllocations.store(true, std::memory_order_relaxed);
+		const auto write = fixture.dsp.executeBoundedJitBlock();
+		const auto writeReachedSuccessor = fixture.dsp.getPC().toWord() == writerEnd;
+		const auto branch = fixture.dsp.executeBoundedJitBlock();
+		const auto branchReachedTarget = fixture.dsp.getPC().toWord() == TargetPC;
+		const auto interpreted = fixture.dsp.executeBoundedJitBlock();
+		g_measureAllocations.store(false, std::memory_order_relaxed);
+
+		require(write.stop == DSP::BoundedJitExecutionStop::BlockComplete
+			&& writeReachedSuccessor
+			&& fixture.memory.get(MemArea_P, TargetPC) == replacement.word[0]
+			&& branch.stop == DSP::BoundedJitExecutionStop::BlockComplete
+			&& branchReachedTarget
+			&& interpreted.stop == DSP::BoundedJitExecutionStop::BlockComplete
+			&& interpreted.instructionDelta == 1
+			&& fixture.dsp.getPC().toWord() == TargetPC + 1
+			&& fixture.dsp.regs().r[1].toWord() == 2
+			&& fixture.dsp.isBoundedJitExecutionActive()
+			&& g_allocations.load(std::memory_order_relaxed) == 0,
+			"first realtime program write executed stale native code or allocated");
+
+		require(fixture.dsp.setBoundedJitCompilationAllowed(true),
+			"failed to reopen compilation after the realtime program write");
+		fixture.dsp.setPC(TargetPC);
+		require(fixture.dsp.executeBoundedJitBlock().stop
+				== DSP::BoundedJitExecutionStop::BlockComplete
+			&& fixture.dsp.regs().r[1].toWord() == 2,
+			"reopened preparation did not compile the realtime replacement");
+		require(fixture.dsp.endBoundedJitExecution(),
+			"failed to end realtime program-write bounded session");
 	}
 
 	void waitStopAndResetRemainBounded()
@@ -566,6 +623,7 @@ int main()
 			measuredDynamicBlocksMatchTheSameOrdinaryJitConfiguration();
 			prewarmedOnlyModeRejectsAnUnseenBlockWithoutLosingOwnership();
 			preparedVolatileProgramWritesUseTheAllocationFreeInterpreter();
+			firstRealtimeProgramWriteInvalidatesWithoutAllocation();
 			waitStopAndResetRemainBounded();
 			callbacksCannotReenterOrSilentlyChangeTheOwnedConfiguration();
 		}

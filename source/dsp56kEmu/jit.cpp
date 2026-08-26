@@ -88,7 +88,10 @@ namespace dsp56k
 		Jit::toJitPtr(_jit)->run(_pc);
 	}
 
-	Jit::Jit(DSP& _dsp) : m_dsp(_dsp), m_rt(new JitRuntime())
+	Jit::Jit(DSP& _dsp)
+		: m_dsp(_dsp)
+		, m_rt(new JitRuntime())
+		, m_realtimeInterpreterP((m_dsp.memory().sizeP() + 63u) / 64u)
 	{
 		m_emitters.reserve(16);
 		m_blockRuntimeDatas.reserve(0x10000);
@@ -249,6 +252,11 @@ namespace dsp56k
 
 	void Jit::notifyProgramMemWrite(const TWord _offset)
 	{
+		if(!m_dsp.jitCompilationAllowed())
+		{
+			deferRealtimeProgramWrite(_offset);
+			return;
+		}
 		for (auto& it : m_chains)
 			it.second->notifyPMemWrite(_offset, it.second.get() == m_currentChain);
 
@@ -257,7 +265,40 @@ namespace dsp56k
 
 	bool Jit::requiresRealtimeInterpreter(const TWord _pc) const noexcept
 	{
-		return isVolatileP(_pc) || (_pc != 0x00ffffffu && isVolatileP(_pc + 1));
+		return isRealtimeInterpreterAddress(_pc) || isVolatileP(_pc)
+			|| (_pc != 0x00ffffffu && isVolatileP(_pc + 1));
+	}
+
+	void Jit::deferRealtimeProgramWrite(const TWord _address) noexcept
+	{
+		if(_address >= m_dsp.memory().sizeP())
+			return;
+		constexpr TWord WordsPerInstruction = 2;
+		constexpr TWord MaximumGeneratedBlockWords =
+			DSP::BoundedJitMaxInstructionsPerBlock * WordsPerInstruction;
+		const auto first = _address >= MaximumGeneratedBlockWords
+			? _address - MaximumGeneratedBlockWords + 1 : 0;
+		for(auto address = first; address <= _address; ++address)
+			m_realtimeInterpreterP[address / 64u] |= uint64_t{1} << (address % 64u);
+	}
+
+	bool Jit::isRealtimeInterpreterAddress(const TWord _address) const noexcept
+	{
+		return _address < m_dsp.memory().sizeP()
+			&& (m_realtimeInterpreterP[_address / 64u]
+				& (uint64_t{1} << (_address % 64u))) != 0;
+	}
+
+	void Jit::refreshRealtimeProgramAddresses()
+	{
+		for(size_t wordIndex = 0; wordIndex < m_realtimeInterpreterP.size(); ++wordIndex)
+		{
+			auto bits = m_realtimeInterpreterP[wordIndex];
+			for(size_t bit = 0; bits != 0; ++bit, bits >>= 1u)
+				if((bits & 1u) != 0)
+					notifyProgramMemWrite(static_cast<TWord>(wordIndex * 64u + bit));
+		}
+		std::fill(m_realtimeInterpreterP.begin(), m_realtimeInterpreterP.end(), 0);
 	}
 
 	void Jit::refreshVolatileProgramAddresses()
@@ -351,15 +392,8 @@ namespace dsp56k
 			return;
 		if(!m_dsp.jitCompilationAllowed())
 		{
-			if (isVolatileP(pMemWriteAddr))
-			{
-				m_dsp.deferVolatileJitProgramWrite(pMemWriteAddr);
-				return;
-			}
-			// Destruction/recycling can allocate through cache containers. Preserve
-			// the architectural write, fail the bounded visit, and defer JIT cache
-			// invalidation until preparation explicitly reopens compilation.
-			m_dsp.deferJitProgramWrite(pMemWriteAddr);
+			notifyProgramMemWrite(pMemWriteAddr);
+			m_dsp.notifyProgramMemWrite(pMemWriteAddr);
 			return;
 		}
 
@@ -433,6 +467,7 @@ namespace dsp56k
 	{
 		m_chains.clear();
 		m_currentChain = nullptr;
+		std::fill(m_realtimeInterpreterP.begin(), m_realtimeInterpreterP.end(), 0);
 		checkModeChange();
 	}
 

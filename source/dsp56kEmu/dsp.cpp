@@ -204,17 +204,6 @@ namespace dsp56k
 			return;
 		}
 
-		// A prewarmed-only bounded owner must not consume or acknowledge an
-		// interrupt whose vector would require compilation. Keep the request at
-		// the FIFO front so preparation can reopen compilation and retry it.
-		if(g_useJIT && m_pacedJitExecuting && m_boundedJitMode
-			&& !m_boundedJitCompilationAllowed
-			&& !m_jit.canExecuteProgramAddressWithoutCompilation(vba))
-		{
-			notifyJitCacheMiss();
-			return;
-		}
-
 		// it is important that the processing mode is switched first before popping the vector to prevent a possible
 		// race condition in hasPendingInterrupt()
 		{
@@ -242,7 +231,12 @@ namespace dsp56k
 			m_debugger->onExec(vba);
 #endif
 
-		if(g_useJIT && !m_budgetedExecutionActive)
+		const bool useRealtimeInterruptInterpreter = m_pacedJitActive
+			&& m_boundedJitMode && !m_boundedJitCompilationAllowed
+			&& (m_jit.requiresRealtimeInterpreter(vba)
+				|| !m_jit.canExecuteProgramAddressWithoutCompilation(vba));
+		if(g_useJIT && !m_budgetedExecutionActive
+			&& !useRealtimeInterruptInterpreter)
 		{
 			if(!m_jit.ensureProgramAddress(vba))
 				return;
@@ -505,7 +499,6 @@ namespace dsp56k
 		m_boundedJitCompilationAllowed = true;
 		m_boundedJitCacheMiss = false;
 		m_boundedJitDeferredVolatileWrites = false;
-		m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		m_ownedJitMaxInstructions = BoundedJitMaxInstructionsPerBlock;
 		m_ownedJitMaxDoIterations = BoundedJitMaxDoIterations;
 		m_pacedJitActive = true;
@@ -530,7 +523,6 @@ namespace dsp56k
 		m_boundedJitCompilationAllowed = true;
 		m_boundedJitCacheMiss = false;
 		m_boundedJitDeferredVolatileWrites = false;
-		m_boundedJitDeferredProgramWrite = 0xffffffffu;
 		m_ownedJitMaxInstructions = 0;
 		m_ownedJitMaxDoIterations = 0;
 		m_pacedJitConfigGeneration = 0;
@@ -840,12 +832,8 @@ namespace dsp56k
 			m_boundedJitDeferredVolatileWrites = false;
 			m_jit.refreshVolatileProgramAddresses();
 		}
-		if(_allowed && m_boundedJitDeferredProgramWrite != 0xffffffffu)
-		{
-			const auto address = m_boundedJitDeferredProgramWrite;
-			m_boundedJitDeferredProgramWrite = 0xffffffffu;
-			m_jit.notifyProgramMemWrite(address);
-		}
+		if(_allowed)
+			m_jit.refreshRealtimeProgramAddresses();
 		return true;
 	}
 

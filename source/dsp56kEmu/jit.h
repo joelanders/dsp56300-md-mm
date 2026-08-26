@@ -61,6 +61,7 @@ namespace dsp56k
 		// allocation-free interpreter instead of running a stale native block.
 		bool requiresRealtimeInterpreter(TWord _pc) const noexcept;
 		void refreshVolatileProgramAddresses();
+		void refreshRealtimeProgramAddresses();
 
 		void run(TWord _pc) noexcept;
 		void runCheckPMemWrite(TWord _pc) noexcept;
@@ -125,6 +126,8 @@ namespace dsp56k
 
 	private:
 		void checkPMemWrite() noexcept;
+		void deferRealtimeProgramWrite(TWord _address) noexcept;
+		bool isRealtimeInterpreterAddress(TWord _address) const noexcept;
 
 		DSP& m_dsp;
 
@@ -140,6 +143,10 @@ namespace dsp56k
 
 		std::vector<TJitFunc> m_jitFuncs;
 		std::set<TWord> m_volatileP;
+		// One bit per P-memory word. A closed-cache program write marks the
+		// containing maximum-size generated-block window so subsequent execution
+		// uses the allocation-free interpreter instead of stale native code.
+		std::vector<uint64_t> m_realtimeInterpreterP;
 		std::map<TWord, TWord> m_loops;
 		std::set<TWord> m_loopEnds;
 

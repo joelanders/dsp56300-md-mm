@@ -3,6 +3,7 @@
 #include <sstream>
 #include <string>
 #include <iomanip>
+#include <cstdint>
 
 namespace Logging
 {
@@ -11,6 +12,32 @@ namespace Logging
 	void g_logToConsole( const std::string& _s );
 	void g_logToFile( const std::string& _s );
 	void setLogFunc(LogFunc _func);
+
+	inline thread_local uint32_t g_currentThreadSuppressionDepth = 0;
+
+	inline bool isCurrentThreadLogEnabled() noexcept
+	{
+		return g_currentThreadSuppressionDepth == 0;
+	}
+
+	class ScopedCurrentThreadLogSuppression final
+	{
+	public:
+		ScopedCurrentThreadLogSuppression() noexcept
+		{
+			++g_currentThreadSuppressionDepth;
+		}
+
+		~ScopedCurrentThreadLogSuppression()
+		{
+			--g_currentThreadSuppressionDepth;
+		}
+
+		ScopedCurrentThreadLogSuppression(
+			const ScopedCurrentThreadLogSuppression&) = delete;
+		ScopedCurrentThreadLogSuppression& operator=(
+			const ScopedCurrentThreadLogSuppression&) = delete;
+	};
 }
 
 #define LOGTOCONSOLE(ss)	{ Logging::g_logToConsole( (ss).str() ); }
@@ -19,6 +46,7 @@ namespace Logging
 #define LOG(S)																												\
 do																															\
 {																															\
+	if(!Logging::isCurrentThreadLogEnabled()) break;													\
 	std::stringstream __ss__logging_h;	__ss__logging_h << __func__ << "@" << __LINE__ << ": " << S;						\
 																															\
 	LOGTOCONSOLE(__ss__logging_h)																							\
@@ -28,6 +56,7 @@ while(false)
 #define LOGF(S)																												\
 do																															\
 {																															\
+	if(!Logging::isCurrentThreadLogEnabled()) break;													\
 	std::stringstream __ss__logging_h;	__ss__logging_h << S;																\
 																															\
 	LOGTOFILE(__ss__logging_h)																								\
