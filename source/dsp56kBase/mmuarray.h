@@ -45,7 +45,7 @@ namespace dsp56k
 		// Initialize the array
 		// _maxSize: maximum number of elements (defines virtual address range in MMU mode)
 		// _fillFunc: function to fill blocks with default values (called with pointer and count)
-		// _blockSize: number of elements per MMU block (must be power of 2, ignored in non-MMU mode)
+		// _blockSize: number of elements per allocation block (must be power of 2)
 		// Returns true if MMU mode is active, false if using fallback
 		bool init(size_t _maxSize, FillFunc _fillFunc, size_t _blockSize = 16384)
 		{
@@ -218,7 +218,13 @@ namespace dsp56k
 				return false;
 
 			const auto oldSize = m_fallback.size();
-			const auto newSize = _index + 1;
+			// Keep fallback growth aligned with the same blocks used by the MMU path.
+			// Exact index+1 growth makes a high-address JIT block resize once at its
+			// first opcode and again at its last opcode, copying a very large vector
+			// twice on platforms (notably macOS) where MMU mode is unavailable.
+			const auto requiredSize = _index + 1;
+			const auto roundedSize = ((_index / m_blockSize) + 1) * m_blockSize;
+			const auto newSize = roundedSize <= m_maxSize ? roundedSize : requiredSize;
 			m_fallback.resize(newSize);
 			m_fillFunc(m_fallback.data() + oldSize, newSize - oldSize);
 			m_ptr = m_fallback.data();
