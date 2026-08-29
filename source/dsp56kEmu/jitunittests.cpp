@@ -64,6 +64,7 @@ namespace dsp56k
 		rep_div();
 
 		parallelMoveXY();
+		boundedDispatch();
 	}
 
 	JitUnittests::~JitUnittests()
@@ -186,6 +187,55 @@ namespace dsp56k
 	{
 		for(size_t i=0; i<_count; ++i)
 			block->asm_().nop();
+	}
+
+	void JitUnittests::boundedDispatch()
+	{
+		constexpr TWord loopPC = 0x100;
+		TWord pc = loopPC;
+		pc = emitToMemory("nop", pc);
+		pc = emitToMemory("nop", pc);
+		emitToMemory("bra >$100", pc);
+
+		const auto run = [this](const bool _bounded)
+		{
+			dsp.resetHW();
+			dsp.setPC(loopPC);
+			peripheralsX.resetDelayCycles(0, IPeripherals::MaxDelayCycles);
+			peripheralsX.setCycleDeadline(7);
+
+			constexpr uint64_t targetCycles = 257;
+			if(_bounded)
+				dsp.execUntilCycles(targetCycles);
+			else
+			{
+				do
+					dsp.execJit();
+				while(dsp.getCycles() < targetCycles);
+			}
+
+			return std::array<uint64_t, 4>{
+				dsp.getPC().toWord(), dsp.getInstructionCounter(), dsp.getCycles(),
+				peripheralsX.getTargetClock()};
+		};
+
+		const auto reference = run(false);
+		const auto bounded = run(true);
+		verify(bounded == reference);
+		verify(bounded[2] >= 257);
+
+		constexpr TWord highPC = 0x70000;
+		dsp.resetHW();
+		emitToMemory("jmp (r0)", loopPC);
+		emitToMemory("jmp (r0)", highPC);
+		dsp.regs().r[0].var = highPC;
+		dsp.setPC(loopPC);
+		const bool needsGrowth = dsp.getJitEntriesSize() <= highPC;
+		dsp.execUntilCycles(32);
+		verify(dsp.getPC().toWord() == highPC);
+		verify(dsp.getCycles() >= 32);
+		if(needsGrowth)
+			verify(dsp.getJitEntriesSize() > highPC);
 	}
 
 	void JitUnittests::conversion_build()
