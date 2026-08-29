@@ -15,7 +15,7 @@ namespace dsp56k
 	{
 	public:
 		typedef void (*TExecLoopFunc)(DSP*, uint32_t) noexcept;				// DSP, iteration count
-		typedef void (*TExecUntilCyclesFunc)(DSP*, uint64_t) noexcept;		// DSP, exclusive cycle target
+		typedef TWord (*TExecUntilCyclesFunc)(DSP*, uint64_t) noexcept;		// DSP, exclusive cycle target; invalid PC or 0xffffffff
 		typedef void (*TExecOneFunc)(JitDspPtr*, TWord, TJitFunc) noexcept;	// DspRegs, PC, function to be called
 
 		static constexpr uint32_t UnrollShift = 3;
@@ -41,9 +41,9 @@ namespace dsp56k
 			m_funcExecOne(_jit, _pc, _func);
 		}
 
-		void execUntilCycles(DSP* _dsp, const uint64_t _targetCycles) const noexcept
+		TWord execUntilCycles(DSP* _dsp, const uint64_t _targetCycles) const noexcept
 		{
-			m_funcExecUntilCycles(_dsp, _targetCycles);
+			return m_funcExecUntilCycles(_dsp, _targetCycles);
 		}
 
 	private:

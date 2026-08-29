@@ -239,7 +239,16 @@ namespace dsp56k
 					return;
 				}
 
-				m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
+				while(m_cycles < _targetCycles)
+				{
+					const TWord invalidPC = m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
+					if(invalidPC == 0xffffffffu)
+						return;
+
+					onInvalidPC(invalidPC);
+					if(invalidPC >= m_jitEntriesSize)
+						return;
+				}
 			}
 			else
 			{
@@ -467,6 +476,7 @@ namespace dsp56k
 
 		void			setJitEntries					(const TJitFunc* _funcs, const size_t _count)	{ m_jitEntries = _funcs; m_jitEntriesSize = static_cast<TWord>(_count); }
 		const auto&		getJitEntries					() const			{ return m_jitEntries; }
+		const auto&		getJitEntriesSize				() const			{ return m_jitEntriesSize; }
 
 		// called when the PC left the JIT dispatch table, i.e. it is not a valid P memory address anymore. Halts this DSP.
 		ASMJIT_NOINLINE void onInvalidPC(TWord _pc) noexcept;

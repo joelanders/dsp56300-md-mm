@@ -314,6 +314,8 @@ namespace dsp56k
 #endif
 
 		const auto label = m_asm.newNamedLabel("beginExecUntilCycles");
+		const auto invalidPC = m_asm.newNamedLabel("invalidPCExecUntilCycles");
+		const auto done = m_asm.newNamedLabel("doneExecUntilCycles");
 		m_asm.align(asmjit::AlignMode::kCode, 64);
 		m_asm.bind(label);
 
@@ -324,6 +326,9 @@ namespace dsp56k
 
 		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_ptrJitEntries, 8));
 		m_asm.ldr(r32(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrPC, 4));
+		m_asm.ldr(r32(g_funcArgGPs[0]), Jitmem::makeRelativePtr(&m_dsp.getJitEntriesSize(), &m_dsp, g_ptrDSP, 4));
+		m_asm.cmp(r32(g_funcArgGPs[1]), r32(g_funcArgGPs[0]));
+		m_asm.b(asmjit::arm::CondCode::kUnsignedGE, invalidPC);
 		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_funcToCall, g_funcArgGPs[1], 3, 8));
 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
 		m_asm.blr(g_funcToCall);
@@ -343,6 +348,8 @@ namespace dsp56k
 
 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
+		m_asm.cmp(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.getJitEntriesSize(), &m_dsp, dsp, 4));
+		m_asm.jae(invalidPC);
 		m_asm.mov(g_funcToCall, Jitmem::makePtr(g_funcToCall, g_funcArgGPs[1], 3, 8));
 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
 		m_asm.call(g_funcToCall);
@@ -352,6 +359,12 @@ namespace dsp56k
 		m_asm.cmp(Jitmem::makeRelativePtr(&m_dsp.getCycles(), &m_dsp, dsp, 8), scratchA);
 		m_asm.jb(label);
 #endif
+
+		m_asm.mov(r32(regReturnVal), asmjit::Imm(0xffffffffu));
+		m_asm.jmp(done);
+		m_asm.bind(invalidPC);
+		m_asm.mov(r32(regReturnVal), r32(g_funcArgGPs[1]));
+		m_asm.bind(done);
 
 #ifdef HAVE_X86_64
 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_stackSize));
