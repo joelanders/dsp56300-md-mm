@@ -216,6 +216,39 @@ namespace dsp56k
 			}
 		}
 
+		// Execute cached blocks under one trampoline entry until the first block
+		// that reaches _targetCycles has completed. Peripheral and interrupt checks
+		// still run before every block, exactly as they do in exec(). Hosts with a
+		// cycle-domain scheduling deadline can therefore amortize trampoline setup
+		// without increasing their existing one-block deadline overshoot.
+		ASMJIT_FORCE_INLINE void execUntilCycles(const uint64_t _targetCycles) noexcept
+		{
+			if(m_cycles >= _targetCycles)
+				return;
+
+			if constexpr(g_useJIT)
+			{
+				// The optional correction is evaluated before every block by execJit().
+				// Keep that specialized core on the reference path until the generated
+				// bounded loop has an equivalent pre-block hook.
+				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
+				{
+					do
+						execJit();
+					while(m_cycles < _targetCycles);
+					return;
+				}
+
+				m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
+			}
+			else
+			{
+				do
+					execInterpreter();
+				while(m_cycles < _targetCycles);
+			}
+		}
+
 		ASMJIT_FORCE_INLINE void execInlinePeripheralCheck() noexcept
 		{
 			if(g_useJIT)
