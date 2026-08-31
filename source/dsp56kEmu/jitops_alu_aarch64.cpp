@@ -20,7 +20,8 @@ namespace dsp56k
 		getBlock().dspRegPool().getXY0(r32(_dst), _xy);
 
 		m_asm.sbfiz(_dst, _dst, asmjit::Imm(32), asmjit::Imm(24));
-		m_asm.lsr(_dst, _dst, asmjit::Imm(8));
+		if constexpr (!g_leftAlignedAlu)
+			m_asm.lsr(_dst, _dst, asmjit::Imm(8));	// sbfiz already lands it at the left-aligned position
 	}
 
 	void JitOps::XY1to56(const JitReg64& _dst, int _xy) const
@@ -28,7 +29,8 @@ namespace dsp56k
 		getBlock().dspRegPool().getXY1(r32(_dst), _xy);
 
 		m_asm.sbfiz(_dst, _dst, asmjit::Imm(32), asmjit::Imm(24));
-		m_asm.lsr(_dst, _dst, asmjit::Imm(8));
+		if constexpr (!g_leftAlignedAlu)
+			m_asm.lsr(_dst, _dst, asmjit::Imm(8));	// sbfiz already lands it at the left-aligned position
 	}
 
 	void JitOps::alu_abs(const JitRegGP& _r)
@@ -39,7 +41,7 @@ namespace dsp56k
 	
 	void JitOps::alu_and(const TWord ab, DspValue& _v)
 	{
-		m_asm.shl(r64(_v), asmjit::Imm(24));
+		m_asm.shl(r64(_v), asmjit::Imm(24 + g_aluBitOffset));
 
 		AluRef alu(m_block, ab);
 
@@ -48,8 +50,8 @@ namespace dsp56k
 			m_asm.ands(r, alu.get(), r64(_v));
 			ccr_update_ifZero(CCRB_Z);
 
-			m_asm.lsr(r, r, asmjit::Imm(24));
-			m_asm.bfi(alu, r, asmjit::Imm(24), asmjit::Imm(24));
+			m_asm.lsr(r, r, asmjit::Imm(24 + g_aluBitOffset));
+			m_asm.bfi(alu, r, asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
 		}
 
 		_v.release();
@@ -66,7 +68,7 @@ namespace dsp56k
 		if (_abDst != _abSrc)
 			m_dspRegs.getALU(alu.get(), _abSrc);
 
-		signextend56to64(alu);
+		aluSignextendTo64(alu);
 
 		const RegGP oldAlu(m_block);
 		m_asm.mov(oldAlu, alu);
@@ -83,7 +85,7 @@ namespace dsp56k
 		// The easiest way to check this is to shift back and compare if the initial alu value is identical ot the backshifted one
 		{
 			const RegScratch s(m_block);
-			signextend56to64(s, alu);
+			aluSignextendTo64(s, alu);
 			if(_v)
 				m_asm.asr(s, s, _v->get());
 			else
@@ -106,7 +108,7 @@ namespace dsp56k
 
 		const CcrBatchUpdate bu(*this, CCR_C, CCR_V);
 
-		m_asm.lsl(alu, alu, asmjit::Imm(8));	// make sign-extend possible in our wide registers
+		aluExtendTo64(alu);						// make sign-extend possible in our wide registers
 		if(_v)
 			m_asm.asr(alu, alu, _v->get());
 		else
@@ -114,7 +116,7 @@ namespace dsp56k
 
 		copyBitToCCR(alu, 7, CCRB_C);			// carry is the last bit shifted out, we can grab it at bit pos 7 now as we pre-shifted left by 8
 
-		m_asm.lsr(alu, alu, asmjit::Imm(8));	// correction
+		aluRestoreFrom64(alu);					// discards bits below the accumulator - the hardware has no resolution there
 
 //		ccr_clear(CCR_V);						// cleared by batch update
 
@@ -184,7 +186,7 @@ namespace dsp56k
 	void JitOps::alu_rnd(TWord ab, const JitReg64& d, const bool _needsSignextend/* = true*/)
 	{
 		if(_needsSignextend)
-			signextend56to64(d);
+			aluSignextendTo64(d);
 
 		RegGP rounder(m_block);
 
@@ -192,7 +194,7 @@ namespace dsp56k
 
 		if(mode)
 		{
-			uint32_t r = 0x800000;
+			uint64_t r = 0x800000ull << g_aluBitOffset;
 
 			if(mode->testSR(SRB_S1))	r >>= 1;
 			if(mode->testSR(SRB_S0))	r <<= 1;
@@ -201,7 +203,7 @@ namespace dsp56k
 		}
 		else
 		{
-			m_asm.mov(rounder, asmjit::Imm(0x800000));
+			m_asm.mov(rounder, asmjit::Imm(0x800000ull << g_aluBitOffset));
 
 			const ShiftReg shifter(m_block);
 			m_asm.mov(shifter, asmjit::a64::xzr);
@@ -282,6 +284,11 @@ namespace dsp56k
 		m_asm.mov(r32(offset), r32(_widthOffset.get()));
 		m_asm.and_(offset.get(), asmjit::Imm(0x3f));
 
+		// the offset is relative to the 56-bit value; shifting both the value and the mask by the
+		// aligned offset places the field correctly in either representation
+		if constexpr (g_leftAlignedAlu)
+			m_asm.add(offset.get(), asmjit::Imm(g_aluBitOffset));
+
 		// uint64_t s = src & mask;
 		const RegGP s(m_block);
 		m_asm.mov(r32(s), r32(_src.get()));
@@ -351,7 +358,10 @@ namespace dsp56k
 
 		const RegGP t(m_block);
 		const RegGP shifted(m_block);
-		m_asm.lsl(r64(shifted), r64(s), asmjit::Imm(8));
+		if constexpr (g_leftAlignedAlu)
+			m_asm.mov(r64(shifted), r64(s));	// count from the MSB; left-aligned it is already there
+		else
+			m_asm.lsl(r64(shifted), r64(s), asmjit::Imm(8));
 
 		// this instruction counts the number of equal bits starting at the MSB
 		// We only count leading zeroes, so we invert the source if the MSB is a 1
@@ -370,9 +380,9 @@ namespace dsp56k
 		m_asm.csel(r32(t), r32(t), asmjit::a64::regs::wzr, asmjit::arm::CondCode::kNotZero);
 
 		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23, CCRB_N);
+		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
 
-		m_asm.lsl(r64(d), r64(t), asmjit::Imm(24));
+		m_asm.lsl(r64(d), r64(t), asmjit::Imm(24 + g_aluBitOffset));
 		ccr_update_ifZero(CCRB_Z);
 	}
 
@@ -397,7 +407,7 @@ namespace dsp56k
 			const auto sr = m_dspRegs.getSR(JitDspRegs::ReadWrite);
 
 			m_asm.eor(r, d, d, asmjit::arm::lsr(1));
-			m_asm.ubfx(r, r, asmjit::Imm(54), asmjit::Imm(1));
+			m_asm.ubfx(r, r, asmjit::Imm(54 + g_aluBitOffset), asmjit::Imm(1));
 			m_asm.bfi(sr, r, asmjit::Imm(CCRB_V), asmjit::Imm(1));
 			m_asm.lsl(r, r, asmjit::Imm(CCRB_L));
 			m_asm.orr(sr, sr, r.get());
@@ -410,7 +420,7 @@ namespace dsp56k
 			decode_JJ_read(s, jj);
 
 			m_asm.shl(r64(s), asmjit::Imm(40));
-			m_asm.sar(r64(s), asmjit::Imm(16));
+			m_asm.sar(r64(s), asmjit::Imm(16 - g_aluBitOffset));	// land on the ALU field position
 
 			const RegGP addOrSub(m_block);
 			m_asm.eor(addOrSub, r64(s), d.get());
@@ -418,15 +428,25 @@ namespace dsp56k
 			m_asm.shl(d, asmjit::Imm(1));
 
 			m_asm.bitTest(m_dspRegs.getSR(JitDspRegs::Read), CCRB_C);
-			m_asm.cinc(d, d, asmjit::arm::CondCode::kNotZero);
+			if constexpr (g_leftAlignedAlu)
+			{
+				// the carry enters at the LSB of the 56-bit value, which is bit 8 of the register
+				const RegScratch c(m_block);
+				m_asm.cset(r64(c.get()), asmjit::arm::CondCode::kNotZero);
+				m_asm.add(d, d, r64(c.get()), asmjit::arm::lsl(g_aluBitOffset));
+			}
+			else
+			{
+				m_asm.cinc(d, d, asmjit::arm::CondCode::kNotZero);
+			}
 
 			const RegScratch dLsWord(m_block);
-			m_asm.and_(dLsWord, d.get(), asmjit::Imm(0xffffff));
+			m_asm.and_(dLsWord, d.get(), asmjit::Imm(g_leftAlignedAlu ? 0xffffff00 : 0xffffff));
 
 			const asmjit::Label sub = m_asm.newLabel();
 			const asmjit::Label end = m_asm.newLabel();
 
-			m_asm.bitTest(addOrSub, 55);
+			m_asm.bitTest(addOrSub, 55 + g_aluBitOffset);
 
 			m_asm.jz(sub);
 			m_asm.add(d, r64(s));
@@ -436,12 +456,12 @@ namespace dsp56k
 			m_asm.sub(d, r64(s));
 
 			m_asm.bind(end);
-			m_asm.and_(d, asmjit::Imm(0xffffffffff000000));
+			m_asm.and_(d, asmjit::Imm(g_leftAlignedAlu ? 0xffffffff00000000 : 0xffffffffff000000));
 			m_asm.orr(d, d, dLsWord);
 		}
 
 		// C is set if bit 55 of the result is cleared
-		m_asm.bitTest(d, 55);
+		m_asm.bitTest(d, 55 + g_aluBitOffset);
 		ccr_update_ifZero(CCRB_C);
 
 		m_dspRegs.mask56(d);
@@ -468,11 +488,16 @@ namespace dsp56k
 			// L: Set if the Overflow bit (V) is set.
 			// What we do is we check if bits 55 and 54 of the ALU are not identical (host parity bit cleared) and set V accordingly.
 			// Nearly identical for L but L is only set, not cleared as it is sticky
+			// TODO: L is only derived from the last step here, but the DSP makes it sticky by ORing the
+			// per-step V across all N steps. Reproducing that needs the per-step V accumulated inside the
+			// loop, which costs instructions in the hottest block in the emulator, so it is deliberately
+			// not done. It only differs for a division whose dividend is out of range, see the last case
+			// of rep_div_powerOfTwo.
 			const RegGP r(m_block);
 			const auto sr = m_dspRegs.getSR(JitDspRegs::ReadWrite);
 
 			m_asm.eor(r, alu, alu, asmjit::arm::lsr(1));
-			m_asm.ubfx(r, r, asmjit::Imm(54), asmjit::Imm(1));
+			m_asm.ubfx(r, r, asmjit::Imm(54 + g_aluBitOffset), asmjit::Imm(1));
 			m_asm.bfi(sr, r, asmjit::Imm(CCRB_V), asmjit::Imm(1));
 			m_asm.lsl(r, r, asmjit::Imm(CCRB_L));
 			m_asm.orr(sr, sr, r.get());
@@ -490,12 +515,12 @@ namespace dsp56k
 
 		// once
 		m_asm.shl(r64(sPos), asmjit::Imm(40));
-		m_asm.sar(r64(sPos), asmjit::Imm(16));
+		m_asm.sar(r64(sPos), asmjit::Imm(16 - g_aluBitOffset));	// land on the ALU field position
 
 		m_asm.tst(r64(sPos), r64(sPos));
 		m_asm.cneg(r64(sPos), r64(sPos), asmjit::arm::CondCode::kSign);
 
-		signextend56to64(alu);
+		aluSignextendTo64(alu);
 
 		m_asm.ubfx(carry, m_dspRegs.getSR(JitDspRegs::Read), asmjit::Imm(CCRB_C), 1);
 
@@ -505,8 +530,13 @@ namespace dsp56k
 				m_asm.tst(alu, alu);
 			m_asm.cneg(s, r64(sPos), asmjit::arm::CondCode::kNotSign);
 
-			m_asm.add(alu, carry.get(), alu, asmjit::arm::lsl(1));
-			m_asm.adds(alu, alu, s.get());
+			// One division step is alu = alu*2 + carry + s, and each step depends on the previous one, so
+			// this chain is pure latency - it is what makes the rep/div block the hottest thing in the
+			// Virus C. Fold the shift into the add (ADDS takes a shifted operand) and fold the carry into
+			// s, which is off the alu chain: three dependent adds become one. x64 already does the
+			// equivalent with lea.
+			m_asm.add(s, s, carry.get(), asmjit::arm::lsl(g_aluBitOffset));	// carry enters at the LSB of the 56-bit value
+			m_asm.adds(alu, s, alu, asmjit::arm::lsl(1));
 
 			// C is set if bit 55 of the result is cleared
 			if (_updateCCR)
@@ -515,11 +545,98 @@ namespace dsp56k
 				m_asm.cset(carry, asmjit::arm::CondCode::kNotSign);
 		};
 
+		// A rep/div whose divisor is a power of two and whose dividend is already in range is a shift,
+		// not N dependent steps. Both are runtime properties, so the guard is emitted rather than assumed:
+		// the divisor must be a power of two, and the dividend must satisfy 0 <= alu < divisor. One
+		// unsigned compare covers both halves of the range test, because a negative accumulator is huge
+		// when read unsigned, and it also rejects a zero divisor (which passes the power-of-two test).
+		// In that domain N steps of non-restoring division produce, exactly,
+		//     alu = ((alu << N) mod 2S) - S + (alu >> (log2(2S) - N)) + carry * 2^(N-1)
+		// with V cleared and L untouched. Verified against the interpreter for every divisor 2^0..2^23,
+		// every iteration count 1..24, both carry values, at every piecewise boundary of the domain.
+		// Everything here lives in the left-aligned domain, so the quotient has to be scaled back up by
+		// g_aluBitOffset while the remainder, which is already a value in that domain, does not.
+		// TODO: only a power of two divisor is handled. The general case is a real division of
+		// (alu << N) by 2S, which x64 could do with a single div rdx:rax while aarch64 would need a
+		// different approach. Just 1 of the 8 rep/div sites in the Virus C ROM has a power of two
+		// divisor and none of the other 7 show up in a profile, so measure before building it.
+		const auto fastPathEnd = m_asm.newLabel();
+		// Below a handful of iterations the loop is simply cheaper: a step is two cycles of latency,
+		// while the closed form costs about seven regardless of N, so the crossover sits near four. No
+		// shipped Virus ROM reps a div fewer than 7 times (TI/Snow use 7, 12, 16 and 24, B and C only 12
+		// and 24), so the floor never rejects a real site - it only keeps the guard off code that could
+		// not profit from it.
+		const auto hasFastPath = _iterationCount >= 4 && _iterationCount <= 24;
+
+		if (hasFastPath)
+		{
+			const auto slowPath = m_asm.newLabel();
+
+			// addOrSub is not set up yet and s is only ever used inside a step, so both are free scratch here
+			const auto t = s.get();
+			const auto q = addOrSub.get();
+
+			m_asm.sub(t, r64(sPos), asmjit::Imm(1));
+			m_asm.tst(t, r64(sPos));					// S & (S-1), zero if S is a power of two or zero
+			m_asm.jnz(slowPath);
+			m_asm.cmp(alu, r64(sPos));
+			m_asm.b(asmjit::arm::CondCode::kUnsignedGE, slowPath);	// rejects alu < 0 and S == 0 too
+
+			m_asm.rbit(t, r64(sPos));
+			m_asm.clz(t, t);							// log2(S), well defined because S != 0 here
+			if (_iterationCount > 1)
+				m_asm.sub(t, t, asmjit::Imm(_iterationCount - 1));
+			m_asm.lsr(q, alu, t);						// q = alu >> (log2(2S) - N)
+			m_asm.lsl(q, q, asmjit::Imm(g_aluBitOffset));
+
+			m_asm.lsl(alu, alu, asmjit::Imm(_iterationCount));
+			m_asm.lsl(t, r64(sPos), asmjit::Imm(1));
+			m_asm.sub(t, t, asmjit::Imm(1));
+			m_asm.and_(alu, t);							// (alu << N) mod 2S
+			m_asm.sub(alu, alu, r64(sPos));
+			m_asm.add(alu, alu, q);
+			m_asm.add(alu, alu, carry.get(), asmjit::arm::lsl(_iterationCount - 1 + g_aluBitOffset));
+
+			// C is set if bit 55 of the result is cleared
+			m_asm.tst(alu, alu);
+			ccr_update(CCRB_C, asmjit::arm::CondCode::kNotSign);
+
+			// V is always cleared here and L stays untouched. This is exactly what ccrUpdateVL emits for
+			// V == 0, including its compile time bookkeeping, so both paths leave the CCR state identical.
+			m_asm.and_(m_dspRegs.getSR(JitDspRegs::ReadWrite), asmjit::Imm(~CCR_V));
+			m_ccrDirty = static_cast<CCRMask>(m_ccrDirty & ~(CCR_L | CCR_V));
+
+			m_asm.jmp(fastPathEnd);
+			m_asm.bind(slowPath);
+		}
+
+		// The sign of the previous ALU decides BOTH which value is added (+|s| or -|s|) and what the
+		// carry into the LSB is (0 or 1), so the whole step is "add one of two loop invariant values,
+		// shifted". Precompute them and a step becomes csel + adds instead of cneg + add + adds.
+		// Only the first step is different: its carry comes from SR, not from a previous step.
+		m_asm.mov(addOrSub, asmjit::Imm(1ull << g_aluBitOffset));
+		m_asm.sub(addOrSub, addOrSub, r64(sPos));
+
+		const auto loopIterationInvariant = [&](const bool _needsTestAlu, const bool _updateCCR)
+		{
+			if (_needsTestAlu)
+				m_asm.tst(alu, alu);
+			m_asm.csel(s, r64(sPos), addOrSub.get(), asmjit::arm::CondCode::kSign);
+			m_asm.adds(alu, s, alu, asmjit::arm::lsl(1));
+
+			if (_updateCCR)
+				ccr_update(CCRB_C, asmjit::arm::CondCode::kNotSign);
+		};
+
 		// loop
 		if (_iterationCount <= 24)
 		{
-			for (TWord i = 0; i < _iterationCount - 1; ++i)
-				loopIteration(i == 0, false);
+			if(_iterationCount > 1)
+			{
+				loopIteration(true, false);							// carry comes from SR
+				for (TWord i = 1; i < _iterationCount - 1; ++i)
+					loopIterationInvariant(false, false);
+			}
 		}
 		else
 		{
@@ -534,7 +651,13 @@ namespace dsp56k
 
 		// once
 		ccrUpdateVL();
-		loopIteration(true, true);
+		if(_iterationCount > 1)
+			loopIterationInvariant(true, true);
+		else
+			loopIteration(true, true);
+
+		if (hasFastPath)
+			m_asm.bind(fastPathEnd);
 
 		m_dspRegs.mask56(alu);
 	}
@@ -614,15 +737,15 @@ namespace dsp56k
 		AluRef d(m_block, ab ? 1 : 0, true, true);
 
 		const RegGP oldBit55(m_block);
-		m_asm.bitTest(d, 55);
+		m_asm.bitTest(d, 55 + g_aluBitOffset);
 		m_asm.cset(r32(oldBit55), asmjit::arm::CondCode::kNotZero);
 
-		signextend56to64(d);
+		aluSignextendTo64(d);
 		m_asm.shl(d, asmjit::Imm(1));
 
 		{
 			const RegGP s(m_block);
-			signextend56to64(s, r64(m_dspRegs.getALU(ab ? 0 : 1)));
+			aluSignextendTo64(s, r64(m_dspRegs.getALU(ab ? 0 : 1)));
 
 			m_asm.sub(d, s);
 		}
@@ -630,7 +753,7 @@ namespace dsp56k
 		ccr_dirty(ab ? 1 : 0, d, static_cast<CCRMask>(CCR_E | CCR_U | CCR_N | CCR_Z));
 
 		const RegGP newBit55(m_block);
-		m_asm.bitTest(d, 55);
+		m_asm.bitTest(d, 55 + g_aluBitOffset);
 		m_asm.cset(r32(newBit55), asmjit::arm::CondCode::kNotZero);
 
 		m_asm.eor(r32(oldBit55), r32(oldBit55), r32(newBit55));

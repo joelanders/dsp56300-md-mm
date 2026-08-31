@@ -20,6 +20,15 @@ namespace asmjit
 
 namespace dsp56k
 {
+	// Phase 1 of the left-aligned ALU work (see LEFT_ALIGNED_ALU.md). When enabled, ALU registers held in
+	// JIT host registers store the 56-bit value in bits 63..8, with bits 7..0 always zero. The DspRegs
+	// memory format stays right-aligned, so the interpreter remains an independent oracle; conversion
+	// happens here at the pool's load/store choke point.
+	static constexpr bool g_leftAlignedAlu = true;
+
+	// every accumulator bit position moves up by 8 when the ALU is stored left-aligned
+	static constexpr uint32_t g_aluBitOffset = g_leftAlignedAlu ? 8 : 0;
+
 	class DspValue;
 	class JitBlock;
 
@@ -95,6 +104,9 @@ namespace dsp56k
 		void releaseTemp(PoolReg _reg);
 
 		bool isWritten(PoolReg _reg) const		{ return flagTest(m_writtenDspRegs, _reg); }
+
+		// drops a pending write-back without emitting the store. Only valid if the value is provably dead in memory
+		void discardWritten(const PoolReg _reg)	{ clearWritten(_reg); }
 		bool isLocked(PoolReg _reg) const		{ return flagTest(m_lockedGps, _reg); }
 
 		bool move(PoolReg _dst, PoolReg _src);
@@ -387,6 +399,7 @@ namespace dsp56k
 
 		std::vector<PoolReg> m_availableTemps;
 		std::list<JitReg128> m_usedXmRegs;
+		size_t m_spillXmmCount = 0;
 
 		bool m_isParallelOp = false;
 		bool m_repMode = false;

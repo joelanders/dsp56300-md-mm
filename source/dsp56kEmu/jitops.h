@@ -1,5 +1,6 @@
 #pragma once
 
+#include "jitdspregpool.h"
 #include "jitblock.h"
 #include "jitdspregs.h"
 #include "jitdspvalue.h"
@@ -290,6 +291,21 @@ namespace dsp56k
 
 		// helpers
 		void signextend56to64(const JitReg64& _dst, const JitReg64& _src) const;
+
+		// --- left-aligned ALU representation (see LEFT_ALIGNED_ALU.md) ---
+		// A left-aligned accumulator holds the 56-bit value in bits 63..8. INVARIANT: bits 7..0 are always
+		// zero. The DSP56300 has no such bits, so any information reaching them would be resolution the
+		// hardware never had. Every op that can shift a bit down into them must call aluClearLowByte().
+		void aluSignextendTo64(const JitReg64& _dst, const JitReg64& _src) const;
+		void aluSignextendTo64(const JitReg64& _reg) const { aluSignextendTo64(_reg, _reg); }
+		void aluClearLowByte(const JitRegGP& _reg) const;
+		// paired: make an accumulator usable as a full 64-bit signed value, then put it back. Both are
+		// no-ops when left-aligned, except that the restore keeps enforcing the low-byte invariant.
+		void aluExtendTo64(const JitRegGP& _reg) const;
+		void aluRestoreFrom64(const JitRegGP& _reg) const;
+		void aluToLeftAligned(const JitRegGP& _reg) const;   // 56-bit right-aligned -> left-aligned
+		void aluFromLeftAligned(const JitRegGP& _reg) const; // left-aligned -> 56-bit right-aligned
+
 		void signextend56to64(const JitReg64& _reg) const { return signextend56to64(_reg, _reg); }
 
 		void signextend48to64(const JitReg64& _reg) const;
@@ -338,7 +354,9 @@ namespace dsp56k
 #endif
 		constexpr static uint64_t signed24To56(const TWord _src)
 		{
-			return static_cast<uint64_t>((static_cast<int64_t>(_src) << 40ull) >> 8ull) >> 8ull;
+			const auto v = static_cast<uint64_t>((static_cast<int64_t>(_src) << 40ull) >> 8ull);
+			// left-aligned keeps the value at bits 55..32 instead of shifting it back down
+			return g_leftAlignedAlu ? v : (v >> 8ull);
 		}
 
 		void callDSPFunc(void(* _func)(DSP*, TWord), TWord _arg) const;
@@ -504,6 +522,14 @@ namespace dsp56k
 		void ccr_n_update_by23(const JitReg64& _alu);
 		void ccr_s_update(const JitReg64& _alu);
 		void ccr_l_update_by_v();
+
+		// V is overwritten while L is a sticky OR of V, so where both are written together they can be
+		// produced from a single 0/1 value instead of two independent read-modify-writes of SR.
+		void ccr_vl_update_ifNotZero();
+#ifndef HAVE_ARM64
+		void ccr_vl_update_ifNotParity();
+		void ccr_vl_update(asmjit::x86::CondCode _cc);
+#endif
 		void ccr_v_update(const JitReg64& _nonMaskedResult);
 
 		void ccr_clear(CCRMask _mask);

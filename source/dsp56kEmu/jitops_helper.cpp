@@ -1,3 +1,4 @@
+#include "jitdspregpool.h"
 #include "jitconfig.h"
 #include "jitops.h"
 #include "dsp.h"
@@ -6,6 +7,57 @@ namespace dsp56k
 {
 	void dspExecDefaultPreventInterrupt(DSP*);
 	void dspExecNop(DSP*);
+
+	void JitOps::aluSignextendTo64(const JitReg64& _dst, const JitReg64& _src) const
+	{
+		// Sign-extends an ACCUMULATOR to 64 bits. Distinct from signextend56to64(), which is the generic
+		// 56-bit helper used on raw values: a left-aligned accumulator is already natively sign-correct,
+		// a raw right-aligned 56-bit value is not.
+		if constexpr (g_leftAlignedAlu)
+		{
+			if(_dst != _src)
+				m_asm.mov(_dst, _src);
+			return;
+		}
+		signextend56to64(_dst, _src);
+	}
+
+	void JitOps::aluExtendTo64(const JitRegGP& _reg) const
+	{
+		if constexpr (!g_leftAlignedAlu)
+			m_asm.shl(r64(_reg), asmjit::Imm(8));
+	}
+
+	void JitOps::aluRestoreFrom64(const JitRegGP& _reg) const
+	{
+		if constexpr (g_leftAlignedAlu)
+			aluClearLowByte(_reg);	// the right-aligned form discards the low bits via shr; keep discarding them
+		else
+			m_asm.shr(r64(_reg), asmjit::Imm(8));
+	}
+
+	void JitOps::aluClearLowByte(const JitRegGP& _reg) const
+	{
+		// Enforces the left-aligned invariant: the 8 LSBs must never carry information. This is the exact
+		// counterpart of the `shr alu,8` that the right-aligned code uses to discard shifted-out bits.
+#ifdef HAVE_ARM64
+		m_asm.and_(r64(_reg), r64(_reg), asmjit::Imm(~static_cast<uint64_t>(0xff)));
+#else
+		// 0xFFFFFF00 as a sign-extended imm32 is 0xFFFFFFFFFFFFFF00, so this is a single instruction
+		m_asm.and_(r64(_reg), asmjit::Imm(-0x100));	// signed so the encoding sign-extends to 0xFFFFFFFFFFFFFF00
+#endif
+	}
+
+	void JitOps::aluToLeftAligned(const JitRegGP& _reg) const
+	{
+		m_asm.shl(r64(_reg), asmjit::Imm(8));
+	}
+
+	void JitOps::aluFromLeftAligned(const JitRegGP& _reg) const
+	{
+		// logical shift: yields the 56-bit value zero-extended, matching the TReg56 memory format
+		m_asm.shr(r64(_reg), asmjit::Imm(8));
+	}
 
 	void JitOps::signextend56to64(const JitReg64& _dst, const JitReg64& _src) const
 	{
@@ -380,13 +432,16 @@ namespace dsp56k
 
 #ifdef HAVE_ARM64
 		AluRef alu(m_block, _aluIndex, true, false);
-		m_asm.sbfx(r64(_dst), r64(alu), asmjit::Imm(48), asmjit::Imm(8));
+		m_asm.sbfx(r64(_dst), r64(alu), asmjit::Imm(48 + g_aluBitOffset), asmjit::Imm(8));
 		m_asm.ubfx(r32(_dst), r32(_dst), asmjit::Imm(0), asmjit::Imm(24));
 #else
 		const auto temp = r64(_dst.get());
 
 		AluRef alu(m_block, _aluIndex, true, false);
-		m_asm.rol(temp, alu, 8);
+		if constexpr (g_leftAlignedAlu)
+			m_asm.mov(temp, r64(alu));	// a2 already sits at the top when left-aligned
+		else
+			m_asm.rol(temp, alu, 8);
 		m_asm.sar(temp, asmjit::Imm(56));
 		m_asm.and_(temp, asmjit::Imm(0xffffff));
 #endif

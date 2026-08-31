@@ -31,6 +31,32 @@ namespace dsp56k
 			return false;
 		}
 
+		// pool registers are handed out front to back, so every volatile must be listed before the first non-volatile
+		template<typename A, typename B> constexpr bool volatilesFirst(const A& _pool, const B& _nonVolatiles)
+		{
+			bool seenNonVolatile = false;
+
+			for (const auto& p : _pool)
+			{
+				bool isNonVolatile = false;
+
+				for (const auto& nv : _nonVolatiles)
+				{
+					if (p.equals(nv))
+					{
+						isNonVolatile = true;
+						break;
+					}
+				}
+
+				if (isNonVolatile)
+					seenNonVolatile = true;
+				else if (seenNonVolatile)
+					return false;
+			}
+			return true;
+		}
+
 		template<typename A, typename B> constexpr bool contains(const A& _a, const B& _b)
 		{
 			for (const auto& a : _a)
@@ -51,8 +77,10 @@ namespace dsp56k
 
 		// these are important as we do not have to push anything on the stack for simple functions if we can use volatiles only
 		static_assert(!contains(g_nonVolatileGPs, *g_regGPTemps.begin()), "first temp must be volatile");
-		static_assert(!contains(g_nonVolatileGPs, regDspPtr), "register for DSP pointer must be volatile");
+		static_assert(contains(g_nonVolatileGPs, regDspPtr), "register for DSP pointer must be non-volatile");
 		static_assert(!contains(g_nonVolatileGPs, g_dspPoolGps[0]), "first pool reg must be volatile");
+		static_assert(volatilesFirst(g_dspPoolGps, g_nonVolatileGPs), "GP pool registers must list all volatiles before the first non-volatile");
+		static_assert(volatilesFirst(g_dspPoolXmms, g_nonVolatileXMMs), "XMM pool registers must list all volatiles before the first non-volatile");
 	}
 #endif
 	constexpr bool g_traceOps = false;
@@ -87,7 +115,7 @@ namespace dsp56k
 		Jit::toJitPtr(_jit)->run(_pc);
 	}
 
-	Jit::Jit(DSP& _dsp) : m_dsp(_dsp), m_rt(new JitRuntime())
+	Jit::Jit(DSP& _dsp) : m_dsp(_dsp), m_trampoline(_dsp), m_rt(new JitRuntime())
 	{
 		m_emitters.reserve(16);
 		m_blockRuntimeDatas.reserve(0x10000);
@@ -120,6 +148,8 @@ namespace dsp56k
 		{
 			LOG("No profiler detected");
 		}
+
+		m_trampoline.generateCode();
 	}
 
 	Jit::~Jit()
@@ -222,7 +252,7 @@ namespace dsp56k
 	void Jit::run(const TWord _pc) noexcept
 	{
 		const auto* block = m_currentChain->getBlockUnsafe(_pc);
-		block->getFunc()(&m_dsp.regs(), _pc);
+		m_trampoline.execOne(&m_dsp.regs(), _pc, block->getFunc());
 
 		if(g_traceOps && m_dsp.m_trace)
 		{

@@ -1,3 +1,4 @@
+#include "jitdspregpool.h"
 #include "jitops.h"
 
 #include "jitops_alu.inl"
@@ -14,6 +15,8 @@ namespace dsp56k
 	{
 		m_dspRegs.getXY(_dst, _xy);
 		signextend48to56(_dst);
+		if constexpr (g_leftAlignedAlu)
+			m_asm.shl(_dst, asmjit::Imm(8));	// the result feeds ALU arithmetic, so match the ALU representation
 	}
 
 	void JitOps::op_Abs(TWord op)
@@ -22,11 +25,11 @@ namespace dsp56k
 
 		AluRef ra(m_block, ab);							// Load ALU
 
-		m_asm.shl(ra, asmjit::Imm(8));				// extend to 64 bits
+		aluExtendTo64(ra);				// extend to 64 bits
 
 		alu_abs(ra);
 
-		m_asm.shr(ra, asmjit::Imm(8));
+		aluRestoreFrom64(ra);
 
 	//	sr_v_update(d);
 	//	sr_l_update_by_v();
@@ -37,8 +40,29 @@ namespace dsp56k
 	{
 		AluRef alu(m_block, _ab);
 
-		m_asm.add(alu.get(), _v);
-		
+		if constexpr (g_leftAlignedAlu)
+		{
+			// Left-aligned: the carry out of the 56-bit accumulator IS the host carry flag. The batch
+			// update clobbers EFLAGS, so it has to be emitted before the operation rather than after.
+			if(!m_disableCCRUpdates)
+			{
+				CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+#ifdef HAVE_ARM64
+				m_asm.adds(alu, alu, _v);
+#else
+				m_asm.add(alu, _v);
+#endif
+				ccr_update_ifCarry(CCRB_C);
+			}
+			else
+			{
+				m_asm.add(alu, _v);
+			}
+		}
+		else
+		{
+		m_asm.add(alu, _v);
+
 		if(!m_disableCCRUpdates)
 		{
 			CcrBatchUpdate bu(*this, CCR_C, CCR_V);
@@ -47,8 +71,11 @@ namespace dsp56k
 
 //			ccr_clear(CCR_V);						// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
 		}
+		}
 
-		m_dspRegs.mask56(alu);
+		// see alu_mpy: adding two values that are clean by the accumulator invariant stays clean
+		if constexpr (!g_leftAlignedAlu)
+			m_dspRegs.mask56(alu);
 
 		if(!m_disableCCRUpdates)
 			ccr_dirty(_ab, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
@@ -65,6 +92,28 @@ namespace dsp56k
 	{
 		AluRef alu(m_block, _ab);
 
+		if constexpr (g_leftAlignedAlu)
+		{
+			// Left-aligned: the carry out of the 56-bit accumulator IS the host carry flag. The batch
+			// update clobbers EFLAGS, so it has to be emitted before the operation rather than after.
+			if(!m_disableCCRUpdates)
+			{
+				CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+#ifdef HAVE_ARM64
+				m_asm.subs(alu, alu, _v);
+				ccr_update_ifNotCarry(CCRB_C);	// ARM carry means unsigned >=, inverted vs 56k/x64
+#else
+				m_asm.sub(alu, _v);
+				ccr_update_ifCarry(CCRB_C);
+#endif
+			}
+			else
+			{
+				m_asm.sub(alu, _v);
+			}
+		}
+		else
+		{
 		m_asm.sub(alu, _v);
 
 		if(!m_disableCCRUpdates)
@@ -75,8 +124,11 @@ namespace dsp56k
 
 //			ccr_clear(CCR_V); batch cleared
 		}
+		}
 
-		m_dspRegs.mask56(alu);
+		// see alu_mpy: adding two values that are clean by the accumulator invariant stays clean
+		if constexpr (!g_leftAlignedAlu)
+			m_dspRegs.mask56(alu);
 
 		if(!m_disableCCRUpdates)
 			ccr_dirty(_ab, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
@@ -91,7 +143,7 @@ namespace dsp56k
 
 	void JitOps::unsignedImmediateToAlu(const JitReg64& _r, const uint8_t _i) const
 	{
-		m_asm.mov(_r, asmjit::Imm(static_cast<uint32_t>(_i) << 24));
+		m_asm.mov(_r, asmjit::Imm(static_cast<uint64_t>(_i) << (24 + (g_leftAlignedAlu ? 8 : 0))));
 	}
 
 	void JitOps::op_Add_SD(TWord op)
@@ -131,7 +183,7 @@ namespace dsp56k
 
 		AluReg aluD(m_block, ab);
 
-		signextend56to64(aluD);
+		aluSignextendTo64(aluD);
 
 #ifdef HAVE_ARM64
 		m_asm.lsl(aluD, aluD, asmjit::Imm(1));
@@ -141,7 +193,7 @@ namespace dsp56k
 		{
 			AluReg aluS(m_block, ab ? 0 : 1, true);
 
-			signextend56to64(aluS);
+			aluSignextendTo64(aluS);
 
 #ifdef HAVE_ARM64
 			m_asm.adds(aluD, aluD, aluS.get());
@@ -152,7 +204,10 @@ namespace dsp56k
 
 		ccr_update_ifCarry(CCRB_C);
 
-		m_dspRegs.mask56(aluD);
+		// D = 2 * D + S: the shift is to the LEFT, so the spare low byte stays zero, and adding another
+		// accumulator keeps it that way. Contrast op_Addr below, which shifts right and does need the mask.
+		if constexpr (!g_leftAlignedAlu)
+			m_dspRegs.mask56(aluD);
 
 		ccr_clear(CCR_V);	// TODO: Set if overflow has occurred in the A or B result or the MSB of the destination operand is changed as a result of the instruction�s left shift.
 		ccr_dirty(ab, aluD, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
@@ -166,22 +221,35 @@ namespace dsp56k
 
 		AluReg aluD(m_block, ab);
 
-		m_asm.sal(aluD, asmjit::Imm(8));
+		aluExtendTo64(aluD);
 		m_asm.sar(aluD, asmjit::Imm(1));
-		m_asm.shr(aluD, asmjit::Imm(8));
+		aluRestoreFrom64(aluD);		// discards the bit shifted out, left-aligned or not
 
 		{
 			AluRef aluS(m_block, ab ? 0 : 1, true, false);
+#ifdef HAVE_ARM64
+			m_asm.adds(aluD, aluD, aluS.get());
+#else
 			m_asm.add(aluD, aluS.get());
+#endif
+
+			// Left-aligned the sum can exceed 64 bits, so the 57th bit is the host carry rather than
+			// something a compare against the 56-bit maximum could still see. Capture it immediately:
+			// leaving the scope may emit a register release and clobber EFLAGS.
+			if constexpr (g_leftAlignedAlu)
+				ccr_update_ifCarry(CCRB_C);
 		}
 
+		if constexpr (!g_leftAlignedAlu)
 		{
-			const RegScratch aluMax(m_block);
-			m_asm.mov(aluMax, asmjit::Imm(g_alu_max_56_u));
-			m_asm.cmp(aluD, aluMax);
-		}
+			{
+				const RegScratch aluMax(m_block);
+				m_asm.mov(aluMax, asmjit::Imm(g_alu_max_56_u));
+				m_asm.cmp(aluD, aluMax);
+			}
 
-		ccr_update_ifGreater(CCRB_C);
+			ccr_update_ifGreater(CCRB_C);
+		}
 
 		m_dspRegs.mask56(aluD);
 
@@ -321,8 +389,13 @@ namespace dsp56k
 	{
 		AluReg d(m_block, ab, true);
 
-		m_asm.sal(d.get(), asmjit::Imm(8));
-		m_asm.sal(_v, asmjit::Imm(8));
+		// Both operands already carry the ALU representation when left-aligned: d is an accumulator and
+		// _v comes from decode_JJJ_read_56, which produces ALU-aligned values.
+		if constexpr (!g_leftAlignedAlu)
+		{
+			m_asm.sal(d.get(), asmjit::Imm(8));
+			m_asm.sal(_v, asmjit::Imm(8));
+		}
 
 		if (_magnitude)
 		{
@@ -343,8 +416,11 @@ namespace dsp56k
 #endif
 		}
 
-		m_asm.shr(d, asmjit::Imm(8));
-		m_asm.shr(_v, asmjit::Imm(8));
+		if constexpr (!g_leftAlignedAlu)
+		{
+			m_asm.shr(d, asmjit::Imm(8));
+			m_asm.shr(_v, asmjit::Imm(8));
+		}
 
 		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
@@ -357,9 +433,9 @@ namespace dsp56k
 		if(_v.isImm24())
 			_v.toTemp();
 #ifdef HAVE_ARM64
-		m_asm.eor(r, r, r64(_v.get()), asmjit::arm::lsl(24));
+		m_asm.eor(r, r, r64(_v.get()), asmjit::arm::lsl(24 + g_aluBitOffset));
 #else
-		m_asm.shl(r64(_v.get()), asmjit::Imm(24));
+		m_asm.shl(r64(_v.get()), asmjit::Imm(24 + g_aluBitOffset));
 		m_asm.xor_(r, r64(_v.get()));
 #endif
 		// S L E U N Z V C
@@ -368,10 +444,10 @@ namespace dsp56k
 
 		const RegGP t(m_block);
 #ifdef HAVE_ARM64
-		m_asm.ubfx(r64(t), r64(r), asmjit::Imm(24), asmjit::Imm(24));
+		m_asm.ubfx(r64(t), r64(r), asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
 		m_asm.test_(t);
 #else
-		m_asm.ror(t.get(), r, 24);
+		m_asm.ror(t.get(), r, 24 + g_aluBitOffset);
 		m_asm.test(t, asmjit::Imm(0xffffff));
 #endif
 		ccr_update_ifZero(CCRB_Z);
@@ -407,12 +483,14 @@ namespace dsp56k
 
 		if (_accumulate)
 		{
-			signextend56to64(d);
-			m_asm.add(d, d, r64(_s1), asmjit::arm::lsl(1));		// fractional multiplication requires one post-shift to be correct
+			aluSignextendTo64(d);
+			// fractional multiplication requires one post-shift; left-aligned the product is scaled here too
+			m_asm.add(d, d, r64(_s1), asmjit::arm::lsl(1 + g_aluBitOffset));
 		}
 		else
 		{
-			m_asm.lsl(d, r64(_s1), asmjit::Imm(1));					// fractional multiplication requires one post-shift to be correct
+			// fractional multiplication requires one post-shift; left-aligned the product is scaled here too
+			m_asm.lsl(d, r64(_s1), asmjit::Imm(1 + g_aluBitOffset));
 		}
 #else
 		if(_s2.isImmediate())
@@ -435,9 +513,13 @@ namespace dsp56k
 					m_asm.imul(r64(_s1), asmjit::Imm(i));
 				}
 			}
+			// scale the product into the ALU representation before it meets the accumulator
+			if constexpr (g_leftAlignedAlu)
+				m_asm.shl(r64(_s1), asmjit::Imm(8));
+
 			if (_accumulate)
 			{
-				signextend56to64(d);
+				aluSignextendTo64(d);
 				m_asm.add(d, r64(_s1));
 			}
 			else
@@ -450,6 +532,10 @@ namespace dsp56k
 			m_asm.imul(r64(_s1), r64(_s2));
 			_s2.release();
 
+			// scale the product into the ALU representation before it meets the accumulator
+			if constexpr (g_leftAlignedAlu)
+				m_asm.shl(r64(_s1), asmjit::Imm(8));
+
 			if(!_accumulate && !_negate)
 			{
 				m_asm.lea(r64(d.get()), asmjit::x86::ptr(r64(_s1.get()), r64(_s1.get())));
@@ -457,7 +543,7 @@ namespace dsp56k
 			else
 			{
 				if (_accumulate)
-					signextend56to64(d);
+					aluSignextendTo64(d);
 
 				if(_accumulate && !_negate)
 				{
@@ -494,8 +580,15 @@ namespace dsp56k
 
 			ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z | vBit));
 
-			if (canOverflow || _negate)
-				m_dspRegs.mask56(d);
+			// Left-aligned, mask56 only clears the low byte - it cannot trim an overflow, because the 56
+			// bits already occupy 63..8. After a multiply that byte is zero by construction: the product
+			// is shifted up by 8, doubling keeps it zero, and the accumulator it is added to is clean by
+			// the same invariant.
+			if constexpr (!g_leftAlignedAlu)
+			{
+				if (canOverflow || _negate)
+					m_dspRegs.mask56(d);
+			}
 		}
 		else
 		{
@@ -529,7 +622,7 @@ namespace dsp56k
 		if(_v.isImm24())
 			_v.toTemp();
 
-		m_asm.shl(r64(_v.get()), asmjit::Imm(24));
+		m_asm.shl(r64(_v.get()), asmjit::Imm(24 + g_aluBitOffset));
 		m_asm.or_(r, r64(_v.get()));
 
 		// S L E U N Z V C
@@ -538,10 +631,10 @@ namespace dsp56k
 
 		const RegGP t(m_block);
 #ifdef HAVE_ARM64
-		m_asm.ubfx(r64(t), r64(r), asmjit::Imm(24), asmjit::Imm(24));
+		m_asm.ubfx(r64(t), r64(r), asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
 		m_asm.test_(t);
 #else
-		m_asm.ror(t.get(), r, 24);
+		m_asm.ror(t.get(), r, 24 + g_aluBitOffset);
 		m_asm.test(t, asmjit::Imm(0xffffff));
 #endif
 		ccr_update_ifZero(CCRB_Z);
@@ -606,7 +699,7 @@ namespace dsp56k
 		convert(r56, TReg24(iiiiii));
 
 		const RegGP v(m_block);
-		m_asm.mov(v, asmjit::Imm(r56.var));
+		m_asm.mov(v, asmjit::Imm(g_leftAlignedAlu ? (r56.var << 8) : r56.var));
 		alu_cmp(D, v, false);
 	}
 
@@ -620,7 +713,7 @@ namespace dsp56k
 		convert(r56, s);
 
 		const RegGP v(m_block);
-		m_asm.mov(v, asmjit::Imm(r56.var));
+		m_asm.mov(v, asmjit::Imm(g_leftAlignedAlu ? (r56.var << 8) : r56.var));
 
 		alu_cmp(D, v, false);
 	}
@@ -638,7 +731,7 @@ namespace dsp56k
 		const auto ab = getFieldValue<Dec, Field_d>(op);
 		AluRef r(m_block, ab);
 
-		m_asm.shl(r, asmjit::Imm(8));	// shift left by 8 bits to enable using the host carry bit
+		aluExtendTo64(r);	// reach the 64 bit boundary to use the host carry bit (free when left-aligned)
 
 #ifdef HAVE_ARM64
 		m_asm.subs(r, r, asmjit::Imm(0x100));
@@ -648,7 +741,7 @@ namespace dsp56k
 		ccr_update_ifCarry(CCRB_C);
 #endif
 
-		m_asm.shr(r, asmjit::Imm(8));
+		aluRestoreFrom64(r);
 		ccr_clear(CCR_V);				// never set in the simulator, even when wrapping around. Carry is set instead
 
 		ccr_dirty(ab, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
@@ -679,12 +772,17 @@ namespace dsp56k
 		// fractional multiplication requires one post-shift to be correct
 		m_asm.sal(r64(s1), asmjit::Imm(1));
 
+		// scale the product into the ALU representation. Note the accumulator's own sar by 24 below
+		// already yields the correct left-aligned form, since (d >> 24) << 8 == (d << 8) >> 24.
+		if constexpr (g_leftAlignedAlu)
+			m_asm.sal(r64(s1), asmjit::Imm(8));
+
 		if (negate)
 			m_asm.neg(r64(s1));
 
 		AluRef d(m_block, ab);
 
-		signextend56to64(d);
+		aluSignextendTo64(d);
 		m_asm.sar(d, asmjit::Imm(24));
 
 		m_asm.add(d, r64(s1));
@@ -699,8 +797,7 @@ namespace dsp56k
 		// detect overflow by sign-extending the actual result and comparing VS the non-sign-extended one. We've got overflow if they are different
 		m_asm.cmp(dOld, d.get());
 
-		ccr_update_ifNotZero(CCRB_V);
-		ccr_l_update_by_v();
+		ccr_vl_update_ifNotZero();
 
 		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
@@ -751,6 +848,10 @@ namespace dsp56k
 		m_asm.shr(mask, shiftOperand(width.get()));
 
 		AluReg s(m_block, abSrc, abSrc != abDst);
+
+		// the bit offsets are relative to the 56-bit value, so work right-aligned and convert the result back
+		if constexpr (g_leftAlignedAlu)
+			m_asm.shr(s, asmjit::Imm(8));
 #ifdef HAVE_X86_64
 		if (JitEmitter::hasBMI2())
 		{
@@ -765,6 +866,9 @@ namespace dsp56k
 		}
 
 		m_asm.and_(s, mask);
+
+		if constexpr (g_leftAlignedAlu)
+			m_asm.shl(s, asmjit::Imm(8));
 
 		offset.release();
 
@@ -800,8 +904,13 @@ namespace dsp56k
 		if (abSrc != abDst)
 			m_dspRegs.getALU(d, abSrc);
 
-		m_asm.shr(d, asmjit::Imm(offset));
+		// the offset is relative to the 56-bit value, so fold the alignment into the shift and put the
+		// result back into the ALU representation afterwards
+		m_asm.shr(d, asmjit::Imm(offset + g_aluBitOffset));
 		m_asm.and_(d, asmjit::Imm(mask));
+
+		if constexpr (g_leftAlignedAlu)
+			m_asm.shl(d, asmjit::Imm(8));
 
 		ccr_clear(CCR_C);
 		ccr_clear(CCR_V);
@@ -813,7 +922,7 @@ namespace dsp56k
 		const auto ab = getFieldValue<Dec, Field_d>(op);
 		AluRef r(m_block, ab);
 
-		m_asm.shl(r, asmjit::Imm(8));		// shift left by 8 bits to enable using the host carry bit
+		aluExtendTo64(r);		// reach the 64 bit boundary to use the host carry bit (free when left-aligned)
 
 #ifdef HAVE_ARM64
 		m_asm.adds(r, r, asmjit::Imm(0x100));
@@ -822,7 +931,7 @@ namespace dsp56k
 #endif
 		ccr_update_ifCarry(CCRB_C);
 
-		m_asm.shr(r, asmjit::Imm(8));
+		aluRestoreFrom64(r);
 
 		ccr_clear(CCR_V);					// never set in the simulator, even when wrapping around. Carry is set instead
 
@@ -922,8 +1031,8 @@ namespace dsp56k
 		AluRef a(m_block, 0, true);
 		AluReg b(m_block, 1, false);
 
-		signextend56to64(a);
-		signextend56to64(b);
+		aluSignextendTo64(a);
+		aluSignextendTo64(b);
 
 		m_asm.cmp(a,b);
 
@@ -943,8 +1052,8 @@ namespace dsp56k
 		AluReg a(m_block, 0, true);
 		AluReg b(m_block, 1, true);
 
-		signextend56to64(a);
-		signextend56to64(b);
+		aluSignextendTo64(a);
+		aluSignextendTo64(b);
 
 #ifdef HAVE_ARM64
 		m_asm.negs(a, a);										// negate

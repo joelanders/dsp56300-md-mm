@@ -18,6 +18,7 @@
 #include "debuggerinterface.h"
 #include "dspconfig.h"
 #include "interrupts.h"
+#include "opcodecycles.h"
 
 #include "dsp_decode.inl"
 
@@ -305,8 +306,7 @@ namespace dsp56k
 		{
 			LOGJITPC(vba);
 			const auto pc = getPC();
-			m_jitEntries[vba](&reg, vba);
-//			m_jit.exec(vba);
+			m_jit.getTrampoline().execOne(&reg, vba, m_jitEntries[vba]);
 			if(m_processingMode != LongInterrupt)
 			{
 				m_processingMode = DefaultPreventInterrupt;
@@ -382,6 +382,8 @@ namespace dsp56k
 
 	void DSP::terminate()
 	{
+		m_terminate.store(true, std::memory_order_relaxed);
+
 		for(size_t i=0; i<perif.size(); ++i)
 			perif[i]->terminate();
 	}
@@ -471,6 +473,9 @@ namespace dsp56k
 		{
 			++m_instructions;
 
+			if constexpr(!g_useJIT)
+				m_cycles += getOpcodeCycles(currentOp);
+
 			if(g_traceSupported && pcCurrentInstruction == currentOp)
 				traceOp();
 		}
@@ -486,6 +491,7 @@ namespace dsp56k
 		// simulate latches registers for parallel instructions
 
 		// ALU op can only write to either A or B
+		// these are raw copies of the left-aligned values, comparing and restoring them needs no conversion
 		const auto preAluA = reg.a;
 		const auto preAluB = reg.b;
 
@@ -636,6 +642,9 @@ namespace dsp56k
 		
 		sr_set( SR_LF );
 
+		if constexpr(!g_useJIT)
+			m_cycles += getOpcodeCycles(pcCurrentInstruction);
+
 		++m_instructions;
 
 		traceOp();
@@ -643,7 +652,9 @@ namespace dsp56k
 		// __________________
 		//
 
-		while(reg.sc.var >= stackCount)
+		// note the terminate check: the interpreter executes a whole DO loop inside this function, it never returns
+		// to DSPThread::threadFunc in between. Without it, a firmware loop that never ends deadlocks the join on shutdown.
+		while(reg.sc.var >= stackCount && !m_terminate.load(std::memory_order_relaxed))
 		{
 			execInterpreter();
 
@@ -692,11 +703,15 @@ namespace dsp56k
 		const auto lcBackup = reg.lc;
 		reg.lc.var = _loopCount;
 
+		if constexpr(!g_useJIT)
+			m_cycles += getOpcodeCycles(pcCurrentInstruction);
+
 		++m_instructions;
 
 		traceOp();
 
 		pcCurrentInstruction = reg.pc.var;
+		const auto repeatedOpPC = pcCurrentInstruction;
 		const auto op = fetchPC();
 
 		--reg.lc.var;
@@ -711,6 +726,8 @@ namespace dsp56k
 			--reg.lc.var;
 			(this->*func)(op);
 			++m_instructions;
+			if constexpr(!g_useJIT)
+				m_cycles += getOpcodeCycles(repeatedOpPC);
 //			traceOp();
 		}
 
@@ -866,8 +883,8 @@ namespace dsp56k
 	{
 		switch( _reg )
 		{
-		case Reg_A:		_res = reg.a;	return true;
-		case Reg_B:		_res = reg.b;	return true;
+		case Reg_A:		_res = aluA();	return true;
+		case Reg_B:		_res = aluB();	return true;
 		}
 		return false;
 	}
@@ -1024,8 +1041,8 @@ namespace dsp56k
 	{
 		switch( _reg )
 		{
-		case Reg_A:		reg.a = _val;		return true;
-		case Reg_B:		reg.b = _val;		return true;
+		case Reg_A:		setALU(false, _val);	return true;
+		case Reg_B:		setALU(true , _val);	return true;
 		}
 		assert( 0 && "unknown register" );
 		return false;
@@ -1174,6 +1191,8 @@ namespace dsp56k
 	void DSP::notifyProgramMemWrite(TWord _offset)
 	{
 		m_opcodeCache[_offset].op = &DSP::op_ResolveCache;
+		if constexpr(!g_useJIT)
+			m_opcodeCycleCache[_offset] = 0;
 
 #if DSP56300_DEBUGGER
 		if(m_debugger)
@@ -1278,11 +1297,12 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		TInt64 d64 = d.signextend<TInt64>();
+		TInt64 d64 = aluSignextend(d);
 
 		d64 = d64 < 0 ? -d64 : d64;
 
-		d.var = d64 & 0xffffffffffffff;
+		d.var = d64;
+		aluMask(d);
 
 		sr_z_update(d);
 	//	sr_v_update(d);
@@ -1292,7 +1312,7 @@ namespace dsp56k
 
 	void DSP::alu_tfr(const bool ab, const TReg56& src)
 	{
-		auto& d = ab ? reg.b : reg.a;
+		TReg56& d = ab ? reg.b : reg.a;
 		d = src;
 	}
 
@@ -1309,10 +1329,11 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		auto d64 = d.signextend<TInt64>();
+		auto d64 = aluSignextend(d);
 		d64 = -d64;
 		
-		d.var = d64 & 0x00ffffffffffffff;
+		d.var = d64;
+		aluMask(d);
 
 		sr_z_update(d);
 	//	TODO: how to update v? test in sim		sr_v_update(d);
@@ -1324,12 +1345,12 @@ namespace dsp56k
 	{
 		auto& d = ab ? reg.b.var : reg.a.var;
 
-		const auto masked = ~d & 0x00ffffff000000;
+		const auto masked = ~d & static_cast<TInt64>(0x00ffffff000000ull << g_aluShift);
 
-		d &= 0xff000000ffffff;
+		d &= static_cast<TInt64>(0xff000000ffffff00ull);
 		d |= masked;
 
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47>(d));	// Set if bit 47 of the result is set
+		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(d));	// Set if bit 47 of the result is set
 		sr_toggle(CCR_Z, masked == 0);					// Set if bits 47�24 of the result are 0
 		sr_clear(CCR_V);								// Always cleared
 		//sr_s_update();								// Changed according to the standard definition
@@ -1433,15 +1454,38 @@ namespace dsp56k
 			injectInterrupt(m_pendingExternalInterrupts.pop_front());
 	}
 
+	uint32_t DSP::calcOpcodeCycles(const TWord _pc) const
+	{
+		TWord opA;
+		TWord opB;
+		mem.getOpcode(_pc, opA, opB);
+		Instruction instA;
+		Instruction instB;
+		m_opcodes.getInstructionTypes(opA, instA, instB);
+		return dsp56k::calcCycles(instA, instB, _pc, opA, mem.getBridgedMemoryAddress(), 1);
+	}
+
+	uint8_t DSP::getOpcodeCycles(const TWord _pc)
+	{
+		auto& cachedCycles = m_opcodeCycleCache[_pc];
+		if(!cachedCycles)
+			cachedCycles = static_cast<uint8_t>(std::min<uint32_t>(255, std::max<uint32_t>(1, calcOpcodeCycles(_pc))));
+		return cachedCycles;
+	}
+
 	void DSP::clearOpcodeCache()
 	{
 		m_opcodeCache.clear();
 		m_opcodeCache.resize(mem.sizeP(), {&DSP::op_ResolveCache});
+		if constexpr(!g_useJIT)
+			m_opcodeCycleCache.assign(mem.sizeP(), 0);
 	}
 
 	void DSP::clearOpcodeCache(const TWord _address)
 	{
 		m_opcodeCache[_address].op = &DSP::op_ResolveCache;
+		if constexpr(!g_useJIT)
+			m_opcodeCycleCache[_address] = 0;
 		m_jit.notifyProgramMemWrite(_address);
 	}
 	

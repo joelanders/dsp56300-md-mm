@@ -1,3 +1,4 @@
+#include "jitdspregpool.h"
 #include "jitdspmode.h"
 #include "jitops.h"
 #include "types.h"
@@ -591,8 +592,8 @@ namespace dsp56k
 				const auto alu = _lll;
 #ifdef HAVE_ARM64
 				AluRef a(m_block, alu, true, false);
-				m_asm.ubfx(r64(x), r64(a), asmjit::Imm(24), asmjit::Imm(24));
-				m_asm.ubfx(r64(y), r64(a), asmjit::Imm(0), asmjit::Imm(24));
+				m_asm.ubfx(r64(x), r64(a), asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
+				m_asm.ubfx(r64(y), r64(a), asmjit::Imm(0 + g_aluBitOffset), asmjit::Imm(24));
 #else
 				m_dspRegs.getALU(r64(y), alu);
 				m_asm.ror(r64(x), r64(y), 24);
@@ -650,8 +651,8 @@ namespace dsp56k
 				const auto alu = _lll & 3;
 				AluRef r(m_block, alu);
 #ifdef HAVE_ARM64
-				m_asm.bfi(r64(r), r64(x), asmjit::Imm(24), asmjit::Imm(24));
-				m_asm.bfi(r64(r), r64(y), asmjit::Imm(0), asmjit::Imm(24));
+				m_asm.bfi(r64(r), r64(x), asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
+				m_asm.bfi(r64(r), r64(y), asmjit::Imm(0 + g_aluBitOffset), asmjit::Imm(24));
 #else
 				m_asm.shr(r, asmjit::Imm(48));	// clear 48 LSBs
 				m_asm.shl(r, asmjit::Imm(24));
@@ -669,13 +670,21 @@ namespace dsp56k
 				AluRef r(m_block, alu, false, true);
 
 #ifdef HAVE_ARM64
-				m_asm.sbfiz(r64(r), r64(x), asmjit::Imm(24), asmjit::Imm(24));
-				m_asm.bfi(r64(r), r64(y), asmjit::Imm(0), asmjit::Imm(24));
+				m_asm.sbfiz(r64(r), r64(x), asmjit::Imm(24 + g_aluBitOffset), asmjit::Imm(24));
+				m_asm.bfi(r64(r), r64(y), asmjit::Imm(0 + g_aluBitOffset), asmjit::Imm(24));
 				m_dspRegs.mask56(r);
 #else
 				m_asm.rol(r64(r), r32(x), 40);
 				m_asm.sar(r64(r), asmjit::Imm(8));
-				m_asm.shr(r64(r), asmjit::Imm(8));
+				if constexpr (g_leftAlignedAlu)
+				{
+					// x already sits at bits 55..32; y goes to 31..8 rather than 23..0
+					m_asm.shl(r64(y.get()), asmjit::Imm(8));
+				}
+				else
+				{
+					m_asm.shr(r64(r), asmjit::Imm(8));
+				}
 				m_asm.or_(r64(r), r64(y.get()));
 #endif
 			}
