@@ -271,7 +271,7 @@ namespace dsp56k
 		void execTX() override;
 		void execRX() override;
 
-		TWord hasEnabledTransmitters() const override { return getEnabledTransmitters(); }
+		TWord hasEnabledTransmitters() const override { return m_tcr.test(M_TPR) ? 0 : getEnabledTransmitters(); }
 		TWord hasEnabledReceivers() const override { return getEnabledReceivers(); }
 
 		uint32_t getTransmitFrameSync() const
@@ -428,6 +428,7 @@ namespace dsp56k
 		bool isRxSlotActive(uint32_t _slot) const	{ return _slot < 16 ? (m_rsma & (1 << _slot)) != 0 : (m_rsmb & (1 << (_slot - 16))) != 0; }
 
 		void injectInterrupt(TWord _interrupt) const;
+		void resetTransmitSection();
 		void readSlotFromFrame();
 		void writeSlotToFrame();
 
