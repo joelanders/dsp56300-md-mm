@@ -52,6 +52,9 @@ namespace dsp56k
 
 	void UnitTests::runAllTests()
 	{
+		esaiResetState();
+		esaiTransmitControl();
+
 		conditionCodes();
 		aguModulo();
 		aguMultiWrapModulo();
@@ -172,6 +175,75 @@ namespace dsp56k
 
 		// multi-instruction tests
 		multiInstructionTests();
+	}
+
+	void UnitTests::esaiResetState()
+	{
+		auto verifyReset = [](Esai& _esai)
+		{
+			_esai.writestatusRegister(0x3ffff);
+			_esai.reset();
+			verify(_esai.readStatusRegister() == 0);
+		};
+
+		verifyReset(peripheralsX.getEsai());
+		verifyReset(peripheralsY.getEsai());
+	}
+
+	void UnitTests::esaiTransmitControl()
+	{
+		auto& esai = peripheralsX.getEsai();
+		esai.reset();
+		uint32_t completedFrames = 0;
+		Esai::TxFrame transmittedFrame;
+		esai.setWriteTxCallback([&](uint64_t&, const Esai::TxFrame& _frame)
+		{
+			++completedFrames;
+			transmittedFrame = _frame;
+		});
+		esai.writeTransmitClockControlRegister(1u << Esai::M_TDC0);
+		esai.writeTX(0, 0x123456);
+		peripheralsX.resetDelayCycles(dsp.getInstructionCounter(), 1234);
+
+		const auto statusBeforeEnable = esai.readStatusRegister();
+		const auto framesBeforeEnable = esai.getTxFrameCounter();
+		const auto scheduleBeforeEnable = peripheralsX.getDelayCycles();
+		esai.writeTransmitControlRegister(1u << Esai::M_TE0);
+
+		verify(esai.readStatusRegister() == statusBeforeEnable);
+		verify(esai.getTxFrameCounter() == framesBeforeEnable);
+		verify(peripheralsX.getDelayCycles() == scheduleBeforeEnable);
+		verify(completedFrames == 0);
+
+		// A real serial step, unlike a TCR write, transfers the pending word.
+		esai.execTX();
+		verify((esai.readStatusRegister() & (1u << Esai::M_TFS)) != 0);
+		verify((esai.readStatusRegister() & (1u << Esai::M_TDE)) != 0);
+		verify(completedFrames == 0);
+		esai.writeTX(0, 0x234567);
+		esai.execTX();
+		verify(completedFrames == 1);
+		verify(transmittedFrame.size() == 2);
+		verify(transmittedFrame[0][0] == 0x123456);
+		verify(transmittedFrame[1][0] == 0x234567);
+
+		// TPR resets transmitter status immediately, preserves receiver status,
+		// and holds the transmitter inert until software clears TPR.
+		esai.writestatusRegister((1u << Esai::M_TFS) |
+			(1u << Esai::M_TDE) | (1u << Esai::M_TUE) |
+			(1u << Esai::M_RFS));
+		esai.writeTransmitControlRegister((1u << Esai::M_TPR) |
+			(1u << Esai::M_TE0));
+		verify(esai.readStatusRegister() == (1u << Esai::M_RFS));
+
+		const auto statusInReset = esai.readStatusRegister();
+		const auto framesInReset = esai.getTxFrameCounter();
+		esai.execTX();
+		verify(esai.readStatusRegister() == statusInReset);
+		verify(esai.getTxFrameCounter() == framesInReset);
+
+		esai.reset();
+		esai.setWriteTxCallback([](uint64_t&, const Esai::TxFrame&) {});
 	}
 
 	void UnitTests::conditionCodes()
