@@ -32,7 +32,10 @@ namespace dsp56k
 
 	bool HDI08::hostCommandHoldActive() const
 	{
-		if(!m_hostCommandArbitration || !m_hostCommandPending.load(std::memory_order_acquire))
+		if(!m_hostCommandArbitration ||
+			!(m_hostCommandState.load(std::memory_order_acquire) & HostCommandPending))
+			return false;
+		if(!dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire)))
 			return false;
 
 		// The hold suppresses only mainline execution. Interrupt handlers already
@@ -56,7 +59,8 @@ namespace dsp56k
 
 		// Derive HCP on the DSP thread to avoid a cross-thread HSR update.
 		if(m_hostCommandArbitration)
-			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, m_hostCommandPending.load(std::memory_order_acquire) ? 1 : 0);
+			dsp56k::bitset<TWord, HSR_HCP>(m_hsr,
+				(m_hostCommandState.load(std::memory_order_acquire) & HostCommandPending) ? 1 : 0);
 
 		// Apply pending host flags, if applicable
 		const auto hf01 = m_pendingHostFlags01.load(std::memory_order_acquire);
@@ -79,7 +83,7 @@ namespace dsp56k
 		m_hostCommandArbitration = _enable;
 
 		// Reset the serializer when arbitration is reconfigured.
-		m_hostCommandPending.store(false, std::memory_order_release);
+		m_hostCommandState.store(0, std::memory_order_release);
 		m_hostCommandInFlight.store(false, std::memory_order_release);
 		m_hostCommandHasQueued.store(false, std::memory_order_release);
 		m_hcEntered = false;
@@ -121,22 +125,42 @@ namespace dsp56k
 		// injection, so the DSP thread observes a coherent command state. HCP is
 		// derived on the DSP thread to avoid a cross-thread read-modify-write.
 		m_hostCommandVba.store(_vba, std::memory_order_relaxed);
-		m_hostCommandPending.store(true, std::memory_order_release);
-		m_periph.getDSP().injectExternalInterrupt(_vba);
+		m_hostCommandState.store(HostCommandPending, std::memory_order_release);
+		requestHostCommandInterrupt();
+	}
+
+	void HDI08::requestHostCommandInterrupt()
+	{
+		auto state = m_hostCommandState.load(std::memory_order_acquire);
+		while((state & HostCommandPending) && !(state & HostCommandInterruptRequested))
+		{
+			if(!dsp56k::bittest<TWord, HCR_HCIE>(m_hcr.load(std::memory_order_acquire)))
+				return;
+
+			const auto requested = static_cast<uint8_t>(state | HostCommandInterruptRequested);
+			if(m_hostCommandState.compare_exchange_weak(state, requested,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+				break;
+		}
+
+		if(!(state & HostCommandPending) || (state & HostCommandInterruptRequested))
+			return;
+
+		m_periph.getDSP().injectExternalInterrupt(
+			m_hostCommandVba.load(std::memory_order_relaxed));
 	}
 
 	void HDI08::onInterruptDispatched(const TWord _vba)
 	{
-		if(!m_hostCommandPending.load(std::memory_order_acquire) ||
+		if(!(m_hostCommandState.load(std::memory_order_acquire) & HostCommandPending) ||
 			_vba != m_hostCommandVba.load(std::memory_order_relaxed))
 			return;
 		// Servicing the vector clears HCP and moves the command to in-flight.
 		// The stack level provides an on-thread interrupt-return signal.
-		m_hostCommandPending.store(false, std::memory_order_release);
-
 		m_hcReturnSsIndex = m_periph.getDSP().ssIndex();
 		m_hcEntered = false;
 		m_hostCommandInFlight.store(true, std::memory_order_release);
+		m_hostCommandState.store(0, std::memory_order_release);
 	}
 
 	void HDI08::pollHostCommandCompletion()
@@ -158,12 +182,11 @@ namespace dsp56k
 			else if(mode == DSP::Default)
 			{
 				// A short interrupt completes within execInterrupt.
-				m_hostCommandInFlight.store(false, std::memory_order_release);
-				if(m_hostCommandHasQueued.load(std::memory_order_acquire))
+				if(m_hostCommandHasQueued.exchange(false, std::memory_order_acq_rel))
 				{
-					m_hostCommandHasQueued.store(false, std::memory_order_relaxed);
 					dispatchHostCommandNow(m_hostCommandQueuedVba.load(std::memory_order_relaxed));
 				}
+				m_hostCommandInFlight.store(false, std::memory_order_release);
 			}
 			return;
 		}
@@ -171,18 +194,20 @@ namespace dsp56k
 		// A long interrupt completes at its original stack level in default mode.
 		if(mode == DSP::Default && ss <= m_hcReturnSsIndex)
 		{
-			m_hostCommandInFlight.store(false, std::memory_order_release);
-			if(m_hostCommandHasQueued)
+			if(m_hostCommandHasQueued.exchange(false, std::memory_order_acq_rel))
 			{
-				m_hostCommandHasQueued = false;
-				dispatchHostCommandNow(m_hostCommandQueuedVba);
+				dispatchHostCommandNow(m_hostCommandQueuedVba.load(std::memory_order_relaxed));
 			}
+			m_hostCommandInFlight.store(false, std::memory_order_release);
 		}
 	}
 
 	uint32_t HDI08::exec() noexcept
 	{
 		pollHostCommandCompletion();
+		// Close the cross-thread race where a command becomes pending while the
+		// DSP enables HCIE. The one-shot flag makes repeated polls harmless.
+		requestHostCommandInterrupt();
 
 		if (!bittest(m_hpcr, HPCR_HEN))
 			return IPeripherals::MaxDelayCycles;
@@ -354,6 +379,12 @@ namespace dsp56k
 	void HDI08::reset()
 	{
 		m_hcr.store(0, std::memory_order_relaxed);
+		m_hostCommandState.store(0, std::memory_order_release);
+		m_hostCommandInFlight.store(false, std::memory_order_release);
+		m_hostCommandHasQueued.store(false, std::memory_order_release);
+		m_hostCommandVba.store(0, std::memory_order_relaxed);
+		m_hostCommandQueuedVba.store(0, std::memory_order_relaxed);
+		m_hcEntered = false;
 		m_hpcr = 0;
 		m_hsr = 0;
 		bitset<TWord, HSR_HTDE>(m_hsr, 1);
@@ -485,6 +516,7 @@ namespace dsp56k
 		const auto hadTXInterrupt = txInterruptEnabled();
 		const auto hadRXInterrupt = rxInterruptEnabled();
 		m_hcr.store(_val, std::memory_order_release);
+		requestHostCommandInterrupt();
 
 		m_callbackHostStateChanged();
 

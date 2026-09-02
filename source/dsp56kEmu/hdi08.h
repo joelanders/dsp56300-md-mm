@@ -203,11 +203,17 @@ namespace dsp56k
 		bool hostCommandBusy() const
 		{
 			return m_hostCommandArbitration &&
-				(m_hostCommandPending.load(std::memory_order_acquire) ||
+				((m_hostCommandState.load(std::memory_order_acquire) & HostCommandPending) ||
 				 m_hostCommandInFlight.load(std::memory_order_acquire));
 		}
 
 	private:
+		enum HostCommandStateBits : uint8_t
+		{
+			HostCommandPending = 1u << 0,
+			HostCommandInterruptRequested = 1u << 1
+		};
+
 		// Suppress mainline HRX consumption while a command can preempt it.
 		bool hostCommandHoldActive() const;
 
@@ -216,6 +222,7 @@ namespace dsp56k
 
 		// Publish and inject a host-command vector.
 		void dispatchHostCommandNow(TWord _vba);
+		void requestHostCommandInterrupt();
 
 		bool dmaTriggerReceive() const;
 		bool dmaTriggerTransmit() const;
@@ -247,7 +254,7 @@ namespace dsp56k
 
 		// Host-port arbitration state shared by the host and DSP threads.
 		bool	m_hostCommandArbitration = false;	// config gate (A1-A4)
-		std::atomic<bool>	m_hostCommandPending{false};	// A2: HCP/HRDF hold, A4: command armed
+		std::atomic<uint8_t>	m_hostCommandState{0};	// pending/requested transition is one atomic operation
 		std::atomic<TWord>	m_hostCommandVba{0};			// A2/A4: the pending host-command vector (2xHV)
 		TWord	m_lastRXValue = 0;					// A3: last valid word presented in HRX
 
