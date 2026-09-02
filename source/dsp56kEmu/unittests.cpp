@@ -52,6 +52,8 @@ namespace dsp56k
 
 	void UnitTests::runAllTests()
 	{
+		hdi08HostCommandInterruptEnable();
+
 		conditionCodes();
 		aguModulo();
 		aguMultiWrapModulo();
@@ -172,6 +174,42 @@ namespace dsp56k
 
 		// multi-instruction tests
 		multiInstructionTests();
+	}
+
+	void UnitTests::hdi08HostCommandInterruptEnable()
+	{
+		Peripherals56303 peripherals;
+		PeripheralsNop noPeripherals;
+		Memory testMemory(g_defaultMemoryValidator, 0x10000);
+		DSP testDsp(testMemory, &peripherals, &noPeripherals);
+		testDsp.regs().sr.var = 0;
+		auto& hdi = peripherals.getHI08();
+
+		hdi.setHostCommandArbitration(true);
+		hdi.writeControlRegister(0);
+		const TWord rxValue = 0x654321;
+		hdi.writeRX(&rxValue, 1);
+		hdi.writeHostCommand(0x20);
+
+		const auto disabledStatus = hdi.readStatusRegister();
+		verify((disabledStatus & (1u << HDI08::HSR_HCP)) != 0);
+		verify((disabledStatus & (1u << HDI08::HSR_HRDF)) != 0);
+		verify(!testDsp.hasPendingExternalInterrupts());
+
+		hdi.writeControlRegister(1u << HDI08::HCR_HCIE);
+		verify(testDsp.hasPendingExternalInterrupts());
+		verify((hdi.readStatusRegister() & (1u << HDI08::HSR_HRDF)) == 0);
+
+		// Once requested, rewriting or toggling HCIE must not duplicate the
+		// command interrupt while the same HCP instance remains pending.
+		testDsp.processExternalInterrupts();
+		verify(!testDsp.hasPendingExternalInterrupts());
+		hdi.writeControlRegister(0);
+		hdi.writeControlRegister(1u << HDI08::HCR_HCIE);
+		verify(!testDsp.hasPendingExternalInterrupts());
+
+		hdi.reset();
+		verify((hdi.readStatusRegister() & (1u << HDI08::HSR_HCP)) == 0);
 	}
 
 	void UnitTests::conditionCodes()
