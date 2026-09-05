@@ -385,6 +385,10 @@ namespace dsp56k
 
 	void HDI08::reset()
 	{
+		// DSP56303UM table 6-13: HW/SW reset clears HCP. Invalidate tagged
+		// CPU requests and the serializer too, so enabling HCIE cannot revive
+		// a pre-reset command. Reset/reconfiguration requires a quiescent host.
+		setHostCommandArbitration(m_hostCommandArbitration);
 		m_hcr.store(0, std::memory_order_relaxed);
 		m_hpcr = 0;
 		m_hsr = 0;
