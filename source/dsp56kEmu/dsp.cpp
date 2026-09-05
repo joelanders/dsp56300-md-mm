@@ -176,7 +176,17 @@ namespace dsp56k
 			return;
 		}
 
-		const auto interrupt = m_pendingInterrupts.front();
+		const auto request = m_pendingInterrupts.front();
+		const auto interrupt = request.vector;
+		if(request.source && !request.source->interruptEnabled(request.token))
+		{
+			m_pendingInterrupts.pop_front();
+			request.source->interruptDiscarded(request.token);
+			// A disabled peripheral retains its own pending state. Do not let its
+			// withdrawn CPU request block unrelated interrupts or peripheral clocks.
+			m_execPeripheralsFunc(this);
+			return;
+		}
 
 		if(interrupt >= Vba_End)
 		{
@@ -218,17 +228,17 @@ namespace dsp56k
 			m_pendingInterrupts.pop_front();
 		}
 
-		execInterrupt(vba);
+		execInterrupt(vba, request.source, request.token);
 	}
 
-	void DSP::execInterrupt(const TWord vba)
+	void DSP::execInterrupt(const TWord vba, InterruptSource* source, const uint64_t token)
 	{
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
+		if(source)
+			source->interruptServiced(token);
 
-		// Host-command arbitration release hook (HDI08 A2): the moment a vector is serviced, notify a
-		// registered consumer so it can lift its HCP-priority mainline hold for this exact vector.
-		// Unset by default -> no effect for the shipping synths.
+		// General observers do not acknowledge a peripheral's tagged request.
 		if(m_interruptServicedCallback)
 			m_interruptServicedCallback(vba);
 
@@ -1295,9 +1305,9 @@ namespace dsp56k
 		return vba;
 	}
 
-	bool DSP::injectInterrupt(uint32_t _interruptVectorAddress)
+	bool DSP::injectInterrupt(uint32_t _interruptVectorAddress, InterruptSource* source, const uint64_t token)
 	{
-		m_pendingInterrupts.push_back({_interruptVectorAddress});
+		m_pendingInterrupts.push_back({_interruptVectorAddress, source, token});
 
 		if(m_interruptFunc == m_execPeripheralsFunc)
 			m_interruptFunc = &dspExecInterrupts;
@@ -1327,7 +1337,7 @@ namespace dsp56k
 		return prio < minPrio;
 	}
 
-	void DSP::injectExternalInterrupt(const TWord _vba)
+	void DSP::injectExternalInterrupt(const TWord _vba, InterruptSource* source, const uint64_t token)
 	{
 		if(m_externalInterruptAbort)
 		{
@@ -1345,13 +1355,16 @@ namespace dsp56k
 		{
 			m_pendingExternalInterrupts.waitNotFull();
 		}
-		m_pendingExternalInterrupts.push_back(_vba);
+		m_pendingExternalInterrupts.push_back({_vba, source, token});
 	}
 
 	void DSP::processExternalInterrupts()
 	{
 		while(!m_pendingExternalInterrupts.empty())
-			injectInterrupt(m_pendingExternalInterrupts.pop_front());
+		{
+			const auto request = m_pendingExternalInterrupts.pop_front();
+			injectInterrupt(request.vector, request.source, request.token);
+		}
 	}
 
 	uint32_t DSP::calcOpcodeCycles(const TWord _pc) const

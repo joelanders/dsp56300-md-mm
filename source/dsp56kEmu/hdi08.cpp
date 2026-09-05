@@ -32,7 +32,8 @@ namespace dsp56k
 
 	bool HDI08::hostCommandHoldActive() const
 	{
-		if(!m_hostCommandArbitration || !m_hostCommandPending.load(std::memory_order_acquire))
+		if(!m_hostCommandArbitration || !m_hostCommandPending.load(std::memory_order_acquire)
+			|| !(m_hcr.load(std::memory_order_acquire) & (1u << HCR_HCIE)))
 			return false;
 
 		// The hold suppresses only mainline execution. Interrupt handlers already
@@ -79,18 +80,13 @@ namespace dsp56k
 		m_hostCommandArbitration = _enable;
 
 		// Reset the serializer when arbitration is reconfigured.
+		m_hostCommandGeneration.fetch_add(1, std::memory_order_acq_rel);
+		m_hostCommandInjected.store(false, std::memory_order_release);
 		m_hostCommandPending.store(false, std::memory_order_release);
 		m_hostCommandInFlight.store(false, std::memory_order_release);
 		m_hostCommandHasQueued.store(false, std::memory_order_release);
 		m_hcEntered = false;
 
-		if(_enable)
-		{
-			m_periph.getDSP().setInterruptServicedCallback([this](const TWord _vba)
-			{
-				onInterruptDispatched(_vba);
-			});
-		}
 	}
 
 	void HDI08::writeHostCommand(const TWord _vba)
@@ -121,8 +117,43 @@ namespace dsp56k
 		// injection, so the DSP thread observes a coherent command state. HCP is
 		// derived on the DSP thread to avoid a cross-thread read-modify-write.
 		m_hostCommandVba.store(_vba, std::memory_order_relaxed);
+		m_hostCommandGeneration.fetch_add(1, std::memory_order_acq_rel);
+		m_hostCommandInjected.store(false, std::memory_order_release);
 		m_hostCommandPending.store(true, std::memory_order_release);
-		m_periph.getDSP().injectExternalInterrupt(_vba);
+		// The host publishes state and requests a tick; only the DSP owner queues
+		// the CPU interrupt. Do not mutate the owner's scheduling counters here.
+		m_periph.requestExec();
+	}
+
+	bool HDI08::interruptEnabled(const uint64_t token) const
+	{
+		return m_hostCommandArbitration && m_hostCommandPending.load(std::memory_order_acquire)
+			&& token == m_hostCommandGeneration.load(std::memory_order_acquire)
+			&& (m_hcr.load(std::memory_order_acquire) & (1u << HCR_HCIE));
+	}
+
+	void HDI08::tryInjectHostCommand()
+	{
+		// Called on the DSP owner from peripheral execution, HCR writes, or
+		// request withdrawal. Do not add a DSP-side producer to the host queue.
+		const auto token = m_hostCommandGeneration.load(std::memory_order_acquire);
+		if(!interruptEnabled(token)) return;
+		bool expected = false;
+		if(m_hostCommandInjected.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			m_periph.getDSP().injectInterrupt(m_hostCommandVba.load(std::memory_order_relaxed), this, token);
+	}
+
+	void HDI08::interruptDiscarded(const uint64_t token)
+	{
+		if(token != m_hostCommandGeneration.load(std::memory_order_acquire)) return;
+		m_hostCommandInjected.store(false, std::memory_order_release);
+		tryInjectHostCommand();
+	}
+
+	void HDI08::interruptServiced(const uint64_t token)
+	{
+		if(token == m_hostCommandGeneration.load(std::memory_order_acquire))
+			onInterruptDispatched(m_hostCommandVba.load(std::memory_order_relaxed));
 	}
 
 	void HDI08::onInterruptDispatched(const TWord _vba)
@@ -183,6 +214,7 @@ namespace dsp56k
 	uint32_t HDI08::exec() noexcept
 	{
 		pollHostCommandCompletion();
+		tryInjectHostCommand();
 
 		if (!bittest(m_hpcr, HPCR_HEN))
 			return IPeripherals::MaxDelayCycles;
@@ -485,6 +517,7 @@ namespace dsp56k
 		const auto hadTXInterrupt = txInterruptEnabled();
 		const auto hadRXInterrupt = rxInterruptEnabled();
 		m_hcr.store(_val, std::memory_order_release);
+		tryInjectHostCommand();
 
 		m_callbackHostStateChanged();
 

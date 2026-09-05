@@ -12,6 +12,7 @@
 #include "opcodes.h"
 #include "jit.h"
 #include "jittypes.h"
+#include "interrupts.h"
 
 #if 0
 #	define LOGJITPC(PC)		LOG(HEX(reinterpret_cast<uint64_t>(this)) << " exec @ " << HEX(PC))
@@ -117,11 +118,11 @@ namespace dsp56k
 #ifdef HAVE_ARM64
         // Our lock free ring buffer does not work properly on aarch4 :-O
         // https://www.arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/
-		RingBuffer<TWord, 1024, true>				m_pendingInterrupts;	// TODO: array is way too large
-		RingBuffer<TWord, 32, true>					m_pendingExternalInterrupts;
+		RingBuffer<InterruptRequest, 1024, true>				m_pendingInterrupts;	// TODO: array is way too large
+		RingBuffer<InterruptRequest, 32, true>					m_pendingExternalInterrupts;
 #else
-        RingBuffer<TWord, 1024, false>				m_pendingInterrupts;    // TODO: array is way too large
-		RingBuffer<TWord, 32, false>				m_pendingExternalInterrupts;
+        RingBuffer<InterruptRequest, 1024, false>				m_pendingInterrupts;    // TODO: array is way too large
+		RingBuffer<InterruptRequest, 32, false>				m_pendingExternalInterrupts;
 #endif
 
 		std::vector<std::function<void()>>			m_customInterrupts;
@@ -324,6 +325,7 @@ namespace dsp56k
 
 		template<typename Ta, typename Tb> ASMJIT_NOINLINE void execPeripherals() noexcept
 		{
+			perif[0]->beginExec();
 			// we do not have any Y peripherals that need processing atm
 			const auto delayA = static_cast<Ta*>(perif[0])->exec();
 //			const auto delayB = static_cast<Tb*>(perif[1])->exec();
@@ -343,7 +345,7 @@ namespace dsp56k
 		}
 
 		void	execInterrupts					();
-		void	execInterrupt					(uint32_t vba);
+		void	execInterrupt					(uint32_t vba, InterruptSource* source = nullptr, uint64_t token = 0);
 		void	execDefaultPreventInterrupt		();
 
 		bool	readReg							( EReg _reg, TReg8& _res ) const;
@@ -378,11 +380,11 @@ namespace dsp56k
 		void			logSC							( const char* _func ) const;
 
 		TWord			registerInterruptFunc			(std::function<void()>&& _func);
-		bool			injectInterrupt					(uint32_t _interruptVectorAddress);
+		bool			injectInterrupt					(uint32_t _interruptVectorAddress, InterruptSource* source = nullptr, uint64_t token = 0);
 		bool			injectInterruptImmediate		(uint32_t _interruptVectorAddress);
 		bool			isInterruptMasked				(const TWord _vba) const;
 
-		void			injectExternalInterrupt			(const TWord _vba);
+		void			injectExternalInterrupt			(const TWord _vba, InterruptSource* source = nullptr, uint64_t token = 0);
 		void			processExternalInterrupts		();
 
 		// Optional abort predicate for injectExternalInterrupt's producer-side wait. The external
@@ -393,10 +395,8 @@ namespace dsp56k
 		// the shipping single-owner synths are unaffected.
 		void			setExternalInterruptAbortPredicate(std::function<bool()> _p) { m_externalInterruptAbort = std::move(_p); }
 
-		// Optional per-dispatch notification: called from execInterrupt with the serviced vector, used
-		// by the HDI08 host-command arbitration to release its HCP-priority hold exactly when the
-		// host-command vector dispatches. Default: unset -> shipping synths take one always-false
-		// branch per interrupt (behaviour-neutral).
+		// Optional per-dispatch observer. Source-specific acknowledgement uses
+		// the tagged request independently of this vector-only notification.
 		void			setInterruptServicedCallback	(std::function<void(TWord)> _cb) { m_interruptServicedCallback = std::move(_cb); }
 
 		bool			hasPendingInterrupts			() const
