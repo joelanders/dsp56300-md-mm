@@ -328,6 +328,21 @@ namespace dsp56k
 			const auto op = fetchPC();
 
 			execOp(op);
+
+			// DSP56300FM section 13 (DO): LA identifies the last instruction word,
+			// not a branch destination. Complete at that fetch, after the instruction
+			// executes, without recursively running another loop iteration.
+			if(sr_test_noCache(SR_LF)
+				&& ((pcCurrentInstruction + m_currentOpLen - 1) & 0xffffff) == reg.la.var)
+			{
+				if(reg.lc.var <= 1)
+					do_end();
+				else
+				{
+					--reg.lc.var;
+					setPC(hiword(reg.ss[ssIndex()]));
+				}
+			}
 		}
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept

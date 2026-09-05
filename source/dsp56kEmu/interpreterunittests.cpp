@@ -11,6 +11,7 @@ namespace dsp56k
 		testCCCC();
 		testSubr();
 		testCycleAccounting();
+		testCooperativeDo();
 		
 		runAllTests();
 	}
@@ -52,7 +53,7 @@ namespace dsp56k
 		dsp.execInterpreter();
 		verify(dsp.getCycles() == 9); // REP (5) + four NOPs (1 each)
 
-		// DO likewise runs its loop body internally rather than returning through execOp per pass.
+		// DO setup must return before its body so the host scheduler can run.
 		dsp.resetHW();
 		pc = 0x100;
 		pc = emitToMemory("do #$5,>$104", pc);
@@ -60,7 +61,78 @@ namespace dsp56k
 		emitToMemory("nop", pc);
 		dsp.setPC(0x100);
 		dsp.execInterpreter();
+		verify(dsp.getPC().toWord() == 0x102);
+		verify(dsp.getCycles() == 5);
+		execUntil(0x104);
 		verify(dsp.getCycles() == 15); // DO (5) + five two-NOP iterations
+	}
+
+	void InterpreterUnitTests::testCooperativeDo()
+	{
+		// Independently assembled host-polling loop. X:$20 stands for a value
+		// supplied by the host between DSP steps; no firmware image is involved.
+		dsp.resetHW();
+		dsp.memory().set(MemArea_X, 0x20, 0);
+		emitToMemory("do #$2,>$108", 0x100);
+		emitToMemory("move x:>$20,x0", 0x102);
+		emitToMemory("brclr #0,x0,>$fffffe", 0x104);
+		emitToMemory("nop", 0x106);
+		emitToMemory("nop", 0x107);
+		dsp.setPC(0x100);
+		dsp.execInterpreter();
+		verify(dsp.getPC().toWord() == 0x102);
+		for(unsigned step = 0; step < 8; ++step)
+			dsp.execInterpreter();
+		verify(dsp.getPC().toWord() == 0x102);
+		verify(dsp.regs().lc.toWord() == 2);
+		dsp.memory().set(MemArea_X, 0x20, 1);
+		execUntil(0x108);
+		verify(!dsp.sr_test_noCache(SR_LF));
+		verify(dsp.regs().sc.toWord() == 0);
+
+		// Nested loops restore the outer LA/LC, then the caller's original state.
+		dsp.resetHW();
+		dsp.setALU(false, TReg56(0));
+		dsp.setALU(true, TReg56(0));
+		dsp.regs().la.var = 0x321;
+		dsp.regs().lc.var = 7;
+		emitToMemory("do #$2,>$10a", 0x100);
+		emitToMemory("do #$3,>$106", 0x102);
+		emitToMemory("inc a", 0x104);
+		emitToMemory("nop", 0x105);
+		emitToMemory("inc b", 0x106);
+		for(TWord pc = 0x107; pc < 0x10a; ++pc)
+			emitToMemory("nop", pc);
+		dsp.setPC(0x100);
+		execUntil(0x10a);
+		verify(dsp.aluA().var == 6 && dsp.aluB().var == 2);
+		verify(dsp.regs().la.var == 0x321 && dsp.regs().lc.var == 7);
+		verify(dsp.regs().sc.var == 0 && !dsp.sr_test_noCache(SR_LF));
+
+		// ENDDO terminates early without jumping over the remaining instructions.
+		dsp.resetHW();
+		dsp.setALU(false, TReg56(0));
+		dsp.setALU(true, TReg56(0));
+		emitToMemory("do #$5,>$106", 0x100);
+		emitToMemory("inc a", 0x102);
+		emitToMemory("enddo", 0x103);
+		emitToMemory("nop", 0x104);
+		emitToMemory("inc b", 0x105);
+		dsp.setPC(0x100);
+		execUntil(0x106);
+		verify(dsp.aluA().var == 1 && dsp.aluB().var == 1);
+		verify(dsp.regs().sc.var == 0 && !dsp.sr_test_noCache(SR_LF));
+
+		// A zero count in native (non-SC) mode skips the body without stacking.
+		dsp.resetHW();
+		dsp.setALU(false, TReg56(0));
+		emitToMemory("do #$0,>$104", 0x100);
+		emitToMemory("inc a", 0x102);
+		emitToMemory("nop", 0x103);
+		dsp.setPC(0x100);
+		dsp.execInterpreter();
+		verify(dsp.getPC().toWord() == 0x104 && dsp.aluA().var == 0);
+		verify(dsp.regs().sc.var == 0 && !dsp.sr_test_noCache(SR_LF));
 	}
 
 	void InterpreterUnitTests::execOpcode(uint32_t _op0, uint32_t _op1, const bool _reset, TWord _pc)

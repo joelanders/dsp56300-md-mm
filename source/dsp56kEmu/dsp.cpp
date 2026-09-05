@@ -638,44 +638,10 @@ namespace dsp56k
 
 		pushPCSR();
 
-		const auto stackCount = reg.sc.var;
-		
 		sr_set( SR_LF );
-
-		if constexpr(!g_useJIT)
-			m_cycles += getOpcodeCycles(pcCurrentInstruction);
-
-		++m_instructions;
-
-		traceOp();
-
-		// __________________
-		//
-
-		// note the terminate check: the interpreter executes a whole DO loop inside this function, it never returns
-		// to DSPThread::threadFunc in between. Without it, a firmware loop that never ends deadlocks the join on shutdown.
-		while(reg.sc.var >= stackCount && !m_terminate.load(std::memory_order_relaxed))
-		{
-			execInterpreter();
-
-			if(reg.pc.var != (reg.la.var+1))
-				continue;
-
-			if(!sr_test_noCache(SR_LF))
-				break;
-
-			if( reg.lc.var <= 1 )
-			{
-				// restore PC to point to the next instruction after the last instruction of the loop
-				setPC(reg.la.var+1);
-
-				do_end();
-				break;
-			}
-
-			--reg.lc.var;
-			setPC(hiword(reg.ss[ssIndex()]));
-		}
+		// The instruction establishes architectural loop state only. Executing
+		// its body here would prevent a host scheduler from supplying data to a
+		// peripheral-polling loop. execInterpreter handles each loop-end fetch.
 		return true;
 	}
 
