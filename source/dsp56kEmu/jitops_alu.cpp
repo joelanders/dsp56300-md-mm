@@ -180,36 +180,41 @@ namespace dsp56k
 		// D = 2 * D + S
 
 		const auto ab = getFieldValue<Addl, Field_d>(op);
-
-		AluReg aluD(m_block, ab);
-
-		aluSignextendTo64(aluD);
+		CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+		AluRef aluD(m_block, ab);
+		aluExtendTo64(aluD);
+		const RegGP overflow(m_block);
+		m_asm.mov(overflow, aluD);
 
 #ifdef HAVE_ARM64
 		m_asm.lsl(aluD, aluD, asmjit::Imm(1));
 #else
 		m_asm.sal(aluD, asmjit::Imm(1));
 #endif
+		m_asm.xor_(overflow, aluD.get());
+		const RegGP shifted(m_block);
+		m_asm.mov(shifted, aluD);
 		{
 			AluReg aluS(m_block, ab ? 0 : 1, true);
 
-			aluSignextendTo64(aluS);
+			aluExtendTo64(aluS);
 
 #ifdef HAVE_ARM64
 			m_asm.adds(aluD, aluD, aluS.get());
 #else
 			m_asm.add(aluD, aluS.get());
 #endif
+			ccr_update_ifCarry(CCRB_C);
+			// Addition overflows when the result sign differs from both inputs.
+			m_asm.xor_(shifted, aluD.get());
+			m_asm.xor_(aluS, aluD.get());
+			m_asm.and_(shifted, aluS.get());
+			m_asm.or_(overflow, shifted.get());
 		}
 
-		ccr_update_ifCarry(CCRB_C);
-
-		// D = 2 * D + S: the shift is to the LEFT, so the spare low byte stays zero, and adding another
-		// accumulator keeps it that way. Contrast op_Addr below, which shifts right and does need the mask.
-		if constexpr (!g_leftAlignedAlu)
-			m_dspRegs.mask56(aluD);
-
-		ccr_clear(CCR_V);	// TODO: Set if overflow has occurred in the A or B result or the MSB of the destination operand is changed as a result of the instruction�s left shift.
+		copyBitToCCR(overflow, 63, CCRB_V);
+		ccr_l_update_by_v();
+		aluRestoreFrom64(aluD);
 		ccr_dirty(ab, aluD, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -1175,7 +1180,15 @@ namespace dsp56k
 		m_asm.neg(r);
 		m_dspRegs.mask56(r);
 
-		ccr_clear(CCR_V);
+		// Only negating the minimum 56-bit value produces that value again.
+		// Compare explicitly so this works for either accumulator alignment.
+		{
+			const RegScratch minimum(m_block);
+			m_asm.mov(minimum, asmjit::Imm(uint64_t(1) << (55 + g_aluBitOffset)));
+			m_asm.cmp(r, minimum);
+		}
+		ccr_update_ifZero(CCRB_V);
+		ccr_l_update_by_v();
 
 		ccr_dirty(D, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}

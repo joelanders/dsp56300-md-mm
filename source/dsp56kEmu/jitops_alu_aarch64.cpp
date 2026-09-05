@@ -68,10 +68,16 @@ namespace dsp56k
 		if (_abDst != _abSrc)
 			m_dspRegs.getALU(alu.get(), _abSrc);
 
-		aluSignextendTo64(alu);
+		// Use raw right-aligned bits here so bit 56 can retain carry.
+		if constexpr(g_leftAlignedAlu)
+			m_asm.asr(alu, alu, asmjit::Imm(8));
+		else
+			signextend56to64(alu);
 
 		const RegGP oldAlu(m_block);
 		m_asm.mov(oldAlu, alu);
+		// Zero extension also makes a zero shift produce C=0.
+		m_asm.and_(alu, alu, asmjit::Imm(0x00ffffffffffffffull));
 
 		if(_v)
 			m_asm.lsl(alu, alu, _v->get());
@@ -85,7 +91,7 @@ namespace dsp56k
 		// The easiest way to check this is to shift back and compare if the initial alu value is identical ot the backshifted one
 		{
 			const RegScratch s(m_block);
-			aluSignextendTo64(s, alu);
+			signextend56to64(s, alu);
 			if(_v)
 				m_asm.asr(s, s, _v->get());
 			else
@@ -94,7 +100,10 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 
+		if constexpr(g_leftAlignedAlu)
+			m_asm.lsl(alu, alu, asmjit::Imm(8));
 		m_dspRegs.mask56(alu);
 
 		ccr_dirty(_abDst, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));

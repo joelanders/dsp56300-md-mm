@@ -209,6 +209,9 @@ namespace dsp56k
 		uint32_t exec() noexcept;
 		void setActiveChannel(TWord _channel);
 		void clearActiveChannel(TWord _channel);
+		void channelEnabled(TWord _channel);
+		void transferStarted(TWord _channel);
+		void transferDone(TWord _channel);
 
 		bool hasTrigger(DmaChannel::RequestSource _source) const;
 		bool trigger(DmaChannel::RequestSource _source) const;
@@ -216,7 +219,10 @@ namespace dsp56k
 		void removeTriggerTarget(const DmaChannel* _channel);
 
 	private:
+		IPeripherals& m_peripherals;
 		TWord m_dstr;
+		TWord m_pendingDoneClear = 0;
+		std::array<uint64_t, 6> m_doneClearClock{};
 		std::array<DmaChannel, 6> m_channels;
 		std::array<TWord, 4> m_dor{};
 		std::array<ChannelList, static_cast<uint32_t>(DmaChannel::RequestSource::Count)> m_requestTargets;

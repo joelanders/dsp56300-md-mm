@@ -1,7 +1,25 @@
 #pragma once
 
+#include <cstdint>
+
 namespace dsp56k
 {
+	// Optional level-sensitive source. The owner must outlive its queued requests.
+	class InterruptSource
+	{
+	public:
+		virtual ~InterruptSource() = default;
+		virtual bool interruptEnabled(uint64_t token) const = 0;
+		virtual void interruptDiscarded(uint64_t token) = 0;
+		virtual void interruptServiced(uint64_t token) = 0;
+	};
+
+	struct InterruptRequest
+	{
+		uint32_t vector;
+		InterruptSource* source = nullptr;
+		uint64_t token = 0;
+	};
 	enum InterruptVectorAddress		// Register VBA + InterruptVectorAddress = effective address
 	{
 		// Level 3 (non-maskable)

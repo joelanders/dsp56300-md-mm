@@ -94,6 +94,7 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 		
 		aluRestoreFrom64(alu);						// correction for the pre-shift, and keeps the low byte clear
 
@@ -113,10 +114,11 @@ namespace dsp56k
 			m_asm.sar(alu, _v->get().r8());
 		else
 			m_asm.sar(alu, asmjit::Imm(_immediate));
+		// The 56-bit accumulator is extended/aligned to bits 63:8. Its
+		// last discarded bit is now bit 7, not the host SAR carry bit.
+		copyBitToCCR(alu, 7, CCRB_C);
 		// discards the bits shifted below the accumulator - the hardware has no resolution there
 		aluRestoreFrom64(alu);
-
-		ccr_update_ifCarry(CCRB_C);					// copy the host carry flag to the DSP carry flag
 		
 //		ccr_clear(CCR_V);							// cleared by batch update
 
