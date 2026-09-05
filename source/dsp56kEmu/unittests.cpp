@@ -1221,6 +1221,28 @@ namespace dsp56k
 
 	void UnitTests::clr()
 	{
+		// DSP56300FM Rev. 5, CLR (13-44): E/N/V=0, U/Z=1, C unchanged.
+		// Do not observe SR between instructions: doing so resolves the lazy
+		// flags and would hide a stale pre-CLR result in the interpreter.
+		for(const bool destinationB : {false, true})
+		for(const bool negative : {false, true})
+		for(const TWord carry : {0u, 1u})
+		for(const TWord preserved : {0u, 0xc1u})
+		{
+			runTest([&]()
+			{
+				dsp.setALU(destinationB, TReg56(static_cast<TReg56::MyType>((negative ? 0xffffff00000000ull : 0x1000000000000ull) | carry)));
+				dsp.regs().sr.var = preserved;
+				emit(destinationB ? "asr b" : "asr a");
+				emit(destinationB ? "clr b" : "clr a");
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == 0);
+				// ASR supplies C from bit zero; CLR preserves it and sticky S/L.
+				verify((dsp.getSR().var & 0xff) == ((preserved & 0xc0) | 0x14 | carry));
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(true , TReg56(static_cast<TReg56::MyType>(0x99aabbccddeeff)));

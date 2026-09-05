@@ -334,6 +334,9 @@ namespace dsp56k
 
 	void DSP::alu_clr(bool ab)
 	{
+		// Retire the preceding result before installing CLR's fixed flags.
+		// Otherwise a later SR read can restore stale E/U/N from that result.
+		updateDirtyCCR();
 		TReg56& dst = ab ? reg.b : reg.a;
 		dst.var = 0;
 
