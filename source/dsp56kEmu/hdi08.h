@@ -200,7 +200,14 @@ namespace dsp56k
 
 		bool hostCommandArbitration() const { return m_hostCommandArbitration; }
 
-		// A command remains busy through interrupt return.
+		bool hostCommandPending() const
+		{
+			return m_hostCommandPending.load(std::memory_order_acquire)
+				|| m_hostCommandHasQueued.load(std::memory_order_acquire);
+		}
+		// DSP/machine-owner only. Cancels pending delivery, never an accepted handler.
+		void cancelHostCommand();
+		// The retained serializer remains busy through interrupt return.
 		bool hostCommandBusy() const
 		{
 			return m_hostCommandArbitration &&

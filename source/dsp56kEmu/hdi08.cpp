@@ -57,7 +57,7 @@ namespace dsp56k
 
 		// Derive HCP on the DSP thread to avoid a cross-thread HSR update.
 		if(m_hostCommandArbitration)
-			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, m_hostCommandPending.load(std::memory_order_acquire) ? 1 : 0);
+			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, hostCommandPending() ? 1 : 0);
 
 		// Apply pending host flags, if applicable
 		const auto hf01 = m_pendingHostFlags01.load(std::memory_order_acquire);
@@ -87,6 +87,16 @@ namespace dsp56k
 		m_hostCommandHasQueued.store(false, std::memory_order_release);
 		m_hcEntered = false;
 
+	}
+
+	void HDI08::cancelHostCommand()
+	{
+		// DSP56303UM table 6-9: a host clearing HC also clears HCP. Tokens
+		// withdraw an already queued CPU request without aborting a running ISR.
+		m_hostCommandGeneration.fetch_add(1, std::memory_order_acq_rel);
+		m_hostCommandPending.store(false, std::memory_order_release);
+		m_hostCommandInjected.store(false, std::memory_order_release);
+		m_hostCommandHasQueued.store(false, std::memory_order_release);
 	}
 
 	void HDI08::writeHostCommand(const TWord _vba)
