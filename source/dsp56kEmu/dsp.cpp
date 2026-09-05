@@ -498,8 +498,10 @@ namespace dsp56k
 
 	void DSP::setCCRDirty(bool ab, const TReg56& _alu, uint32_t _dirtyBitsMask)
 	{
-//		if(ccrCache.dirty && ccrCache.ab != ab)
-//			updateDirtyCCR();
+		// A single saved result cannot represent flags from two operations.
+		// Resolve anything the new operation preserves before replacing it.
+		if(ccrCache.dirty & ~_dirtyBitsMask)
+			updateDirtyCCR();
 
 		ccrCache.dirty |= _dirtyBitsMask;
 		ccrCache.alu = _alu;
@@ -513,12 +515,16 @@ namespace dsp56k
 
 		auto& dsp = const_cast<DSP&>(*this);
 
+		const auto dirty = ccrCache.dirty;
 		dsp.ccrCache.dirty = 0;
 		
 //		dsp.sr_s_update();
-		dsp.sr_e_update(ccrCache.alu);
-		dsp.sr_u_update(ccrCache.alu);
-		dsp.sr_n_update(ccrCache.alu);
+		if(dirty & CCR_E)
+			dsp.sr_e_update(ccrCache.alu);
+		if(dirty & CCR_U)
+			dsp.sr_u_update(ccrCache.alu);
+		if(dirty & CCR_N)
+			dsp.sr_n_update(ccrCache.alu);
 	}
 
 	void DSP::sr_debug(char* _dst) const

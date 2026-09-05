@@ -15,6 +15,7 @@ namespace dsp56k
 		void testCycleAccounting();
 		void testCooperativeDo();
 		void testMemoryDoCounts();
+		void testDeferredCCR();
 
 		void runTest(const std::function<void()>& _build, const std::function<void()>& _verify) override;
 		void emit(TWord _opA, TWord _opB = 0, TWord _pc = 0) override;

@@ -583,14 +583,15 @@ namespace dsp56k
 
 		// -- status register management
 
-		void 	sr_set					( CCRMask _bits )					{ reg.sr.var |= _bits;	}
+		// Explicit writes supersede only the corresponding deferred flags.
+		void 	sr_set					( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var |= _bits; }
 		void 	sr_set					( SRMask _bits )					{ reg.sr.var |= _bits;	}
-		void 	sr_clear				( CCRMask _bits )					{ reg.sr.var &= ~_bits; }
+		void 	sr_clear				( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var &= ~_bits; }
 		void 	sr_clear				( SRMask _bits )					{ reg.sr.var &= ~_bits; }
 
 		void 	sr_toggle				( CCRMask _bits, bool _set )		{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
 		void 	sr_toggle				( SRMask _bits, bool _set )			{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
-		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
+		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ ccrCache.dirty &= ~(1u << _bit); bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
 
 	public:
 		int 	sr_test					( CCRMask _bits ) const				{ updateDirtyCCR(); return sr_test_noCache(_bits); }

@@ -13,8 +13,68 @@ namespace dsp56k
 		testCycleAccounting();
 		testCooperativeDo();
 		testMemoryDoCounts();
+		testDeferredCCR();
 		
 		runAllTests();
+	}
+
+	void InterpreterUnitTests::testDeferredCCR()
+	{
+		// Cache contract: every subset of E/U/N can be replaced independently.
+		// These no-scaling results have E/U/N respectively all clear or all set.
+		dsp.setALU(false, TReg56(0x00400000000000ll));
+		dsp.setALU(true, TReg56(0xff000000000000ll));
+		constexpr uint32_t flags = CCR_E | CCR_U | CCR_N;
+		constexpr TWord preserved = CCR_S | CCR_L | CCR_Z | CCR_V | CCR_C;
+		for(const bool firstSet : {false, true})
+		for(uint32_t oldSubset = 0; oldSubset < 8; ++oldSubset)
+		for(uint32_t newSubset = 0; newSubset < 8; ++newSubset)
+		{
+			const auto oldMask = oldSubset << CCRB_N;
+			const auto newMask = newSubset << CCRB_N;
+			const auto oldFlags = firstSet ? flags : 0u;
+			const auto newFlags = firstSet ? 0u : flags;
+			const auto initial = preserved | newFlags;
+			dsp.setSR(initial);
+			dsp.setCCRDirty(firstSet, firstSet ? dsp.regs().b : dsp.regs().a, oldMask);
+			dsp.setCCRDirty(!firstSet, firstSet ? dsp.regs().a : dsp.regs().b, newMask);
+			const auto expected = (initial & ~(oldMask | newMask))
+				| (oldFlags & oldMask & ~newMask) | (newFlags & newMask);
+			verify(dsp.getSR().var == expected);
+			verify(dsp.ccrCache.dirty == 0);
+			verify(dsp.getSR().var == expected); // repeated reads are idempotent
+		}
+
+		// Cover the mask-set, mask-clear and bit-value write entry points.
+		for(const bool pendingSet : {false, true})
+		for(uint32_t subset = 1; subset < 8; ++subset)
+		for(const bool explicitSet : {false, true})
+		{
+			const auto mask = static_cast<CCRMask>(subset << CCRB_N);
+			dsp.setSR(preserved);
+			dsp.setCCRDirty(pendingSet, pendingSet ? dsp.regs().b : dsp.regs().a, flags);
+			if(explicitSet)
+				dsp.sr_set(mask);
+			else
+				dsp.sr_clear(mask);
+			const auto expected = preserved | ((pendingSet ? flags : 0u) & ~mask)
+				| (explicitSet ? static_cast<uint32_t>(mask) : 0u);
+			verify(dsp.ccrCache.dirty == (flags & ~mask));
+			verify(dsp.getSR().var == expected);
+		}
+		for(const bool pendingSet : {false, true})
+		for(const auto bit : {CCRB_E, CCRB_U, CCRB_N})
+		for(const bool explicitSet : {false, true})
+		{
+			const auto mask = 1u << bit;
+			dsp.setSR(preserved);
+			dsp.setCCRDirty(pendingSet, pendingSet ? dsp.regs().b : dsp.regs().a, flags);
+			dsp.sr_toggle(bit, Bit(explicitSet));
+			const auto expected = preserved | ((pendingSet ? flags : 0u) & ~mask)
+				| (explicitSet ? mask : 0u);
+			verify(dsp.ccrCache.dirty == (flags & ~mask));
+			verify(dsp.getSR().var == expected);
+		}
 	}
 
 	void InterpreterUnitTests::testCycleAccounting()

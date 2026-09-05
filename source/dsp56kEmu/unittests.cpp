@@ -53,6 +53,7 @@ namespace dsp56k
 	void UnitTests::runAllTests()
 	{
 		conditionCodes();
+		partialFlagWrites();
 		aguModulo();
 		aguMultiWrapModulo();
 		aguBitreverse();
@@ -1258,6 +1259,50 @@ namespace dsp56k
 		testClb(0x00'00'ffffff'000000, 0x00000001000000);
 		testClb(0x00'00'000000'000001, 0xffffffd2000000);
 		testClb(0, 0);	// special case
+	}
+
+	void UnitTests::partialFlagWrites()
+	{
+		// Public ISA: logical operations replace N/Z/V but preserve E/U/C.
+		// No SR read may separate ASR from the logical operation: the prior
+		// arithmetic flags must remain deferred until the final observation.
+		const char* operationsA[] = {"and x0,a", "or x0,a", "eor x0,a", "not a"};
+		const char* operationsB[] = {"and x0,b", "or x0,b", "eor x0,b", "not b"};
+		for(const uint64_t input : {0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const TWord x : {0u, 0x800001u, 0xffffffu})
+		for(const bool separate : {false, true})
+		for(unsigned operation = 0; operation < 4; ++operation)
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x0055aaaa123456ull : shifted;
+			const TWord msp = (before >> 24) & 0xffffff;
+			const TWord results[] = {msp & x, msp | x, msp ^ x, (~msp) & 0xffffff};
+			const auto result = results[operation];
+			const uint64_t expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const auto integer = shifted >> 47;
+			const bool extension = integer != 0 && integer != 0x1ff;
+			const bool unnormalized = ((shifted >> 47) & 1) == ((shifted >> 46) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u) | (input & 1);
+			runTest([&]()
+			{
+				dsp.setSR(0);
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x0055aaaa123456ull)));
+				dsp.x0(x);
+				emit("asr a");
+				emit(separate ? operationsB[operation] : operationsA[operation]);
+			}, [&]()
+			{
+				verify(dsp.aluA() == (separate ? shifted : expected));
+				verify(dsp.aluB() == (separate ? expected : 0x0055aaaa123456ull));
+				// S's standard scaling behavior is a separate question; all other
+				// flags, including unchanged L=0, are checked here.
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify(dsp.x0() == x);
+			});
+		}
 	}
 
 	void UnitTests::clr()

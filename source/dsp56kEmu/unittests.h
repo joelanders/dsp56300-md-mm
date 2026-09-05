@@ -41,6 +41,7 @@ namespace  dsp56k
 		void runAllTests();
 
 		void conditionCodes();
+		void partialFlagWrites();
 		void aguModulo();
 		void aguMultiWrapModulo();
 		void aguBitreverse();
