@@ -246,6 +246,36 @@ namespace dsp56k
 		run(0x00'000000'000000, {CCCC_Plus, CCCC_NotNormalized});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_Normalized});
 		run(0x00'400000'000000, {CCCC_Plus, CCCC_Normalized});
+
+		// DSP56300FM table 5-1: E tests the complete signed integer portion,
+		// including bit 55 in all scaling modes (down: 48, normal: 47, up: 46).
+		for(unsigned scaling = 0; scaling < 3; ++scaling)
+		{
+			const unsigned lowBit = scaling == 0 ? 47 : scaling == 1 ? 48 : 46;
+			for(const uint64_t value : {0ull, 0xffffffffffffffull, 0x003fffffffffffull,
+				0x00400000000000ull, 0x007fffffffffffull, 0x00800000000000ull,
+				0x00ffffffffffffull, 0x01000000000000ull, 0x7ff00000000000ull,
+				0x80000000000000ull, 0x80100000000000ull, 0xff800000000000ull,
+				0xffc00000000000ull})
+			{
+				bool extension = false;
+				for(unsigned bit = lowBit; bit < 55; ++bit)
+					extension |= ((value >> bit) & 1) != ((value >> 55) & 1);
+				for(const bool ab : {false, true})
+					runTest([&]()
+					{
+						dsp.setSR(scaling << SRB_S0);
+						dsp.setALU(ab, TReg56(value));
+						emit(ab ? "tst b" : "tst a");
+					}, [&]()
+					{
+						if(bool(dsp.sr_test(CCR_E)) != extension)
+							LOG("Extension mismatch scaling=" << scaling << " value=" << std::hex << value
+								<< " sr=" << dsp.getSR().var << " expected=" << extension);
+						verify(bool(dsp.sr_test(CCR_E)) == extension);
+					});
+			}
+		}
 	}
 
 	void UnitTests::aguModulo()
