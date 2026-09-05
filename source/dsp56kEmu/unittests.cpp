@@ -92,6 +92,7 @@ namespace dsp56k
 		dec();
 		div();
 		dmac();
+		dmaAddressWrapping();
 		dmacMultiPrecision();
 		eor();
 		extractu();
@@ -1471,6 +1472,43 @@ namespace dsp56k
 		{
 			verify(dsp.aluA().var == 0x00055555555554);
 		});
+	}
+
+	void UnitTests::dmaAddressWrapping()
+	{
+		struct Case { TWord address, count, offsetA, offsetB, expected; };
+		const Case cases[] = {
+			{0xffffff, 1, 0, 0, 0},              // in-line postincrement
+			{0xfffffe, 0, 0, 4, 2},              // positive DOR-B wrap
+			{0, 0, 0, 0xffffff, 0xffffff},       // negative DOR-B wrap
+			{0xfffffe, 64, 4, 0, 2},             // positive DOR-A wrap
+			{0, 64, 0xffffff, 0, 0xffffff},      // negative DOR-A wrap
+		};
+		for(const auto& test : cases)
+		{
+			auto& dma = peripheralsX.getDMA();
+			runTest([&]()
+			{
+				// Source is 3D, destination is fixed X:$100. The two high source
+				// addresses are readable peripheral registers, so no out-of-range
+				// backing RAM is needed. Issue only one word request, then inspect
+				// the updated address before any subsequent transfer can use it.
+				dma.setDCR(0, 0);
+				dma.setDSR(0, test.address);
+				dma.setDDR(0, 0x100);
+				dma.setDCO(0, test.count);
+				dma.setDOR(0, test.offsetA);
+				dma.setDOR(1, test.offsetB);
+				dma.setDCR(0, (32u << DmaChannel::Dam0) | (1u << DmaChannel::D3d)
+					| (1u << DmaChannel::Dtm0) | (1u << DmaChannel::De));
+				verify(dma.trigger(DmaChannel::RequestSource::ExternalIRQA));
+			}, [&]()
+			{
+				verify(dma.getDSR(0) == test.expected);
+				verify(dma.getDDR(0) == 0x100);
+				dma.setDCR(0, 0);
+			});
+		}
 	}
 
 	void UnitTests::merge()
