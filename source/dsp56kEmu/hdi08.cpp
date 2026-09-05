@@ -109,8 +109,9 @@ namespace dsp56k
 			return;
 		}
 
-		// Serialize one additional command while a previous command is busy.
-		if(hostCommandBusy())
+		// Queue an overlapping pending request, but do not delay a valid new
+		// command merely because an accepted handler has not returned yet.
+		if(hostCommandPending())
 		{
 			// Publish the value before its availability flag.
 			m_hostCommandQueuedVba.store(_vba, std::memory_order_relaxed);

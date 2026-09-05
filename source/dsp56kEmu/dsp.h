@@ -399,6 +399,13 @@ namespace dsp56k
 		// the tagged request independently of this vector-only notification.
 		void			setInterruptServicedCallback	(std::function<void(TWord)> _cb) { m_interruptServicedCallback = std::move(_cb); }
 
+		// Queued requests only; unlike hasPendingInterrupts(), a running handler
+		// does not make this true. Read on the DSP/machine owner.
+		bool hasQueuedInterrupts() const
+		{
+			return !m_pendingExternalInterrupts.empty() || !m_pendingInterrupts.empty();
+		}
+
 		bool			hasPendingInterrupts			() const
 		{
 			if(m_processingMode != Default)
