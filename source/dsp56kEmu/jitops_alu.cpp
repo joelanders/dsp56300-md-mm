@@ -1175,7 +1175,15 @@ namespace dsp56k
 		m_asm.neg(r);
 		m_dspRegs.mask56(r);
 
-		ccr_clear(CCR_V);
+		// Only negating the minimum 56-bit value produces that value again.
+		// Compare explicitly so this works for either accumulator alignment.
+		{
+			const RegScratch minimum(m_block);
+			m_asm.mov(minimum, asmjit::Imm(uint64_t(1) << (55 + g_aluBitOffset)));
+			m_asm.cmp(r, minimum);
+		}
+		ccr_update_ifZero(CCRB_V);
+		ccr_l_update_by_v();
 
 		ccr_dirty(D, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}

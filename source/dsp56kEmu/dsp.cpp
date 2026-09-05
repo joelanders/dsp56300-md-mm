@@ -1329,14 +1329,15 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		auto d64 = aluSignextend(d);
-		d64 = -d64;
-		
-		d.var = d64;
+		const auto value = static_cast<uint64_t>(d.var);
+		const bool overflow = value == (uint64_t(1) << (55 + g_aluShift));
+		// Unsigned subtraction also defines negation of the left-aligned
+		// minimum accumulator, whose signed 64-bit negation would overflow.
+		d.var = static_cast<TReg56::MyType>(uint64_t(0) - value);
 		aluMask(d);
 
 		sr_z_update(d);
-	//	TODO: how to update v? test in sim		sr_v_update(d);
+		sr_toggle(CCR_V, overflow);
 		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
 	}
