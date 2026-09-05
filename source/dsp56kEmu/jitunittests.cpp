@@ -1,5 +1,7 @@
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <vector>
 #include "assembler.h"
 #include "jitdspregpool.h"
 #include "jitunittests.h"
@@ -68,6 +70,83 @@ namespace dsp56k
 		parallelMoveXY();
 		boundedDispatch();
 		recompileActiveLoops();
+		conditionalTransferWithDeferredFlags();
+		temporaryRegisterExhaustion();
+	}
+
+	void JitUnittests::temporaryRegisterExhaustion()
+	{
+		runTest([&]()
+		{
+			auto& pool = block->gpPool();
+			std::vector<std::unique_ptr<RegGP>> held;
+			while(pool.available()) held.push_back(std::make_unique<RegGP>(*block));
+			for(const bool weak : {false, true})
+			{
+				bool rejected = false;
+				try { RegGP excess(*block, true, weak); }
+				catch(const std::runtime_error&) { rejected = true; }
+				verify(rejected);
+				verify(pool.available() == 0);
+			}
+			// Failed acquisitions must not damage the pool. Existing weak-register
+			// reclamation remains supported when a weak owner can be released.
+			held.pop_back();
+			RegGP weak(*block, true, true);
+			RegGP replacement(*block);
+			verify(!weak.isValid());
+			verify(replacement.isValid());
+			verify(pool.available() == 0);
+		}, []() {});
+	}
+
+	void JitUnittests::conditionalTransferWithDeferredFlags()
+	{
+		if constexpr(!g_useJIT) return;
+		const auto savedConfig = dsp.getJit().getConfig();
+		for(const unsigned cap : {1u, 32u})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(const bool normalized : {false, true})
+		for(const bool testNr : {false, true})
+		{
+			dsp.resetHW();
+			auto config = savedConfig;
+			config.maxInstructionsPerBlock = cap;
+			config.linkJitBlocks = false;
+			dsp.getJit().setConfig(config);
+			dsp.getJit().destroyAllBlocks();
+			emitToMemory("abs a", 0x100);
+			emitToMemory(testNr ? "tnr x0,b" : "tnn x0,b", 0x101);
+			emitToMemory("jmp (r0)", 0x102);
+			dsp.regs().r[0].var = 0x102;
+			dsp.setSR(scaling << 10);
+			// Public U/E definitions: a positive nonzero value whose two MSP
+			// bits are 01 is normalized in each selected scaling mode; 00 isn't.
+			const unsigned normalizationBit = scaling == 1 ? 47 : scaling == 2 ? 45 : 46;
+			const uint64_t input = uint64_t(1) << (normalizationBit - (normalized ? 0 : 1));
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+			dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x11223344556677ull)));
+			dsp.x0(0x654321);
+			dsp.setPC(0x100);
+			dsp.getJit().checkModeChange();
+			unsigned dispatches = 0;
+			while(dsp.getPC().var != 0x102 && dispatches < 3)
+			{
+				dsp.execJit();
+				++dispatches;
+			}
+			if(dispatches != (cap == 1 ? 2u : 1u))
+				std::cout << "Conditional dispatch cap " << cap << " scaling " << scaling
+					<< " normalized " << normalized << " testNr " << testNr
+					<< " dispatches " << dispatches << " PC " << dsp.getPC().var << '\n';
+			verify(dispatches == (cap == 1 ? 2u : 1u));
+			verify(dsp.getPC().var == 0x102);
+			verify(dsp.aluA() == input);
+			verify(dsp.x0() == 0x654321);
+			verify(dsp.aluB() == ((testNr == normalized) ? 0x654321000000ull : 0x11223344556677ull));
+		}
+		dsp.getJit().setConfig(savedConfig);
+		dsp.getJit().destroyAllBlocks();
 	}
 
 	JitUnittests::~JitUnittests()

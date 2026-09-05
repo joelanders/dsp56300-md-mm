@@ -82,6 +82,10 @@ namespace dsp56k
 			}
 		case CCCC_Normalized:								// NR			Normalized
 			{
+				// Tcc may already hold a transfer operand. Resolve the flags
+				// before reserving both condition temporaries: deferred U/E
+				// computation otherwise exceeds the four-register temp pool.
+				updateDirtyCCR(static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z));
 				// (SRB_Z + ((!SRB_U) | (!SRB_E))) == 1
 				const RegGP dst(m_block);
 				const RegGP r(m_block);
@@ -95,6 +99,7 @@ namespace dsp56k
 			}
 		case CCCC_NotNormalized:							// NN			Not normalized
 			{
+				updateDirtyCCR(static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z));
 				// (SRB_Z + ((!SRB_U) | !SRB_E)) == 0
 				const RegGP dst(m_block);
 				const RegGP r(m_block);

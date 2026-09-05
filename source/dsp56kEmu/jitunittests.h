@@ -76,6 +76,8 @@ namespace dsp56k
 		void parallelMoveXY();
 		void boundedDispatch();
 		void recompileActiveLoops();
+		void conditionalTransferWithDeferredFlags();
+		void temporaryRegisterExhaustion();
 
 		void emit(TWord _opA, TWord _opB = 0, TWord _pc = 0) override;
 		void execStep() override { dsp.execJit(); }
