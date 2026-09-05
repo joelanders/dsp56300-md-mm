@@ -46,70 +46,6 @@ namespace dsp56k
 
 	Jumptable g_jumptable;
 
-	// Optional, host-selected correction for nominal-rate frame conversion.
-	// The state qualification keeps the generic DSP path unchanged when disabled.
-	void dspMmCleanGndSinStep(DSP* _dsp) noexcept
-	{
-		auto& state = _dsp->m_mmCleanGndSinState;
-
-		const auto pc = _dsp->getPC().toWord();
-		const auto& r = _dsp->regs();
-		const auto word = [](const auto& _v)
-		{
-			return static_cast<TWord>(_v.var) & 0xffffff;
-		};
-		auto& mem = _dsp->memory();
-
-		if(pc == 0x973)
-		{
-			const auto voiceBase = word(r.r[6]);
-			const bool validVoiceBase = voiceBase >= 0x500 && voiceBase <= 0x700 &&
-				((voiceBase - 0x500) & 0xff) == 0;
-			const auto voiceIndex = validVoiceBase ? (voiceBase - 0x500) >> 8 : 0xffffff;
-			const auto sampleRateControl = validVoiceBase
-				? mem.get(MemArea_Y, voiceBase + 0x12) & 0xffffff : 0xffffff;
-			const auto machineProgram = validVoiceBase
-				? mem.get(MemArea_Y, 0x120 + voiceIndex) & 0xffffff : 0xffffff;
-			const auto pitch = validVoiceBase
-				? mem.get(MemArea_X, voiceBase + 0x01) & 0xffffff : 0;
-			// Match the nominal converter setting while excluding deliberate
-			// sample-rate reduction.
-			const int64_t nominalUnrounded = static_cast<int64_t>(pitch) * 96 - 0x7fe0;
-			const auto nominalRatio = nominalUnrounded > 0
-				? static_cast<TWord>(((nominalUnrounded + 0x2000) / 0x4000) * 0x4000)
-				: 0;
-			const auto ratioDelta = sampleRateControl > nominalRatio
-				? sampleRateControl - nominalRatio : nominalRatio - sampleRateControl;
-			state.pending = false;
-			// Apply only to the qualified nominal-rate second pass.
-			if(word(r.r[2]) != 0x00000f || word(r.r[3]) != 0x00000f ||
-				word(r.r[4]) != 0x000091 || machineProgram != 0x000001 ||
-				ratioDelta > 0x200)
-				return;
-
-			bool nonzero = false;
-			for(TWord i = 0; i < 16; ++i)
-			{
-				state.lane0[i] = mem.get(MemArea_X, 0x000001 + i) & 0xffffff;
-				state.lane1[i] = mem.get(MemArea_X, 0x000012 + i) & 0xffffff;
-				nonzero |= state.lane0[i] != 0 || state.lane1[i] != 0;
-			}
-			state.pending = nonzero;
-			return;
-		}
-
-		// Accept both dispatcher boundaries used by the supported execution modes.
-		if((pc != 0x3a9 && pc != 0x979) || !state.pending)
-			return;
-
-		for(TWord i = 0; i < 16; ++i)
-		{
-			mem.set(MemArea_X, i, state.lane0[i]);
-			mem.set(MemArea_X, 0x10 + i, state.lane1[i]);
-		}
-		state.pending = false;
-	}
-
 	void dspExecDefaultPreventInterrupt(DSP* _dsp) noexcept
 	{
 		_dsp->execDefaultPreventInterrupt();
@@ -222,7 +158,6 @@ namespace dsp56k
 		
 		m_instructions = 0;
 		m_cycles = 0;
-		m_mmCleanGndSinState = {};
 		m_jit.resetHW();
 	}
 
@@ -543,7 +478,6 @@ namespace dsp56k
 		perif[0]->reset();
 		if(perif[1] != perif[0])
 			perif[1]->reset();
-		m_mmCleanGndSinState = {};
 	}
 
 	void DSP::jsr(const TReg24& _val)
