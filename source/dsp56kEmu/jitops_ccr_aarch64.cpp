@@ -142,6 +142,9 @@ namespace dsp56k
 			// const auto offset = sr_val_noCache(SRB_S0) - sr_val_noCache(SRB_S1);
 			ShiftReg shift(m_block);
 			sr_getBitValue(shift, SRB_S0);
+			// Build the complete nonnegative shift before touching the operand.
+			// Shifting by 46 first loses bit 45 in scale-up mode (S0-S1=-1).
+			m_asm.add(shift.get(), shift.get(), asmjit::Imm(46 + g_aluBitOffset));
 			{
 				const RegGP s1(m_block);
 				sr_getBitValue(s1, SRB_S1);
@@ -149,8 +152,7 @@ namespace dsp56k
 				m_asm.sub(shift.get(), s1.get());
 			}
 			const RegGP r(m_block);
-			m_asm.lsr(r, _alu, asmjit::Imm(46 + g_aluBitOffset));
-			m_asm.shr(r, shift.get());	// FIXME: how can this work? shift might be negative if SRB_S1 is one but SRB_S0 is zero
+			m_asm.lsr(r, _alu, shift.get());
 
 			shift.release();
 

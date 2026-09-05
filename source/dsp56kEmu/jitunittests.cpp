@@ -35,6 +35,7 @@ namespace dsp56k
 		runTest(&JitUnittests::signextend_build, &JitUnittests::signextend_verify);
 
 		runTest(&JitUnittests::ccr_u_build, &JitUnittests::ccr_u_verify);
+		runtimeUnnormalizedFlag();
 		runTest(&JitUnittests::ccr_e_build, &JitUnittests::ccr_e_verify);
 		runTest(&JitUnittests::ccr_n_build, &JitUnittests::ccr_n_verify);
 		runTest(&JitUnittests::ccr_s_build, &JitUnittests::ccr_s_verify);
@@ -72,6 +73,37 @@ namespace dsp56k
 		recompileActiveLoops();
 		conditionalTransferWithDeferredFlags();
 		temporaryRegisterExhaustion();
+	}
+
+	void JitUnittests::runtimeUnnormalizedFlag()
+	{
+		// Exercise the runtime-SR path used when a deferred flag is resolved
+		// without a compile-time mode. Cover all patterns of bits 48..45.
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(uint64_t bits = 0; bits < 16; ++bits)
+		{
+			const uint64_t input = bits << 45;
+			const unsigned lowBit = scaling == 1 ? 47 : scaling == 2 ? 45 : 46;
+			const auto pair = (input >> lowBit) & 3;
+			const bool expectedU = pair == 0 || pair == 3;
+			runTest([&]()
+			{
+				dsp.setSR((scaling << 10) | (expectedU ? 0u : 0x10u));
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+				emit("tst a");
+				// runTest flushes deferred flags after this builder returns.
+				verify(block->getMode() == nullptr);
+			}, [&]()
+			{
+				if(dsp.sr_val(CCRB_U) != expectedU)
+					LOG("Runtime U scaling=" << scaling << " bits=" << bits
+						<< " U=" << dsp.sr_val(CCRB_U) << " expected=" << expectedU);
+				verify(dsp.sr_val(CCRB_U) == expectedU);
+				verify(dsp.aluA() == input);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+			});
+		}
+		dsp.setSR(0);
 	}
 
 	void JitUnittests::temporaryRegisterExhaustion()

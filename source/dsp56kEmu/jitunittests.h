@@ -31,6 +31,7 @@ namespace dsp56k
 
 		void ccr_u_build();
 		void ccr_u_verify();
+		void runtimeUnnormalizedFlag();
 
 		void ccr_e_build();
 		void ccr_e_verify();
