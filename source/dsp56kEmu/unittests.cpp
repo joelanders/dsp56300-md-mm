@@ -2293,6 +2293,29 @@ namespace dsp56k
 
 	void UnitTests::neg()
 	{
+		// NEG preserves C; V describes this operation, and L latches V.
+		// Only negating the most negative 56-bit value overflows.
+		for(const uint64_t value : {0ull, 1ull, 0x00ffffffffffffffull,
+			0x007fffffffffffffull, 0x0080000000000000ull})
+		for(const unsigned initial : {0u, unsigned(CCR_C | CCR_V), unsigned(CCR_L)})
+		for(const bool ab : {false, true})
+		{
+			const bool overflow = value == 0x0080000000000000ull;
+			runTest([&]()
+			{
+				dsp.regs().sr.var = initial;
+				dsp.setALU(ab, TReg56(value));
+				emit(ab ? "neg b" : "neg a");
+			}, [&]()
+			{
+				verify((ab ? dsp.aluB().var : dsp.aluA().var) ==
+					((0ull - value) & 0x00ffffffffffffffull));
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == (overflow || (initial & CCR_L)));
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == static_cast<bool>(initial & CCR_C));
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(1)));
