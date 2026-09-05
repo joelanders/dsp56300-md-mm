@@ -1,4 +1,6 @@
 #include <iostream>
+#include <memory>
+#include "assembler.h"
 #include "jitdspregpool.h"
 #include "jitunittests.h"
 
@@ -65,6 +67,7 @@ namespace dsp56k
 
 		parallelMoveXY();
 		boundedDispatch();
+		recompileActiveLoops();
 	}
 
 	JitUnittests::~JitUnittests()
@@ -187,6 +190,75 @@ namespace dsp56k
 	{
 		for(size_t i=0; i<_count; ++i)
 			block->asm_().nop();
+	}
+
+	void JitUnittests::recompileActiveLoops()
+	{
+		if constexpr(!g_useJIT) return;
+		struct Fixture
+		{
+			DefaultMemoryValidator validator;
+			PeripheralsNop x, y;
+			Memory memory{validator, 0x10000, 0x10000, 0x8000};
+			DSP cpu{memory, &x, &y};
+		};
+		for(const bool nested : {false, true})
+		for(const bool recompile : {false, true})
+		{
+			auto fixture = std::make_unique<Fixture>();
+			auto& cpu = fixture->cpu;
+			auto config = cpu.getJit().getConfig();
+			config.maxInstructionsPerBlock = 1;
+			config.maxDoIterations = 1;
+			config.linkJitBlocks = false;
+			cpu.getJit().setConfig(config);
+			Assembler assembler;
+			TWord pc = 0x100;
+			const auto emit = [&](const char* text)
+			{
+				const auto code = assembler.assemble(text);
+				verify(code.success());
+				for(unsigned i = 0; i < code.wordCount; ++i) cpu.memWriteP(pc++, code.word[i]);
+			};
+			if(nested) { emit("do #$2,>$108"); emit("do #$3,>$106"); }
+			else emit("do #$5,>$104");
+			emit("add b,a"); emit("nop");
+			if(nested) { emit("nop"); emit("nop"); }
+			emit("nop");
+			cpu.regs().sr.var = 0;
+			cpu.regs().lc.var = 0x321;
+			cpu.regs().a.var = 0;
+			cpu.regs().b.var = aluTestValue(0x1000000);
+			cpu.setPC(0x100);
+			const auto pausePc = nested ? 0x105u : 0x103u;
+			const auto endPc = nested ? 0x108u : 0x104u;
+			for(unsigned steps = 0; steps < 10 && cpu.getPC().var != pausePc; ++steps)
+				cpu.execUntilCycles(cpu.getCycles() + 1);
+			verify(cpu.getPC().var == pausePc);
+			verify(cpu.regs().a.var == aluTestValue(0x1000000));
+			verify(cpu.regs().lc.var == (nested ? 3u : 5u));
+			if(recompile) cpu.getJit().recompileAllBlocks();
+			for(unsigned steps = 0; steps < 100 && cpu.getPC().var != endPc; ++steps)
+				cpu.execUntilCycles(cpu.getCycles() + 1);
+			verify(cpu.getPC().var == endPc);
+			verify(cpu.regs().a.var == aluTestValue(nested ? 0x6000000 : 0x5000000));
+			verify(cpu.regs().lc.var == 0x321);
+			verify(!cpu.sr_test_noCache(SR_LF));
+			if(recompile)
+			{
+				// The outer setup has not executed since recompilation: its
+				// retained metadata has no owning compiled setup block.
+				verify(cpu.getJit().getLoops().count(0x100) == 1);
+				if(nested)
+				{
+					cpu.memWriteP(0x101, 0x10b); // change the outer DO endpoint
+					verify(cpu.getJit().getLoops().count(0x100) == 0);
+				}
+				cpu.getJit().destroyAllBlocks();
+				verify(cpu.getJit().getLoops().empty());
+				verify(cpu.getJit().getLoopEnds().empty());
+			}
+		}
 	}
 
 	void JitUnittests::boundedDispatch()
