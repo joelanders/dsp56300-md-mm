@@ -94,6 +94,7 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 		
 		aluRestoreFrom64(alu);						// correction for the pre-shift, and keeps the low byte clear
 
