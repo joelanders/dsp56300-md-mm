@@ -868,6 +868,38 @@ namespace dsp56k
 
 	void UnitTests::asr_D()
 	{
+		// DSP56300FM ASR: C receives the last discarded bit, or zero for
+		// a zero count. Use an unsigned 56-bit oracle, not another backend.
+		for(const uint64_t value : {0x0000000000000001ull, 0x00ffffffffffffffull,
+			0x0080000000000000ull, 0x0055aa55aa55aa55ull})
+		for(const unsigned count : {0u, 1u, 7u, 8u, 16u, 24u, 55u})
+		for(const bool destinationB : {false, true})
+		for(const bool registerCount : {false, true})
+		{
+			constexpr uint64_t mask = 0x00ffffffffffffffull;
+			auto expected = value >> count;
+			if(count && (value & (1ull << 55)))
+				expected |= mask ^ (mask >> count);
+			const bool carry = count && ((value >> (count - 1)) & 1);
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(value));
+				dsp.x0(count);
+				const auto instruction = std::string("asr ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) +
+					",a," + (destinationB ? "b" : "a");
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB().var : dsp.aluA().var) == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(!dsp.sr_test(CCR_V));
+				if(destinationB)
+					verify(dsp.aluA().var == value);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x000599f2204000)));
