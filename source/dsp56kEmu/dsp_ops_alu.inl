@@ -1117,7 +1117,8 @@ namespace dsp56k
 		const auto result = ((source & 0x0fff) << 12) | (oldD1 & 0x0fff);
 		aluField24(destination, 24, TReg24(static_cast<int>(result)));
 
-		resetCCRCache();
+		// Preserve E/U from preceding arithmetic before replacing N/Z/V.
+		updateDirtyCCR();
 		sr_toggle(CCR_N, (result & 0x800000) != 0);
 		sr_toggle(CCR_Z, result == 0);
 		sr_clear(CCR_V);

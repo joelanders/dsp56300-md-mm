@@ -1475,6 +1475,53 @@ namespace dsp56k
 
 	void UnitTests::merge()
 	{
+		// Distinct halves catch reversed packing; all legal sources and both
+		// destinations also exercise source/destination aliasing.
+		for(const auto* source : {"x0", "x1", "y0", "y1", "a1", "b1"})
+			for(const bool ab : {false, true})
+			{
+				const std::string instruction = std::string("merge ") + source + (ab ? ",b" : ",a");
+				const bool alias = std::string(source) == (ab ? "b1" : "a1");
+				runTest([&]()
+				{
+					dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x12abc123654321)));
+					dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x12abc123654321)));
+					dsp.setALU(ab, TReg56(static_cast<TReg56::MyType>(0x12abc456654321)));
+					dsp.x0(0xabc123); dsp.x1(0xabc123);
+					dsp.y0(0xabc123); dsp.y1(0xabc123);
+					dsp.setSR(0xff);
+					emit(instruction.c_str());
+				}, [&]()
+				{
+					verify((ab ? dsp.aluB() : dsp.aluA()).var
+						== (alias ? 0x12456456654321ull : 0x12123456654321ull));
+					verify((ab ? dsp.aluA() : dsp.aluB()).var == 0x12abc123654321ull);
+					verify(dsp.x0().var == 0xabc123 && dsp.x1().var == 0xabc123);
+					verify(dsp.y0().var == 0xabc123 && dsp.y1().var == 0xabc123);
+					verify((dsp.getSR().var & 0xff) == (0xff & ~(CCR_N | CCR_Z | CCR_V)));
+				});
+			}
+
+		// ADD leaves E/U lazy in the interpreter. MERGE must materialize them,
+		// even when it writes the same accumulator that produced those flags.
+		for(const bool extended : {false, true})
+			runTest([&]()
+			{
+				dsp.setSR(extended ? CCR_U : CCR_E);
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(
+					extended ? 0x01400000000000ull : 0)));
+				dsp.x0(0);
+				emit("add x0,a");
+				emit("merge x0,a");
+			}, [&]()
+			{
+				verify(bool(dsp.sr_test(CCR_E)) == extended);
+				verify(bool(dsp.sr_test(CCR_U)) == !extended);
+				verify(!dsp.sr_test(CCR_N));
+				verify(dsp.sr_test(CCR_Z));
+				verify(!dsp.sr_test(CCR_V));
+			});
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x00123800111111)));

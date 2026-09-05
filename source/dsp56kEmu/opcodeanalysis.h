@@ -888,7 +888,7 @@ namespace dsp56k
 			break;
 		case Merge:
 			readf(Field_SSS);
-			writef(Field_D);
+			readwritef(Field_D);
 			break;
 		case Move_xx:
 			writef(Field_ddddd);
