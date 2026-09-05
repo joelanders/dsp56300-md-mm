@@ -757,6 +757,7 @@ namespace dsp56k
 		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
 
 		m_asm.or_(r.get(), r32(prevCarry));						// Set if bits 47�24 of the result are 0
+		m_asm.and_(r.get(), asmjit::Imm(0xffffff));				// Discard shifted-out bit before testing Z
 		ccr_update_ifZero(CCRB_Z);
 		setALU1(D, r);
 
@@ -782,6 +783,7 @@ namespace dsp56k
 		m_asm.or_(r.get(), r32(prevCarry));						// inject old carry into bit 47 position
 
 		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
+		m_asm.test_(r.get());									// N update clobbers native flags; test the result for Z
 		ccr_update_ifZero(CCRB_Z);								// Set if bits 47-24 of the result are 0
 		setALU1(D, r);
 

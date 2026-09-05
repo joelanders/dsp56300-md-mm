@@ -709,6 +709,7 @@ namespace dsp56k
 		ccr_n_update_by23(r64(r));						// Set if bit 47 of the result is set
 
 		m_asm.orr(r.get(), r.get(), r32(prevCarry.get()));
+		m_asm.and_(r.get(), asmjit::Imm(0xffffff));			// Discard shifted-out bit before testing Z
 		m_asm.test_(r32(r));
 		ccr_update_ifZero(CCRB_Z);							// Set if bits 47�24 of the result are 0
 

@@ -54,6 +54,7 @@ namespace dsp56k
 	{
 		conditionCodes();
 		partialFlagWrites();
+		rotateFlags();
 		aguModulo();
 		aguMultiWrapModulo();
 		aguBitreverse();
@@ -1303,6 +1304,89 @@ namespace dsp56k
 				verify(dsp.x0() == x);
 			});
 		}
+	}
+
+	void UnitTests::rotateFlags()
+	{
+		// DSP56300FM 13-165/166: rotate only the 24-bit MSP through C.
+		// EXP/LSP and E/U are preserved; N/Z describe the MSP, and V=0.
+		for(const bool right : {false, true})
+		for(const bool destinationB : {false, true})
+		for(const uint64_t extension : {0u, 1u, 0x80u, 0xffu})
+		for(const TWord msp : {0u, 1u, 0x400000u, 0x7fffffu, 0x800000u, 0xffffffu})
+		for(const TWord carry : {0u, 1u})
+		for(const TWord preserved : {0u, 0x50u, 0xa0u, 0xf0u})
+		{
+			const uint64_t input = (extension << 48) | (uint64_t(msp) << 24) | 0x123456;
+			const TWord result = right ? (msp >> 1) | (carry << 23)
+				: ((msp << 1) | carry) & 0xffffff;
+			const TWord outCarry = right ? msp & 1u : msp >> 23;
+			const uint64_t expected = (input & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			runTest([&]()
+			{
+				dsp.setSR(preserved | 0x0e | carry); // stale N/Z/V must be replaced
+				dsp.setALU(destinationB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!destinationB, TReg56(0x123456789abcdell));
+				emit(right ? (destinationB ? "ror b" : "ror a") : (destinationB ? "rol b" : "rol a"));
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == 0x123456789abcde);
+				// Disabled standard S computation is outside this regression.
+				const auto expectedCcr = (preserved & 0x7f) | ((result & 0x800000) ? 8u : 0u)
+					| (!result ? 4u : 0u) | outCarry;
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Rotate flags right=" << right << " B=" << destinationB << std::hex
+						<< " input=" << input << " carry=" << carry << " preserved=" << preserved
+						<< " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+			});
+		}
+
+		// Preserve E/U from an arithmetic result, with no intervening SR read,
+		// including when the rotate modifies the other accumulator.
+		for(const bool right : {false, true})
+		for(const bool arithmeticB : {false, true})
+		for(const bool separate : {false, true})
+		for(const uint64_t input : {0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x01400000123456ull : shifted;
+			const TWord msp = (before >> 24) & 0xffffff;
+			const TWord carry = input & 1;
+			const TWord result = right ? (msp >> 1) | (carry << 23)
+				: ((msp << 1) | carry) & 0xffffff;
+			const uint64_t expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const unsigned highFraction = scaling == 1 ? 48 : scaling == 2 ? 46 : 47;
+			const auto integer = shifted >> highFraction;
+			const bool extension = integer != 0 && integer != ((uint64_t(1) << (56 - highFraction)) - 1);
+			const bool unnormalized = ((shifted >> highFraction) & 1) == ((shifted >> (highFraction - 1)) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u)
+				| (right ? msp & 1u : msp >> 23);
+			const bool destinationB = arithmeticB != separate;
+			runTest([&]()
+			{
+				dsp.setSR(scaling << 10);
+				dsp.setALU(arithmeticB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!arithmeticB, TReg56(0x01400000123456ll));
+				emit(arithmeticB ? "asr b" : "asr a");
+				emit(right ? (destinationB ? "ror b" : "ror a") : (destinationB ? "rol b" : "rol a"));
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == (separate ? shifted : 0x01400000123456ull));
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Rotate sequence right=" << right << " arithmeticB=" << arithmeticB
+						<< " separate=" << separate << " scaling=" << scaling << std::hex
+						<< " input=" << input << " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+			});
+		}
+		dsp.setSR(0);
 	}
 
 	void UnitTests::clr()

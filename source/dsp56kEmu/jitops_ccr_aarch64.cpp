@@ -260,9 +260,8 @@ namespace dsp56k
 
 	void JitOps::ccr_n_update_by23(const JitReg64& _alu)
 	{
-		// Negative
-		// Set if the MSB of the result is set; otherwise, this bit is cleared.
-		copyBitToCCR(_alu, 23 + g_aluBitOffset, CCRB_N);
+		// getALU1 returns a right-aligned 24-bit value, not an accumulator.
+		copyBitToCCR(_alu, 23, CCRB_N);
 	}
 
 	void JitOps::ccr_s_update(const JitReg64& _alu)

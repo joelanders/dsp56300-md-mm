@@ -1266,22 +1266,18 @@ namespace dsp56k
 
 		auto& d = D ? reg.b.var : reg.a.var;
 
-		const auto c = bitvalue<uint64_t,24 + g_aluShift>(d);	// bit 24 = LSB of a1/b1
-		auto shifted = d;
-		reinterpret_cast<uint64_t&>(shifted) >>= (24 + g_aluShift);	// isolate a1/b1
-		const auto oldBit0 = shifted & 1;
-		shifted >>= 1;									// shift right
-		shifted |= static_cast<TInt64>(sr_val(CCRB_C)) << 23;	// inject old carry into bit 23 (MSB position)
-		shifted &= 0xffffff;
-		shifted <<= (24 + g_aluShift);					// move back
+		// Mask before shifting so EXP bit 0 cannot enter the 24-bit MSP.
+		constexpr uint64_t mspMask = uint64_t(0xffffff) << (24 + g_aluShift);
+		const TWord msp = (static_cast<uint64_t>(d) >> (24 + g_aluShift)) & 0xffffff;
+		const TWord result = (msp >> 1) | (static_cast<TWord>(sr_val(CCRB_C)) << 23);
 
-		d &= static_cast<TInt64>(0xff000000ffffff00ull);
-		d |= shifted;
+		d &= static_cast<TInt64>(~mspMask);
+		d |= static_cast<TInt64>(uint64_t(result) << (24 + g_aluShift));
 
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(shifted));
-		sr_toggle(CCR_Z, shifted == 0);
+		sr_toggle(CCRB_N, bitvalue<TWord, 23>(result));
+		sr_toggle(CCR_Z, result == 0);
 		sr_clear(CCR_V);
-		sr_toggle(CCRB_C, static_cast<Bit>(oldBit0));
+		sr_toggle(CCRB_C, static_cast<Bit>(msp & 1));
 	}
 	inline void DSP::op_Sbc(const TWord op)
 	{
