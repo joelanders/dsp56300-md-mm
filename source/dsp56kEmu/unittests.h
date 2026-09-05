@@ -43,6 +43,7 @@ namespace  dsp56k
 		void conditionCodes();
 		void partialFlagWrites();
 		void rotateFlags();
+		void logicalShiftFlags();
 		void aguModulo();
 		void aguMultiWrapModulo();
 		void aguBitreverse();

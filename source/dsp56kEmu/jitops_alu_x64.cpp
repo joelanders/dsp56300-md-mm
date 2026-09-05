@@ -145,22 +145,25 @@ namespace dsp56k
 
 	void JitOps::alu_lsl(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		// Every replaced flag must be included, including deferred Z.
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_C | CCR_V));
 		DspValue d(m_block);
 		getALU1(d, ab);
+		// Keep the last shifted-out bit at position 24 instead of aligning
+		// it to native CF. Adding 8 to a 32-bit shift count wraps at count 24,
+		// and using that same offset with a 64-bit shift reads the wrong carry.
 		if(_shiftAmount.isImm24())
 		{
-			m_asm.shl(r32(d.get()), _shiftAmount.imm24() + 8); // + 8 to use native carry flag
+			m_asm.shl(r64(d.get()), _shiftAmount.imm24());
 		}
 		else
 		{
 			ShiftReg s(m_block);
 			m_asm.mov(r32(s), r32(_shiftAmount.get()));
-			m_asm.add(r32(s), asmjit::Imm(8));	// + 8 to use native carry flag
 			m_asm.shl(r64(d.get()), s.get().r8());
 		}
-		ccr_update_ifCarry(CCRB_C);
-		m_asm.shr(r32(d.get()), 8);				// revert shift by 8
+		copyBitToCCR(d.get(), 24, CCRB_C); // also zero for a zero shift count
+		m_asm.and_(r32(d.get()), asmjit::Imm(0xffffff));
 		ccr_update_ifZero(CCRB_Z);
 		copyBitToCCR(d.get(), 23, CCRB_N);
 //		ccr_clear(CCR_V);	already cleared above
@@ -169,7 +172,7 @@ namespace dsp56k
 
 	void JitOps::alu_lsr(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_C | CCR_V));
 		DspValue d(m_block);
 		getALU1(d, ab);
 		if(_shiftAmount.isImm24())

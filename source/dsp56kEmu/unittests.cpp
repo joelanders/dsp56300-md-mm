@@ -55,6 +55,7 @@ namespace dsp56k
 		conditionCodes();
 		partialFlagWrites();
 		rotateFlags();
+		logicalShiftFlags();
 		aguModulo();
 		aguMultiWrapModulo();
 		aguBitreverse();
@@ -1384,6 +1385,116 @@ namespace dsp56k
 						<< " input=" << input << " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
 				verify((dsp.getSR().var & 0x7f) == expectedCcr);
 				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+			});
+		}
+		dsp.setSR(0);
+	}
+
+	void UnitTests::logicalShiftFlags()
+	{
+		// DSP56300FM 13-93..96: shift only the MSP, preserve EXP/LSP/E/U,
+		// replace N/Z/C, and clear V. A zero count explicitly clears C.
+		// Use repeated one-bit operations as an independent oracle, avoiding
+		// the host's variable-count masking and native carry conventions.
+		const auto shift = [](TWord msp, const unsigned count, const bool right, TWord& carry)
+		{
+			carry = 0;
+			for(unsigned i = 0; i < count; ++i)
+			{
+				carry = right ? msp & 1u : msp >> 23;
+				msp = right ? msp >> 1 : (msp << 1) & 0xffffff;
+			}
+			return msp;
+		};
+		const char* sources[] = {"", "x0", "x1", "y0", "y1", "a1", "b1", ""};
+		for(const bool right : {false, true})
+		for(const bool destinationB : {false, true})
+		for(unsigned count = 0; count <= 24; ++count)
+		for(unsigned form = 0; form < 8; ++form)
+		for(const TWord msp : {0u, 1u, 0x400000u, 0x7fffffu, 0x800000u, 0xffffffu})
+		for(const TWord initialCcr : {0u, 0xffu})
+		{
+			if(form == 7 && count != 1)
+				continue;
+			uint64_t input[2] = {0x8155aaaa123456ull, 0x7fabcdef654321ull};
+			input[destinationB] = (input[destinationB] & 0xff000000ffffffull) | (uint64_t(msp) << 24);
+			if(form == 5 || form == 6)
+				input[form - 5] = (input[form - 5] & 0xff000000ffffffull) | (uint64_t(count) << 24);
+			TWord controls[] = {2, 3, 5, 7};
+			if(form >= 1 && form <= 4)
+				controls[form - 1] = count;
+			TWord carry;
+			const auto result = shift((input[destinationB] >> 24) & 0xffffff, count, right, carry);
+			const auto expected = (input[destinationB] & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const auto expectedCcr = (initialCcr & 0x70) | ((result & 0x800000) ? 8u : 0u)
+				| (!result ? 4u : 0u) | carry;
+			const std::string operation = std::string(right ? "lsr " : "lsl ")
+				+ (form == 0 ? "#" + std::to_string(count) + "," : form == 7 ? "" : std::string(sources[form]) + ",")
+				+ (destinationB ? "b" : "a");
+			runTest([&]()
+			{
+				dsp.setSR(initialCcr);
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input[0])));
+				dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(input[1])));
+				dsp.x0(controls[0]); dsp.x1(controls[1]); dsp.y0(controls[2]); dsp.y1(controls[3]);
+				emit(operation.c_str());
+			}, [&]()
+			{
+				if((destinationB ? dsp.aluB() : dsp.aluA()) != expected || (dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Logical shift " << operation << " count=" << count << std::hex << " input=" << input[destinationB]
+						<< " initialCCR=" << initialCcr << " SR=" << dsp.getSR().var << " expectedCCR=" << expectedCcr);
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == input[!destinationB]);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr); // standard S behavior is separately disabled
+				verify(dsp.x0() == controls[0] && dsp.x1() == controls[1]
+					&& dsp.y0() == controls[2] && dsp.y1() == controls[3]);
+			});
+		}
+
+		// Retire replaced lazy flags while preserving arithmetic E/U, without
+		// reading SR between instructions, even for separate accumulators.
+		for(const bool right : {false, true})
+		for(const bool arithmeticB : {false, true})
+		for(const bool separate : {false, true})
+		for(const uint64_t input : {0ull, 0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(const unsigned count : {0u, 1u, 24u})
+		for(const bool registerCount : {false, true})
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x01400000123456ull : shifted;
+			TWord carry;
+			const auto result = shift((before >> 24) & 0xffffff, count, right, carry);
+			const auto expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const unsigned highFraction = scaling == 1 ? 48 : scaling == 2 ? 46 : 47;
+			const auto integer = shifted >> highFraction;
+			const bool extension = integer != 0 && integer != ((uint64_t(1) << (56 - highFraction)) - 1);
+			const bool unnormalized = ((shifted >> highFraction) & 1) == ((shifted >> (highFraction - 1)) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u) | carry;
+			const bool destinationB = arithmeticB != separate;
+			const std::string operation = std::string(right ? "lsr " : "lsl ")
+				+ (registerCount ? "x0," : "#" + std::to_string(count) + ",") + (destinationB ? "b" : "a");
+			runTest([&]()
+			{
+				dsp.setSR(scaling << 10);
+				dsp.setALU(arithmeticB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!arithmeticB, TReg56(0x01400000123456ll));
+				dsp.x0(count);
+				emit(arithmeticB ? "asr b" : "asr a");
+				emit(operation.c_str());
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == (separate ? shifted : 0x01400000123456ull));
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Logical shift sequence " << operation << " arithmeticB=" << arithmeticB
+						<< " separate=" << separate << " scaling=" << scaling << std::hex
+						<< " input=" << input << " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+				verify(dsp.x0() == count);
 			});
 		}
 		dsp.setSR(0);
