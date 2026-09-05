@@ -802,6 +802,33 @@ namespace dsp56k
 		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
+	void JitOps::op_Merge(TWord op)
+	{
+		const auto sss = getFieldValue<Merge, Field_SSS>(op);
+		const bool ab = getFieldValue<Merge, Field_D>(op);
+
+		DspValue source(m_block);
+		DspValue result(m_block);
+		decode_sss_read(source, sss);
+		getALU1(result, ab);
+
+		// DSP56300FM 13-108: D1 = {S[11:0], D1[11:0]}.
+		m_asm.and_(r32(source), asmjit::Imm(0x0fff));
+		m_asm.and_(r32(result), asmjit::Imm(0x0fff));
+		m_asm.shl(r32(source), asmjit::Imm(12));
+		m_asm.or_(r32(result), r32(source));
+		setALU1(ab, result);
+
+		copyBitToCCR(r64(result), 23, CCRB_N);
+#ifdef HAVE_ARM64
+		m_asm.test_(r32(result));
+#else
+		m_asm.test(r32(result), asmjit::Imm(0xffffff));
+#endif
+		ccr_update_ifZero(CCRB_Z);
+		ccr_clear(CCR_V);
+	}
+
 	void JitOps::op_Eor_SD(TWord op)
 	{
 		const auto D = getFieldValue<Or_SD, Field_d>(op);

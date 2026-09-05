@@ -109,6 +109,7 @@ namespace dsp56k
 		mac_S();
 		max();
 		maxm();
+		merge();
 		mpy();
 		mpyr();
 		mpy_SD();
@@ -1469,6 +1470,37 @@ namespace dsp56k
 		}, [&]()
 		{
 			verify(dsp.aluA().var == 0x00055555555554);
+		});
+	}
+
+	void UnitTests::merge()
+	{
+		runTest([&]()
+		{
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x00123800111111)));
+			dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x12abc800654321)));
+			dsp.sr_set(CCR_V);
+			emit("merge a1,b");
+		}, [&]()
+		{
+			verify(dsp.aluA().var == 0x00123800111111);
+			verify(dsp.aluB().var == 0x12800800654321);
+			verify(dsp.sr_test(CCR_N));
+			verify(!dsp.sr_test(CCR_Z));
+			verify(!dsp.sr_test(CCR_V));
+		});
+
+		runTest([&]()
+		{
+			dsp.x0(0);
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x5a000000abcdef)));
+			emit("merge x0,a");
+		}, [&]()
+		{
+			verify(dsp.aluA().var == 0x5a000000abcdef);
+			verify(!dsp.sr_test(CCR_N));
+			verify(dsp.sr_test(CCR_Z));
+			verify(!dsp.sr_test(CCR_V));
 		});
 	}
 

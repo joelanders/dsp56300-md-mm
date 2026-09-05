@@ -97,6 +97,7 @@ namespace  dsp56k
 		void mac_S();
 		void max();
 		void maxm();
+		void merge();
 		void mpy();
 		void mpyr();
 		void mpy_SD();

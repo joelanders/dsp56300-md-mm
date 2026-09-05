@@ -1107,7 +1107,20 @@ namespace dsp56k
 	}
 	inline void DSP::op_Merge(const TWord op)
 	{
-		errNotImplemented("MERGE");		
+		const auto sss = getFieldValue<Merge, Field_SSS>(op);
+		const bool ab = getFieldValue<Merge, Field_D>(op);
+		const auto source = decode_sss_read<TWord>(sss);
+		TReg56& destination = ab ? reg.b : reg.a;
+		const auto oldD1 = aluField24(destination, 24).var;
+		// DSP56300FM 13-108: concatenate S[11:0] with D[35:24] into
+		// D[47:24], leaving the other accumulator fields unchanged.
+		const auto result = ((source & 0x0fff) << 12) | (oldD1 & 0x0fff);
+		aluField24(destination, 24, TReg24(static_cast<int>(result)));
+
+		resetCCRCache();
+		sr_toggle(CCR_N, (result & 0x800000) != 0);
+		sr_toggle(CCR_Z, result == 0);
+		sr_clear(CCR_V);
 	}
 	inline void DSP::op_Mpy_S1S2D(const TWord op)
 	{
