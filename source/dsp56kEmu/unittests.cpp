@@ -786,6 +786,38 @@ namespace dsp56k
 
 	void UnitTests::asl_D()
 	{
+		// Independent bit-by-bit ASL oracle (DSP56300FM 13-15).
+		for(const uint64_t input : {0ull, 1ull, 0x0080000000000000ull,
+			0x0040000000000000ull, 0x00ffffffffffffffull})
+		for(const unsigned count : {0u, 1u, 8u, 55u})
+		for(const bool registerCount : {false, true})
+		{
+			auto expected = input;
+			bool carry = false, overflow = false;
+			for(unsigned bit = 0; bit < count; ++bit)
+			{
+				carry = (expected >> 55) != 0;
+				expected = (expected << 1) & 0x00ffffffffffffffull;
+				overflow |= carry != static_cast<bool>(expected >> 55);
+			}
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(input));
+				dsp.x0(count);
+				const auto instruction = std::string("asl ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) + ",a,b";
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify(dsp.aluA().var == input);
+				verify(dsp.aluB().var == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == overflow);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xaaabcdef123456)));
