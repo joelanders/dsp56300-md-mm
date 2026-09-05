@@ -618,6 +618,8 @@ namespace dsp56k
 
 					incrementOther(false);
 				}
+				// DSR/DDR remain 24-bit after increment and signed DOR offsets.
+				_target &= 0xffffff;
 
 //				LOG("DMA" << m_index << " address change " << HEX(prev) << " => " << HEX(_target));
 			};
