@@ -457,6 +457,12 @@ namespace dsp56k
 		if(!m_transmitDataAlwaysEmpty && !m_dataTX.empty() && (!m_transmitDataBuffered || m_dataTX.full()))
 		{
 			m_dataTX.front() = _val;
+			// A replacement is a new production event too. Host bridges must
+			// observe it so the retained word cannot inherit an older timestamp.
+			if(m_callbackTx)
+				m_callbackTx();
+			if(m_callbackHostPumpWake)
+				m_callbackHostPumpWake();
 			return;
 		}
 
