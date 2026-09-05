@@ -181,6 +181,40 @@ namespace dsp56k
 
 	void UnitTests::conditionCodes()
 	{
+		// DSP56300FM tables 12-17/18. Test every software-writable CCR
+		// pattern, including Z=1 together with N!=V. The manual's '+' is OR,
+		// not addition or parity. Do not derive this oracle from a backend.
+		for(TWord ccr = 0; ccr < 256; ++ccr)
+		{
+			const bool c = ccr & 1, v = ccr & 2, z = ccr & 4, n = ccr & 8;
+			const bool u = ccr & 16, e = ccr & 32, l = ccr & 64;
+			const bool expected[] = {
+				!c, n == v, !z, !n, !z && (u || e), !e, !l, !z && (n == v),
+				c, n != v, z, n, z || (!u && !e), e, l, z || (n != v)
+			};
+			for(TWord cc = 0; cc < 16; ++cc)
+				runTest([&]()
+				{
+					dsp.setSR(ccr);
+					dsp.setALU(false, TReg56(0x0123456789abcdll));
+					dsp.setALU(true, TReg56(0xfedcba98765432ll));
+					dsp.regs().r[0].var = 0x123456;
+					dsp.regs().r[1].var = 0x654321;
+					emit(0x020801 | (cc << 12)); // Tcc R0,R1, condition encoding from table 12-18
+				}, [&]()
+				{
+					const auto result = expected[cc] ? 0x123456u : 0x654321u;
+					if(dsp.regs().r[1].var != result)
+						LOG("Condition truth table CCR=" << std::hex << ccr << " cc=" << cc
+							<< " R1=" << dsp.regs().r[1].var << " expected=" << result);
+					verify(dsp.regs().r[1].var == result);
+					verify(dsp.regs().r[0].var == 0x123456);
+					verify(dsp.aluA() == 0x0123456789abcdull && dsp.aluB() == 0xfedcba98765432ull);
+					verify(dsp.getSR().var == ccr);
+				});
+		}
+		dsp.setSR(0);
+
 		auto invert = [](ConditionCode _cc)
 		{
 			switch (_cc)
@@ -237,7 +271,7 @@ namespace dsp56k
 		run(+1, {CCCC_Plus, CCCC_GreaterEqual, CCCC_GreaterThan, CCCC_NotEqual, CCCC_CarryClear, CCCC_ExtensionClear});
 		run(-1, {CCCC_Minus, CCCC_LessEqual, CCCC_LessThan, CCCC_NotEqual, CCCC_CarryClear, CCCC_ExtensionClear});
 
-		run(0, {CCCC_Equal, CCCC_LessEqual, CCCC_GreaterEqual, CCCC_CarryClear, CCCC_ExtensionClear, CCCC_NotNormalized});
+		run(0, {CCCC_Equal, CCCC_LessEqual, CCCC_GreaterEqual, CCCC_CarryClear, CCCC_ExtensionClear, CCCC_Normalized});
 
 		run(0xff'ffffff'ffffff, {CCCC_Minus, CCCC_ExtensionClear});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_ExtensionClear});
@@ -246,7 +280,7 @@ namespace dsp56k
 		run(0x00'800000'000000, {CCCC_Plus, CCCC_ExtensionSet});
 
 		run(0x00'c00000'000000, {CCCC_Plus, CCCC_NotNormalized});
-		run(0x00'000000'000000, {CCCC_Plus, CCCC_NotNormalized});
+		run(0x00'000000'000000, {CCCC_Plus, CCCC_Normalized});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_Normalized});
 		run(0x00'400000'000000, {CCCC_Plus, CCCC_Normalized});
 

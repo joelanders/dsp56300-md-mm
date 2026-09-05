@@ -72,28 +72,36 @@ namespace dsp56k
 			ccrMaskTest(static_cast<CCRMask>(CCR_N | CCR_V));
 			return asmjit::x86::CondCode::kNP;
 		case CCCC_Normalized:										// NR			Normalized
-			{
-				// Z + (!U & !E) == 1
-				ccrMaskTest(static_cast<CCRMask>(CCR_Z | CCR_U | CCR_E));
-				return asmjit::x86::CondCode::kZero;
-			}
 		case CCCC_NotNormalized:									// NN			Not normalized
 			{
-				// Z + (!U & !E) == 0
-				ccrMaskTest(static_cast<CCRMask>(CCR_Z | CCR_U | CCR_E));
-				return asmjit::x86::CondCode::kNotZero;
+				// NR = Z || !(U || E); NN is its complement.
+				updateDirtyCCR(static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z));
+				const RegGP dst(m_block);
+				const RegGP r(m_block);
+				// ccr_getBitValue materializes only the low byte on x86-64.
+				ccr_getBitValue(dst, CCRB_U);
+				ccr_getBitValue(r, CCRB_E);
+				m_asm.or_(dst.get().r8(), r.get().r8());
+				m_asm.xor_(dst.get().r8(), asmjit::Imm(1));
+				ccr_getBitValue(r, CCRB_Z);
+				m_asm.or_(dst.get().r8(), r.get().r8());
+				return cccc == CCCC_Normalized ? asmjit::x86::CondCode::kNotZero : asmjit::x86::CondCode::kZero;
 			}
 		case CCCC_GreaterThan:										// GT			Greater than
-			{
-				// (SRB_Z + (SRB_N != SRB_V)) == 0
-				ccrMaskTest(static_cast<CCRMask>(CCR_Z | CCR_N | CCR_V));
-				return asmjit::x86::CondCode::kParityEven;
-			}
 		case CCCC_LessEqual:										// LE			Less than or equal
 			{
-				// (SRB_Z + (SRB_N != SRB_V)) == 1
-				ccrMaskTest(static_cast<CCRMask>(CCR_Z | CCR_N | CCR_V));
-				return asmjit::x86::CondCode::kParityOdd;
+				// LE = Z || (N != V); GT is its complement. Parity of Z/N/V
+				// would incorrectly cancel Z when N != V is also true.
+				updateDirtyCCR(static_cast<CCRMask>(CCR_N | CCR_V | CCR_Z));
+				const RegGP dst(m_block);
+				const RegGP r(m_block);
+				// Ignore the unspecified upper bits of the flag temporaries.
+				ccr_getBitValue(dst, CCRB_N);
+				ccr_getBitValue(r, CCRB_V);
+				m_asm.xor_(dst.get().r8(), r.get().r8());
+				ccr_getBitValue(r, CCRB_Z);
+				m_asm.or_(dst.get().r8(), r.get().r8());
+				return cccc == CCCC_GreaterThan ? asmjit::x86::CondCode::kZero : asmjit::x86::CondCode::kNotZero;
 			}
 		default:
 			assert(0 && "invalid CCCC value");

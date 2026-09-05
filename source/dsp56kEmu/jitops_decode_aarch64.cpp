@@ -81,53 +81,29 @@ namespace dsp56k
 				return asmjit::arm::CondCode::kNotZero;
 			}
 		case CCCC_Normalized:								// NR			Normalized
+		case CCCC_NotNormalized:							// NN			Not normalized
 			{
 				// Tcc may already hold a transfer operand. Resolve the flags
 				// before reserving both condition temporaries: deferred U/E
 				// computation otherwise exceeds the four-register temp pool.
 				updateDirtyCCR(static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z));
-				// (SRB_Z + ((!SRB_U) | (!SRB_E))) == 1
+				// NR = Z || !(U || E); NN is its complement.
 				const RegGP dst(m_block);
 				const RegGP r(m_block);
 				ccr_getBitValue(dst, CCRB_U);
 				ccr_getBitValue(r, CCRB_E);
 				m_asm.orr(dst, dst, r);
+				m_asm.eor(dst, dst, asmjit::Imm(1));
 				ccr_getBitValue(r, CCRB_Z);
 				m_asm.orr(dst, dst, r);
 				m_asm.tst(dst, dst);
-				return asmjit::arm::CondCode::kZero;
-			}
-		case CCCC_NotNormalized:							// NN			Not normalized
-			{
-				updateDirtyCCR(static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z));
-				// (SRB_Z + ((!SRB_U) | !SRB_E)) == 0
-				const RegGP dst(m_block);
-				const RegGP r(m_block);
-				ccr_getBitValue(dst, CCRB_U);
-				ccr_getBitValue(r, CCRB_E);
-				m_asm.orr(dst, dst, r);
-				ccr_getBitValue(r, CCRB_Z);
-				m_asm.orr(dst, dst, r);
-				m_asm.tst(dst, dst);
-				return asmjit::arm::CondCode::kNotZero;
+				return cccc == CCCC_Normalized ? asmjit::arm::CondCode::kNotZero : asmjit::arm::CondCode::kZero;
 			}
 		case CCCC_GreaterThan:								// GT			Greater than
-			{
-				// (SRB_Z + (SRB_N != SRB_V)) == 0
-				const RegGP r(m_block);
-				const RegGP dst(m_block);
-
-				ccr_getBitValue(dst, CCRB_N);
-				ccr_getBitValue(r, CCRB_V);
-
-				m_asm.eor(dst, dst, r.get());
-				ccr_getBitValue(r, CCRB_Z);
-				m_asm.adds(dst, dst, r.get());
-				return asmjit::arm::CondCode::kZero;
-			}
 		case CCCC_LessEqual:								// LE			Less than or equal
 			{
-				// (SRB_Z + (SRB_N != SRB_V)) == 1
+				// LE = Z || (N != V); GT is its complement.
+				updateDirtyCCR(static_cast<CCRMask>(CCR_N | CCR_V | CCR_Z));
 				const RegGP r(m_block);
 				const RegGP dst(m_block);
 
@@ -136,9 +112,9 @@ namespace dsp56k
 
 				m_asm.eor(dst, dst, r.get());
 				ccr_getBitValue(r, CCRB_Z);
-				m_asm.add(dst, dst, r.get());
-				m_asm.cmp(dst, asmjit::Imm(1));
-				return asmjit::arm::CondCode::kZero;
+				m_asm.orr(dst, dst, r);
+				m_asm.tst(dst, dst);
+				return cccc == CCCC_GreaterThan ? asmjit::arm::CondCode::kZero : asmjit::arm::CondCode::kNotZero;
 			}
 		default:
 			assert(0 && "invalid CCCC value");

@@ -138,9 +138,10 @@ namespace dsp56k
 		const auto savedConfig = dsp.getJit().getConfig();
 		for(const unsigned cap : {1u, 32u})
 		for(const unsigned scaling : {0u, 1u, 2u})
-		for(const bool normalized : {false, true})
+		for(const unsigned normalizationCase : {0u, 1u, 2u})
 		for(const bool testNr : {false, true})
 		{
+			const bool normalized = normalizationCase != 0;
 			dsp.resetHW();
 			auto config = savedConfig;
 			config.maxInstructionsPerBlock = cap;
@@ -154,8 +155,10 @@ namespace dsp56k
 			dsp.setSR(scaling << 10);
 			// Public U/E definitions: a positive nonzero value whose two MSP
 			// bits are 01 is normalized in each selected scaling mode; 00 isn't.
+			// Independently, Z=1 makes zero normalized (table 12-17).
 			const unsigned normalizationBit = scaling == 1 ? 47 : scaling == 2 ? 45 : 46;
-			const uint64_t input = uint64_t(1) << (normalizationBit - (normalized ? 0 : 1));
+			const uint64_t input = normalizationCase == 2 ? 0
+				: uint64_t(1) << (normalizationBit - (normalized ? 0 : 1));
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
 			dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x11223344556677ull)));
 			dsp.x0(0x654321);
@@ -169,7 +172,7 @@ namespace dsp56k
 			}
 			if(dispatches != (cap == 1 ? 2u : 1u))
 				std::cout << "Conditional dispatch cap " << cap << " scaling " << scaling
-					<< " normalized " << normalized << " testNr " << testNr
+					<< " normalizationCase " << normalizationCase << " testNr " << testNr
 					<< " dispatches " << dispatches << " PC " << dsp.getPC().var << '\n';
 			verify(dispatches == (cap == 1 ? 2u : 1u));
 			verify(dsp.getPC().var == 0x102);
