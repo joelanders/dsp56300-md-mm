@@ -422,13 +422,14 @@ namespace dsp56k
 		m_asm.test_(s);
 		m_asm.cmovz(t,s);
 
-		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
-
 		m_asm.shl(r64(t), asmjit::Imm(24 + g_aluBitOffset));
-		ccr_update_ifZero(CCRB_Z);
-
 		m_asm.mov(r64(d), r64(t));
+		// The destination need not have been loaded: derive N/Z only after
+		// installing the count, and explicitly test it after the CCR update.
+		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
+		copyBitToCCR(d, 47 + g_aluBitOffset, CCRB_N);
+		m_asm.test_(r64(d));
+		ccr_update_ifZero(CCRB_Z);
 	}
 
 	void JitOps::op_Div(TWord op)

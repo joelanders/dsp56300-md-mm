@@ -388,10 +388,12 @@ namespace dsp56k
 		m_asm.test_(s);
 		m_asm.csel(r32(t), r32(t), asmjit::a64::regs::wzr, asmjit::arm::CondCode::kNotZero);
 
-		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
-
 		m_asm.lsl(r64(d), r64(t), asmjit::Imm(24 + g_aluBitOffset));
+		// Flags come from the new count, never the old/unloaded destination
+		// or native flags left by an earlier instruction (LSL does not set NZCV).
+		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
+		copyBitToCCR(d, 47 + g_aluBitOffset, CCRB_N);
+		m_asm.test_(r64(d));
 		ccr_update_ifZero(CCRB_Z);
 	}
 

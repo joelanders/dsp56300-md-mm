@@ -708,6 +708,8 @@ namespace dsp56k
 	}
 	inline void DSP::op_Clb(const TWord op)
 	{
+		// CLB replaces N but preserves the preceding arithmetic E/U flags.
+		updateDirtyCCR();
 		const auto S = getFieldValue<Clb, Field_S>(op);
 		const auto D = getFieldValue<Clb, Field_D>(op);
 
@@ -746,7 +748,8 @@ namespace dsp56k
 			count = bsr - (64 - 9 - 1);  // range: -47 to +8
 		}
 
-		d.var = static_cast<TInt64>(count) << (24 + g_aluShift);
+		// Form the signed count's bit pattern without left-shifting a negative integer.
+		d.var = static_cast<uint64_t>(count) << (24 + g_aluShift);
 		aluMask(d);
 
 		// N: Set if bit 47 (= bit 23 of the 24-bit result) is set
