@@ -655,6 +655,41 @@ namespace dsp56k
 
 	void UnitTests::addl()
 	{
+		// 56-bit signed arithmetic fits in int64_t here, including 2*D+S.
+		constexpr uint64_t mask = 0x00ffffffffffffffull;
+		const auto signed56 = [](uint64_t v) -> int64_t
+		{
+			return v < (1ull << 55) ? int64_t(v) : int64_t(v) - (1ll << 56);
+		};
+		for(const uint64_t destination : {0ull, 1ull, mask, 1ull << 54, 1ull << 55,
+			0x015a7b3f37c905ull})
+		for(const uint64_t source : {0ull, 1ull, mask, (1ull << 55) - 1,
+			1ull << 55, 0xd55ad0723547d7ull})
+		for(const bool ab : {false, true})
+		{
+			const auto doubled = 2 * signed56(destination);
+			const auto sum = doubled + signed56(source);
+			const bool shiftOverflow = doubled < -(1ll << 55) || doubled >= (1ll << 55);
+			const bool overflow = shiftOverflow || sum < -(1ll << 55) || sum >= (1ll << 55);
+			const bool carry = (((destination << 1) & mask) + source) > mask;
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_V | CCR_C;
+				dsp.setALU(ab, TReg56(destination));
+				dsp.setALU(!ab, TReg56(source));
+				emit(ab ? "addl a,b" : "addl b,a");
+			}, [&]()
+			{
+				verify((ab ? dsp.aluB().var : dsp.aluA().var) == (uint64_t(sum) & mask));
+				verify((ab ? dsp.aluA().var : dsp.aluB().var) == source);
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == overflow);
+				// The manual only guarantees carry without pre-shift overflow.
+				if(!shiftOverflow)
+					verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x222222)));

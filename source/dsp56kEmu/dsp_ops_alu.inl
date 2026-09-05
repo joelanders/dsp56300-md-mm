@@ -270,15 +270,21 @@ namespace dsp56k
 		TReg56&			d = ab ? reg.b : reg.a;
 		const TReg56&	s = ab ? reg.a : reg.b;
 
-		const TReg56 old = d;
-		const TInt64 res = (aluSignextend(d) << 1) + aluSignextend(s);
-		d.var = res;
+		const auto old = static_cast<uint64_t>(d.var);
+		const auto source = static_cast<uint64_t>(s.var);
+		const auto shifted = (old << 1) & (0x00ffffffffffffffull << g_aluShift);
+		const auto res = shifted + source;
+		constexpr auto sign = uint64_t(1) << (55 + g_aluShift);
+		const bool overflow = ((old ^ shifted) & sign) ||
+			(((res ^ shifted) & (res ^ source)) & sign);
+		const bool carry = g_aluShift ? res < shifted : res > 0x00ffffffffffffffull;
+		d.var = static_cast<TReg56::MyType>(res);
 		aluMask(d);
 
 		sr_z_update(d);
-		sr_clear(CCR_V);		// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
-		//sr_l_update_by_v();
-		sr_c_update_arithmetic(old,d);
+		sr_toggle(CCR_V, overflow);
+		sr_l_update_by_v();
+		sr_toggle(CCR_C, carry);
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
