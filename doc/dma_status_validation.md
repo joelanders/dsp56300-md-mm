@@ -27,10 +27,12 @@ an already accepted delayed block still completes before reporting done.
 - continuous blocks with DE retained and new requests;
 - disable with an accepted delayed block still pending.
 
-The test and full core suite pass on ARM64 JIT, x86-64 JIT and a forced ARM64
-interpreter build. Integration checks pass for MD UW/RAM on ARM64 and MM sine
-on both JIT architectures. The existing MM interpreter idle-noise failure is
-unchanged; this correction is not its established root cause.
+In the original cleanup integration, the test and full core suite passed on
+ARM64 JIT, x86-64 JIT and a forced ARM64 interpreter build. MD UW/RAM on ARM64
+and MM sine on both JIT architectures also passed there. Those historical
+integration results are not substituted for testing the independent extraction
+below. This correction was not established as the MM interpreter idle-noise
+root cause.
 
 Limits: this does not implement a cycle-accurate DMA bus arbiter, deferred
 request capture, reset of the entire DMA controller, or hardware validation.
@@ -39,3 +41,33 @@ long instructions/REP and larger dispatcher batches need separate timing
 coverage. Existing delayed-block scheduling and DACT arbitration are unchanged.
 The same omission is present in this checkout's 2022 commit `402a280ca`; this
 is not a claim about the current state of any external upstream branch.
+
+## Independent extraction, 2026-09-06
+
+Extracted original commit `608a6542` onto release base `da3aaf31` as
+`46d84dec`, preserving its attribution. This branch contains only the DMA
+status correction, its standalone regression, CTest registration and this note.
+It does not depend on the unfinished DSP #6/main #43/MCU #3 cleanup stack or
+the separate boot-reply removal. No product submodule pointer is changed here.
+
+Fresh Release builds pass the focused DMA test and the complete available
+core runner on native ARM64, x86-64/Rosetta, and forced ARM64 interpreter.
+Restoring only `dma.cpp/.h` to the release base makes the new ARM64 regression
+fail on all six channels: DTD remains set after enable, with done-mask 63
+instead of the expected per-channel cleared bit. The corrected files were
+restored afterward. The pre-fix comparison used the same test, not a different
+oracle or weakened assertion.
+
+Reproduction from this branch (choose `arm64` or `x86_64`; add
+`-DDSP56K_FORCE_INTERPRETER=ON` for the interpreter build):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DBUILD_TESTING=ON
+cmake --build build --target dsp56kTestRunner dspDmaStatusTest --parallel 2
+ctest --test-dir build -R '^dsp56300_(unitTests|dmaStatus)$' --output-on-failure
+```
+
+The existing CI workflow builds all targets and runs CTest on macOS, Linux and
+Windows, so this new target participates without a separate workflow change.
+CI success and fresh product-integration results must be checked separately;
+the local core results above do not claim either.
