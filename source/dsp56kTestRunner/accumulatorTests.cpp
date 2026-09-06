@@ -163,8 +163,10 @@ int runExpectedTests()
 		{"neg a", 1, CCR_V, 0xffffffffffffff, CCR_V | CCR_L, 0},
 		{"inc a", 0x7fffffffffffff, 0, 0x80000000000000, CCR_V | CCR_L | CCR_C, CCR_V | CCR_L},
 		{"inc a", 0xffffffffffffff, 0, 0, CCR_V | CCR_L | CCR_C, CCR_C},
+		{"inc a", 0x007fffffffffff, 0, 0x00800000000000, CCR_V | CCR_L | CCR_C, 0},
 		{"dec a", 0x80000000000000, 0, 0x7fffffffffffff, CCR_V | CCR_L | CCR_C, CCR_V | CCR_L},
 		{"dec a", 0, 0, 0xffffffffffffff, CCR_V | CCR_L | CCR_C, CCR_C},
+		{"dec a", 0x00800000000000, 0, 0x007fffffffffff, CCR_V | CCR_L | CCR_C, 0},
 		{"tst a", 0x80000000000000, SR_S1, 0x80000000000000, CCR_E, CCR_E},
 	};
 	Assembler assembler;
@@ -264,6 +266,7 @@ int runSequenceTests()
 		{{"ror a"}, 0, CCR_C, "jmi", true},
 		{{"ror a"}, 0xff000000000000, 0, "jeq", true},
 		{{"rol a"}, 0x800000000000, 0, "jeq", true},
+		{{"rol a"}, 0x400000000000, 0, "jmi", true},
 		{{"lsl a"}, 0x2000000, CCR_Z, "jeq", false},
 		{{"lsr a"}, 0x2000000, CCR_Z, "jeq", false},
 		{{"tst a", "lsl a"}, 0x00400000000000, 0, "jmi", true},
