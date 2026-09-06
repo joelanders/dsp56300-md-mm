@@ -93,6 +93,7 @@ namespace dsp56k
 		div();
 		dmac();
 		dmaAddressWrapping();
+		hdiTransmitCallbacks();
 		dmacMultiPrecision();
 		eor();
 		extractu();
@@ -1472,6 +1473,40 @@ namespace dsp56k
 		{
 			verify(dsp.aluA().var == 0x00055555555554);
 		});
+	}
+
+	void UnitTests::hdiTransmitCallbacks()
+	{
+		// A bridge timestamps each write, including a write that replaces full HOTX.
+		HDI08 port(peripheralsX);
+		port.setTransmitDataAlwaysEmpty(false);
+		unsigned writes = 0, wakes = 0;
+		uint64_t cycle = 254, lastWrite = 0;
+		port.setWriteTxCallback([&] { ++writes; lastWrite = cycle; });
+		port.setHostPumpWakeCallback([&] { ++wakes; });
+		port.writeTX(0x111);
+		verify(writes == 1 && wakes == 1 && lastWrite == 254);
+		cycle = 508;
+		port.writeTX(0x222);
+		verify(writes == 2 && wakes == 2 && lastWrite == 508);
+		verify(port.txData().size() == 1 && port.readTX() == 0x222);
+		verify(!port.hasTX());
+
+		// Notifications may consume the replacement synchronously.
+		port.setWriteTxCallback({});
+		port.writeTX(0x333);
+		TWord received = 0;
+		port.setWriteTxCallback([&] { received = port.readTX(); });
+		port.writeTX(0x444);
+		verify(received == 0x444 && !port.hasTX());
+
+		// Buffered mode still queues distinct words and notifies for each append.
+		port.setWriteTxCallback([&] { ++writes; });
+		port.setTransmitDataBuffered(true);
+		port.writeTX(0x555);
+		port.writeTX(0x666);
+		verify(writes == 4 && port.txData().size() == 2);
+		verify(port.readTX() == 0x555 && port.readTX() == 0x666 && !port.hasTX());
 	}
 
 	void UnitTests::dmaAddressWrapping()

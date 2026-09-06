@@ -155,6 +155,7 @@ namespace dsp56k
 			return dsp56k::bittest<TWord, HCR_HRIE>(m_hcr.load(std::memory_order_acquire));
 		}
 
+		// Called after every HOTX write, including replacement of a full latch.
 		void setWriteTxCallback(const CallbackTx& _callback)
 		{
 			m_callbackTx = _callback;
