@@ -519,7 +519,7 @@ namespace dsp56k
 		void ccr_e_update(const JitReg64& _alu);
 		void ccr_n_update_by55(const JitReg64& _alu);
 		void ccr_n_update_by47(const JitReg64& _alu);
-		void ccr_n_update_by23(const JitReg64& _alu);
+		void ccr_n_update_raw24(const JitReg64& _alu);
 		void ccr_s_update(const JitReg64& _alu);
 		void ccr_l_update_by_v();
 

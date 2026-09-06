@@ -94,6 +94,7 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 		
 		aluRestoreFrom64(alu);						// correction for the pre-shift, and keeps the low byte clear
 
@@ -113,10 +114,11 @@ namespace dsp56k
 			m_asm.sar(alu, _v->get().r8());
 		else
 			m_asm.sar(alu, asmjit::Imm(_immediate));
+		// The 56-bit accumulator is extended/aligned to bits 63:8. Its
+		// last discarded bit is now bit 7, not the host SAR carry bit.
+		copyBitToCCR(alu, 7, CCRB_C);
 		// discards the bits shifted below the accumulator - the hardware has no resolution there
 		aluRestoreFrom64(alu);
-
-		ccr_update_ifCarry(CCRB_C);					// copy the host carry flag to the DSP carry flag
 		
 //		ccr_clear(CCR_V);							// cleared by batch update
 
@@ -143,7 +145,7 @@ namespace dsp56k
 
 	void JitOps::alu_lsl(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V | CCR_Z));
 		DspValue d(m_block);
 		getALU1(d, ab);
 		if(_shiftAmount.isImm24())
@@ -167,7 +169,7 @@ namespace dsp56k
 
 	void JitOps::alu_lsr(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V | CCR_Z));
 		DspValue d(m_block);
 		getALU1(d, ab);
 		if(_shiftAmount.isImm24())
@@ -751,9 +753,10 @@ namespace dsp56k
 		copyBitToCCR(r.get(), 23, CCRB_C);						// Set if bit 47 of the destination operand is set, and cleared otherwise
 
 		m_asm.shl(r.get(), asmjit::Imm(1));
-		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
+		ccr_n_update_raw24(r64(r));								// Set if bit 47 of the result is set
 
 		m_asm.or_(r.get(), r32(prevCarry));						// Set if bits 47�24 of the result are 0
+		m_asm.and_(r.get(), asmjit::Imm(0xffffff));
 		ccr_update_ifZero(CCRB_Z);
 		setALU1(D, r);
 
@@ -778,7 +781,8 @@ namespace dsp56k
 		m_asm.shl(r32(prevCarry), asmjit::Imm(23));
 		m_asm.or_(r.get(), r32(prevCarry));						// inject old carry into bit 47 position
 
-		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
+		ccr_n_update_raw24(r64(r));								// Set if bit 47 of the result is set
+		m_asm.test_(r32(r));
 		ccr_update_ifZero(CCRB_Z);								// Set if bits 47-24 of the result are 0
 		setALU1(D, r);
 

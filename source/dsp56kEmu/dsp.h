@@ -647,7 +647,10 @@ namespace dsp56k
 			1	0	Scale Up	Bits 55,54..............47,46
 			*/
 
-			const uint32_t mask = (0x3fe << sr_val_noCache(SRB_S0) >> sr_val_noCache(SRB_S1)) & 0x3ff;
+			// Keep bit 55 in the signed integer portion in every mode. Shifting
+			// 0x3fe right for scale-up incorrectly drops that sign bit.
+			const auto lowBit = 1 + sr_val_noCache(SRB_S0) - sr_val_noCache(SRB_S1);
+			const uint32_t mask = 0x3ff & ~((1u << lowBit) - 1u);
 
 			const uint32_t d2 = static_cast<uint32_t>(_ab.var >> (46 + g_aluShift));
 
@@ -841,7 +844,7 @@ namespace dsp56k
 			// left-aligned the value is already sign-correct in 64 bits, no sign extension needed
 			const int64_t test = _src.var;
 
-			if( test < (-140737488355328ll << g_aluShift) )	// ff 800000 000000
+			if( test < -(140737488355328ll << g_aluShift) )	// ff 800000 000000
 			{
 				sr_set( CCR_L );
 				_dst = 0x800000;

@@ -786,19 +786,17 @@ namespace dsp56k
 	}
 	inline void DSP::op_Dec(const TWord op)
 	{
-		auto ab = getFieldValue<Dec,Field_d>(op);
+		const auto ab = getFieldValue<Dec, Field_d>(op);
 		TReg56& d = ab ? reg.b : reg.a;
-
-		const auto old = d;
-		const auto res = (d.var -= (TInt64(1) << g_aluShift));
-
+		const uint64_t old = d.var;
+		const uint64_t step = uint64_t(1) << g_aluShift;
+		const uint64_t result = old - step;
+		d.var = static_cast<int64_t>(result);
 		aluMask(d);
-
 		sr_z_update(d);
-		sr_v_update(res,d);
+		sr_toggle(CCR_C, old < step);
+		sr_toggle(CCR_V, old == (uint64_t(0x80000000000000) << g_aluShift));
 		sr_l_update_by_v();
-		sr_c_update_arithmetic(old,d);
-		sr_toggle( CCR_C, bittest(d, 47 + g_aluShift) != bittest(old, 47 + g_aluShift) );
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
@@ -912,20 +910,17 @@ namespace dsp56k
 	}
 	inline void DSP::op_Inc(const TWord op)
 	{
-		const auto ab = getFieldValue<Inc,Field_d>(op);
+		const auto ab = getFieldValue<Inc, Field_d>(op);
 		TReg56& d = ab ? reg.b : reg.a;
-
-		const auto old = d;
-
-		const auto res = (d.var += (TInt64(1) << g_aluShift));
-
+		const uint64_t old = d.var;
+		const uint64_t step = uint64_t(1) << g_aluShift;
+		const uint64_t result = old + step;
+		d.var = static_cast<int64_t>(result);
 		aluMask(d);
-
 		sr_z_update(d);
-		sr_v_update(res,d);
+		sr_toggle(CCR_C, old > result);
+		sr_toggle(CCR_V, old == ((uint64_t(0x7fffffffffffff) << g_aluShift)));
 		sr_l_update_by_v();
-		sr_c_update_arithmetic(old,d);	// TODO: what? C updated two times?!
-		sr_toggle( CCR_C, bittest(d, 47 + g_aluShift) != bittest(old, 47 + g_aluShift) );
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
@@ -1250,26 +1245,14 @@ namespace dsp56k
 	}
 	inline void DSP::op_Ror(const TWord op)
 	{
-		const auto D = getFieldValue<Ror, Field_d>(op);
-
-		auto& d = D ? reg.b.var : reg.a.var;
-
-		const auto c = bitvalue<uint64_t,24 + g_aluShift>(d);	// bit 24 = LSB of a1/b1
-		auto shifted = d;
-		reinterpret_cast<uint64_t&>(shifted) >>= (24 + g_aluShift);	// isolate a1/b1
-		const auto oldBit0 = shifted & 1;
-		shifted >>= 1;									// shift right
-		shifted |= static_cast<TInt64>(sr_val(CCRB_C)) << 23;	// inject old carry into bit 23 (MSB position)
-		shifted &= 0xffffff;
-		shifted <<= (24 + g_aluShift);					// move back
-
-		d &= static_cast<TInt64>(0xff000000ffffff00ull);
-		d |= shifted;
-
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(shifted));
-		sr_toggle(CCR_Z, shifted == 0);
+		const auto ab = getFieldValue<Ror, Field_d>(op);
+		const uint32_t field = ab ? b1().var : a1().var;
+		const uint32_t result = (field >> 1) | (static_cast<uint32_t>(sr_val(CCRB_C)) << 23);
+		if(ab) b1(TReg24(result)); else a1(TReg24(result));
+		sr_toggle(CCR_N, (result & 0x800000) != 0);
+		sr_toggle(CCR_Z, result == 0);
 		sr_clear(CCR_V);
-		sr_toggle(CCRB_C, static_cast<Bit>(oldBit0));
+		sr_toggle(CCR_C, (field & 1) != 0);
 	}
 	inline void DSP::op_Sbc(const TWord op)
 	{

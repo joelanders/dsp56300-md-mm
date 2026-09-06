@@ -247,6 +247,36 @@ namespace dsp56k
 		run(0x00'000000'000000, {CCCC_Plus, CCCC_NotNormalized});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_Normalized});
 		run(0x00'400000'000000, {CCCC_Plus, CCCC_Normalized});
+
+		// DSP56300FM table 5-1: E tests the complete signed integer portion,
+		// including bit 55 in all scaling modes (down: 48, normal: 47, up: 46).
+		for(unsigned scaling = 0; scaling < 3; ++scaling)
+		{
+			const unsigned lowBit = scaling == 0 ? 47 : scaling == 1 ? 48 : 46;
+			for(const uint64_t value : {0ull, 0xffffffffffffffull, 0x003fffffffffffull,
+				0x00400000000000ull, 0x007fffffffffffull, 0x00800000000000ull,
+				0x00ffffffffffffull, 0x01000000000000ull, 0x7ff00000000000ull,
+				0x80000000000000ull, 0x80100000000000ull, 0xff800000000000ull,
+				0xffc00000000000ull})
+			{
+				bool extension = false;
+				for(unsigned bit = lowBit; bit < 55; ++bit)
+					extension |= ((value >> bit) & 1) != ((value >> 55) & 1);
+				for(const bool ab : {false, true})
+					runTest([&]()
+					{
+						dsp.setSR(scaling << SRB_S0);
+						dsp.setALU(ab, TReg56(value));
+						emit(ab ? "tst b" : "tst a");
+					}, [&]()
+					{
+						if(bool(dsp.sr_test(CCR_E)) != extension)
+							LOG("Extension mismatch scaling=" << scaling << " value=" << std::hex << value
+								<< " sr=" << dsp.getSR().var << " expected=" << extension);
+						verify(bool(dsp.sr_test(CCR_E)) == extension);
+					});
+			}
+		}
 	}
 
 	void UnitTests::aguModulo()
@@ -756,6 +786,38 @@ namespace dsp56k
 
 	void UnitTests::asl_D()
 	{
+		// Independent bit-by-bit ASL oracle (DSP56300FM 13-15).
+		for(const uint64_t input : {0ull, 1ull, 0x0080000000000000ull,
+			0x0040000000000000ull, 0x00ffffffffffffffull})
+		for(const unsigned count : {0u, 1u, 8u, 55u})
+		for(const bool registerCount : {false, true})
+		{
+			auto expected = input;
+			bool carry = false, overflow = false;
+			for(unsigned bit = 0; bit < count; ++bit)
+			{
+				carry = (expected >> 55) != 0;
+				expected = (expected << 1) & 0x00ffffffffffffffull;
+				overflow |= carry != static_cast<bool>(expected >> 55);
+			}
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(input));
+				dsp.x0(count);
+				const auto instruction = std::string("asl ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) + ",a,b";
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify(dsp.aluA().var == input);
+				verify(dsp.aluB().var == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == overflow);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xaaabcdef123456)));
@@ -838,6 +900,38 @@ namespace dsp56k
 
 	void UnitTests::asr_D()
 	{
+		// DSP56300FM ASR: C receives the last discarded bit, or zero for
+		// a zero count. Use an unsigned 56-bit oracle, not another backend.
+		for(const uint64_t value : {0x0000000000000001ull, 0x00ffffffffffffffull,
+			0x0080000000000000ull, 0x0055aa55aa55aa55ull})
+		for(const unsigned count : {0u, 1u, 7u, 8u, 16u, 24u, 55u})
+		for(const bool destinationB : {false, true})
+		for(const bool registerCount : {false, true})
+		{
+			constexpr uint64_t mask = 0x00ffffffffffffffull;
+			auto expected = value >> count;
+			if(count && (value & (1ull << 55)))
+				expected |= mask ^ (mask >> count);
+			const bool carry = count && ((value >> (count - 1)) & 1);
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(value));
+				dsp.x0(count);
+				const auto instruction = std::string("asr ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) +
+					",a," + (destinationB ? "b" : "a");
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB().var : dsp.aluA().var) == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(!dsp.sr_test(CCR_V));
+				if(destinationB)
+					verify(dsp.aluA().var == value);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x000599f2204000)));
@@ -2266,6 +2360,29 @@ namespace dsp56k
 
 	void UnitTests::neg()
 	{
+		// NEG preserves C; V describes this operation, and L latches V.
+		// Only negating the most negative 56-bit value overflows.
+		for(const uint64_t value : {0ull, 1ull, 0x00ffffffffffffffull,
+			0x007fffffffffffffull, 0x0080000000000000ull})
+		for(const unsigned initial : {0u, unsigned(CCR_C | CCR_V), unsigned(CCR_L)})
+		for(const bool ab : {false, true})
+		{
+			const bool overflow = value == 0x0080000000000000ull;
+			runTest([&]()
+			{
+				dsp.regs().sr.var = initial;
+				dsp.setALU(ab, TReg56(value));
+				emit(ab ? "neg b" : "neg a");
+			}, [&]()
+			{
+				verify((ab ? dsp.aluB().var : dsp.aluA().var) ==
+					((0ull - value) & 0x00ffffffffffffffull));
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == (overflow || (initial & CCR_L)));
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == static_cast<bool>(initial & CCR_C));
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(1)));
