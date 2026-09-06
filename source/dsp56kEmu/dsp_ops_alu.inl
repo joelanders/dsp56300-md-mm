@@ -222,6 +222,9 @@ namespace dsp56k
 	//
 	void DSP::alu_lsl( bool ab, int _shiftAmount )
 	{
+		// E/U survive this instruction, while N is replaced by bit 47.
+		// Resolve prior arithmetic flags before writing the logical-shift flags.
+		updateDirtyCCR();
 		TReg24 d = ab ? b1() : a1();
 
 		sr_toggle( CCR_C, _shiftAmount && bittest( d, 23-_shiftAmount+1) );
@@ -247,6 +250,7 @@ namespace dsp56k
 	//
 	void DSP::alu_lsr( bool ab, int _shiftAmount )
 	{
+		updateDirtyCCR();
 		TReg24 d = ab ? b1() : a1();
 
 		sr_toggle( CCR_C, _shiftAmount && bittest( d, _shiftAmount-1) );

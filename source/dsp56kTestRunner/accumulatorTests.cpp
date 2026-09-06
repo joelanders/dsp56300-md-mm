@@ -2,6 +2,7 @@
 // Expected semantics: DSP56300 Family Manual, Rev. 5, sections 5.4 and 13.
 #include "dsp56kEmu/assembler.h"
 #include "dsp56kEmu/dsp.h"
+#include "dsp56kBase/logging.h"
 
 #include <iostream>
 #include <memory>
@@ -227,14 +228,148 @@ int runExpectedTests()
 	return failures ? 1 : 0;
 }
 
+// Unlike the single-instruction sweep, these programs keep values and lazy CCR
+// state live across instructions, branches, parallel moves and linked blocks.
+int runSequenceTests()
+{
+	Assembler assembler;
+	unsigned total = 0, failures = 0;
+	const auto emit = [&](Machine& machine, TWord& pc, const std::string& instruction) {
+		const auto op = assembler.assemble(instruction.c_str());
+		if(!op.success()) throw std::string("Sequence assembly failed: ") + instruction;
+		for(unsigned i = 0; i < op.wordCount; ++i) machine.mem.set(MemArea_P, pc++, op.word[i]);
+	};
+	const auto execute = [](Machine& machine, bool jit) {
+		machine.dsp.setPC(0x100);
+		machine.dsp.getJit().checkModeChange();
+		for(unsigned dispatch = 0; dispatch < 256 && machine.dsp.getPC() != 0x300; ++dispatch)
+			if(jit) machine.dsp.execJit(); else machine.dsp.execInterpreter();
+		if(machine.dsp.getPC() != 0x300) {
+			std::cerr << "Sequence exit PC=" << std::hex << machine.dsp.getPC().var << " jit=" << jit << '\n';
+			throw std::string("Sequence failed to reach its exit");
+		}
+	};
+	struct BranchCase {
+		std::vector<std::string> body;
+		uint64_t a;
+		uint32_t sr;
+		const char* branch;
+		bool taken;
+	};
+	const BranchCase branches[] = {
+		{{"asr a"}, 1, 0, "jcs", true},
+		{{"asr #0,a,a"}, 1, CCR_C, "jcs", false},
+		{{"asl a"}, 0x80000000000000, 0, "jcs", true},
+		{{"asl a", "tst b"}, 0x40000000000000, 0, "jls", true},
+		{{"ror a"}, 0, CCR_C, "jmi", true},
+		{{"ror a"}, 0xff000000000000, 0, "jeq", true},
+		{{"rol a"}, 0x800000000000, 0, "jeq", true},
+		{{"lsl a"}, 0x2000000, CCR_Z, "jeq", false},
+		{{"lsr a"}, 0x2000000, CCR_Z, "jeq", false},
+		{{"tst a", "lsl a"}, 0x00400000000000, 0, "jmi", true},
+		{{"tst a", "lsr a"}, 0xff800000000000, 0, "jmi", false},
+		{{"abs a"}, 0x80000000000000, 0, "jls", true},
+		{{"neg a"}, 0x80000000000000, 0, "jls", true},
+		{{"inc a"}, 0x7fffffffffffff, 0, "jls", true},
+		{{"dec a"}, 0x80000000000000, 0, "jls", true},
+		{{"inc a"}, 0xffffffffffffff, 0, "jcs", true},
+		{{"dec a"}, 0, 0, "jcs", true},
+		{{"neg a", "neg a"}, 1, CCR_L | CCR_V, "jls", true},
+		{{"tst a"}, 0x80000000000000, SR_S1, "jes", true},
+	};
+	for(bool optimize : {false, true}) for(const auto& test : branches) for(bool jit : {false, true}) {
+		auto machine = std::make_unique<Machine>();
+		auto config = machine->dsp.getJit().getConfig();
+		config.maxInstructionsPerBlock = 32;
+		config.linkJitBlocks = true;
+		config.enableOptimizer = optimize;
+		machine->dsp.getJit().setConfig(config);
+		machine->dsp.regs().a.var = static_cast<int64_t>(test.a << 8);
+		machine->dsp.regs().sr.var = test.sr;
+		TWord pc = 0x100;
+		for(const auto& instruction : test.body) emit(*machine, pc, instruction);
+		emit(*machine, pc, std::string(test.branch) + " $200");
+		emit(*machine, pc, "move #>1,x1");
+		emit(*machine, pc, "jmp $300");
+		pc = 0x200;
+		emit(*machine, pc, "move #>2,x1");
+		emit(*machine, pc, "jmp $300");
+		pc = 0x300;
+		emit(*machine, pc, "jmp $300");
+		execute(*machine, jit);
+		++total;
+		if(machine->dsp.x1().var != (test.taken ? 2u : 1u)) {
+			++failures;
+			std::cerr << "Branch failure " << test.body.front() << " / " << test.branch
+				<< " jit=" << jit << " optimizer=" << optimize << '\n';
+		}
+	}
+	const std::vector<std::string> operations = {
+		"abs a", "neg b", "inc a", "dec b", "asl a", "asr b", "rol a", "ror b",
+		"lsl a", "lsr b", "add x0,a", "sub y0,b", "tst a", "tst b",
+		"move a10,l:<$10", "move l:<$10,b10", "move b10,l:<$11", "move l:<$11,a10",
+		"move a,l:<$12", "move l:<$12,b", "move b,l:<$13", "move l:<$13,a",
+		"abs a a10,l:<$10", "neg b b10,l:<$11", "asr a b10,l:<$12",
+		"asl #8,a,b", "asr #23,b,a", "move a1,x0", "move b1,y0"
+	};
+	for(bool optimize : {false, true}) for(unsigned seed = 0; seed < 192; ++seed) {
+		std::mt19937_64 random(0x56300000 + seed);
+		auto interpreter = std::make_unique<Machine>();
+		auto jit = std::make_unique<Machine>();
+		const uint64_t a = random(), b = random(), x = random(), y = random();
+		std::vector<std::string> program;
+		for(unsigned i = 0; i < 24; ++i) program.push_back(operations[random() % operations.size()]);
+		for(auto* machine : {interpreter.get(), jit.get()}) {
+			auto config = machine->dsp.getJit().getConfig();
+			config.maxInstructionsPerBlock = 32;
+			config.linkJitBlocks = true;
+			config.enableOptimizer = optimize;
+			machine->dsp.getJit().setConfig(config);
+			auto& regs = machine->dsp.regs();
+			regs.a.var = static_cast<int64_t>(a & ~uint64_t(255));
+			regs.b.var = static_cast<int64_t>(b & ~uint64_t(255));
+			regs.x.var = x & 0xffffffffffff;
+			regs.y.var = y & 0xffffffffffff;
+			regs.sr.var = (seed % 3 == 1 ? SR_S0 : seed % 3 == 2 ? SR_S1 : 0) | (seed & 255);
+			TWord pc = 0x100;
+			for(const auto& instruction : program) emit(*machine, pc, instruction);
+			emit(*machine, pc, "jmp $300");
+			pc = 0x300;
+			emit(*machine, pc, "jmp $300");
+		}
+		execute(*interpreter, false);
+		execute(*jit, true);
+		const auto& p = interpreter->dsp.regs();
+		const auto& q = jit->dsp.regs();
+		bool ok = p.a.var == q.a.var && p.b.var == q.b.var && p.x.var == q.x.var && p.y.var == q.y.var
+			&& interpreter->dsp.getSR().var == jit->dsp.getSR().var;
+		for(unsigned i = 0; i < 8; ++i)
+			ok &= p.r[i].var == q.r[i].var && p.n[i].var == q.n[i].var && p.m[i].var == q.m[i].var;
+		for(const auto area : {MemArea_X, MemArea_Y}) for(TWord address = 0x10; address <= 0x13; ++address)
+			ok &= interpreter->mem.get(area, address) == jit->mem.get(area, address);
+		++total;
+		if(!ok) {
+			++failures;
+			std::cerr << "Sequence failure seed=" << std::dec << seed << " optimizer=" << optimize << '\n';
+			std::cerr << std::hex << " A=" << p.a.var << '/' << q.a.var << " B=" << p.b.var << '/' << q.b.var
+				<< " X=" << p.x.var << '/' << q.x.var << " Y=" << p.y.var << '/' << q.y.var
+				<< " SR=" << interpreter->dsp.getSR().var << '/' << jit->dsp.getSR().var << '\n';
+			for(const auto& instruction : program) std::cerr << "  " << instruction << '\n';
+		}
+	}
+	std::cerr << "Sequence cases: " << std::dec << total << " failures: " << failures << '\n';
+	return failures ? 1 : 0;
+}
+
 int main()
 {
-	// JIT construction logs assembly to stdout; test diagnostics use stderr.
-	std::cout.setstate(std::ios_base::failbit);
+	// Keep generated assembly out of CI logs; failures are reported on stderr.
+	Logging::setLogFunc([](const std::string&) {});
 	try {
 		const int expected = runExpectedTests();
 		const int differential = runDifferentialTests();
-		return expected || differential ? 1 : 0;
+		const int sequences = runSequenceTests();
+		return expected || differential || sequences ? 1 : 0;
 	} catch(const std::string& error) { std::cerr << error << '\n'; }
 	catch(const std::exception& error) { std::cerr << error.what() << '\n'; }
 	return 1;
