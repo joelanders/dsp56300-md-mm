@@ -31,6 +31,7 @@ namespace dsp56k
 
 		void ccr_u_build();
 		void ccr_u_verify();
+		void runtimeUnnormalizedFlag();
 
 		void ccr_e_build();
 		void ccr_e_verify();
@@ -75,6 +76,9 @@ namespace dsp56k
 		// host register pressure test
 		void parallelMoveXY();
 		void boundedDispatch();
+		void recompileActiveLoops();
+		void conditionalTransferWithDeferredFlags();
+		void temporaryRegisterExhaustion();
 
 		void emit(TWord _opA, TWord _opB = 0, TWord _pc = 0) override;
 		void execStep() override { dsp.execJit(); }

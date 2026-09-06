@@ -46,70 +46,6 @@ namespace dsp56k
 
 	Jumptable g_jumptable;
 
-	// Optional, host-selected correction for nominal-rate frame conversion.
-	// The state qualification keeps the generic DSP path unchanged when disabled.
-	void dspMmCleanGndSinStep(DSP* _dsp) noexcept
-	{
-		auto& state = _dsp->m_mmCleanGndSinState;
-
-		const auto pc = _dsp->getPC().toWord();
-		const auto& r = _dsp->regs();
-		const auto word = [](const auto& _v)
-		{
-			return static_cast<TWord>(_v.var) & 0xffffff;
-		};
-		auto& mem = _dsp->memory();
-
-		if(pc == 0x973)
-		{
-			const auto voiceBase = word(r.r[6]);
-			const bool validVoiceBase = voiceBase >= 0x500 && voiceBase <= 0x700 &&
-				((voiceBase - 0x500) & 0xff) == 0;
-			const auto voiceIndex = validVoiceBase ? (voiceBase - 0x500) >> 8 : 0xffffff;
-			const auto sampleRateControl = validVoiceBase
-				? mem.get(MemArea_Y, voiceBase + 0x12) & 0xffffff : 0xffffff;
-			const auto machineProgram = validVoiceBase
-				? mem.get(MemArea_Y, 0x120 + voiceIndex) & 0xffffff : 0xffffff;
-			const auto pitch = validVoiceBase
-				? mem.get(MemArea_X, voiceBase + 0x01) & 0xffffff : 0;
-			// Match the nominal converter setting while excluding deliberate
-			// sample-rate reduction.
-			const int64_t nominalUnrounded = static_cast<int64_t>(pitch) * 96 - 0x7fe0;
-			const auto nominalRatio = nominalUnrounded > 0
-				? static_cast<TWord>(((nominalUnrounded + 0x2000) / 0x4000) * 0x4000)
-				: 0;
-			const auto ratioDelta = sampleRateControl > nominalRatio
-				? sampleRateControl - nominalRatio : nominalRatio - sampleRateControl;
-			state.pending = false;
-			// Apply only to the qualified nominal-rate second pass.
-			if(word(r.r[2]) != 0x00000f || word(r.r[3]) != 0x00000f ||
-				word(r.r[4]) != 0x000091 || machineProgram != 0x000001 ||
-				ratioDelta > 0x200)
-				return;
-
-			bool nonzero = false;
-			for(TWord i = 0; i < 16; ++i)
-			{
-				state.lane0[i] = mem.get(MemArea_X, 0x000001 + i) & 0xffffff;
-				state.lane1[i] = mem.get(MemArea_X, 0x000012 + i) & 0xffffff;
-				nonzero |= state.lane0[i] != 0 || state.lane1[i] != 0;
-			}
-			state.pending = nonzero;
-			return;
-		}
-
-		// Accept both dispatcher boundaries used by the supported execution modes.
-		if((pc != 0x3a9 && pc != 0x979) || !state.pending)
-			return;
-
-		for(TWord i = 0; i < 16; ++i)
-		{
-			mem.set(MemArea_X, i, state.lane0[i]);
-			mem.set(MemArea_X, 0x10 + i, state.lane1[i]);
-		}
-		state.pending = false;
-	}
-
 	void dspExecDefaultPreventInterrupt(DSP* _dsp) noexcept
 	{
 		_dsp->execDefaultPreventInterrupt();
@@ -222,7 +158,6 @@ namespace dsp56k
 		
 		m_instructions = 0;
 		m_cycles = 0;
-		m_mmCleanGndSinState = {};
 		m_jit.resetHW();
 	}
 
@@ -241,7 +176,17 @@ namespace dsp56k
 			return;
 		}
 
-		const auto interrupt = m_pendingInterrupts.front();
+		const auto request = m_pendingInterrupts.front();
+		const auto interrupt = request.vector;
+		if(request.source && !request.source->interruptEnabled(request.token))
+		{
+			m_pendingInterrupts.pop_front();
+			request.source->interruptDiscarded(request.token);
+			// A disabled peripheral retains its own pending state. Do not let its
+			// withdrawn CPU request block unrelated interrupts or peripheral clocks.
+			m_execPeripheralsFunc(this);
+			return;
+		}
 
 		if(interrupt >= Vba_End)
 		{
@@ -283,17 +228,17 @@ namespace dsp56k
 			m_pendingInterrupts.pop_front();
 		}
 
-		execInterrupt(vba);
+		execInterrupt(vba, request.source, request.token);
 	}
 
-	void DSP::execInterrupt(const TWord vba)
+	void DSP::execInterrupt(const TWord vba, InterruptSource* source, const uint64_t token)
 	{
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
+		if(source)
+			source->interruptServiced(token);
 
-		// Host-command arbitration release hook (HDI08 A2): the moment a vector is serviced, notify a
-		// registered consumer so it can lift its HCP-priority mainline hold for this exact vector.
-		// Unset by default -> no effect for the shipping synths.
+		// General observers do not acknowledge a peripheral's tagged request.
 		if(m_interruptServicedCallback)
 			m_interruptServicedCallback(vba);
 
@@ -543,7 +488,6 @@ namespace dsp56k
 		perif[0]->reset();
 		if(perif[1] != perif[0])
 			perif[1]->reset();
-		m_mmCleanGndSinState = {};
 	}
 
 	void DSP::jsr(const TReg24& _val)
@@ -554,8 +498,10 @@ namespace dsp56k
 
 	void DSP::setCCRDirty(bool ab, const TReg56& _alu, uint32_t _dirtyBitsMask)
 	{
-//		if(ccrCache.dirty && ccrCache.ab != ab)
-//			updateDirtyCCR();
+		// A single saved result cannot represent flags from two operations.
+		// Resolve anything the new operation preserves before replacing it.
+		if(ccrCache.dirty & ~_dirtyBitsMask)
+			updateDirtyCCR();
 
 		ccrCache.dirty |= _dirtyBitsMask;
 		ccrCache.alu = _alu;
@@ -569,12 +515,16 @@ namespace dsp56k
 
 		auto& dsp = const_cast<DSP&>(*this);
 
+		const auto dirty = ccrCache.dirty;
 		dsp.ccrCache.dirty = 0;
 		
 //		dsp.sr_s_update();
-		dsp.sr_e_update(ccrCache.alu);
-		dsp.sr_u_update(ccrCache.alu);
-		dsp.sr_n_update(ccrCache.alu);
+		if(dirty & CCR_E)
+			dsp.sr_e_update(ccrCache.alu);
+		if(dirty & CCR_U)
+			dsp.sr_u_update(ccrCache.alu);
+		if(dirty & CCR_N)
+			dsp.sr_n_update(ccrCache.alu);
 	}
 
 	void DSP::sr_debug(char* _dst) const
@@ -638,44 +588,10 @@ namespace dsp56k
 
 		pushPCSR();
 
-		const auto stackCount = reg.sc.var;
-		
 		sr_set( SR_LF );
-
-		if constexpr(!g_useJIT)
-			m_cycles += getOpcodeCycles(pcCurrentInstruction);
-
-		++m_instructions;
-
-		traceOp();
-
-		// __________________
-		//
-
-		// note the terminate check: the interpreter executes a whole DO loop inside this function, it never returns
-		// to DSPThread::threadFunc in between. Without it, a firmware loop that never ends deadlocks the join on shutdown.
-		while(reg.sc.var >= stackCount && !m_terminate.load(std::memory_order_relaxed))
-		{
-			execInterpreter();
-
-			if(reg.pc.var != (reg.la.var+1))
-				continue;
-
-			if(!sr_test_noCache(SR_LF))
-				break;
-
-			if( reg.lc.var <= 1 )
-			{
-				// restore PC to point to the next instruction after the last instruction of the loop
-				setPC(reg.la.var+1);
-
-				do_end();
-				break;
-			}
-
-			--reg.lc.var;
-			setPC(hiword(reg.ss[ssIndex()]));
-		}
+		// The instruction establishes architectural loop state only. Executing
+		// its body here would prevent a host scheduler from supplying data to a
+		// peripheral-polling loop. execInterpreter handles each loop-end fetch.
 		return true;
 	}
 
@@ -1329,14 +1245,15 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		auto d64 = aluSignextend(d);
-		d64 = -d64;
-		
-		d.var = d64;
+		const auto value = static_cast<uint64_t>(d.var);
+		const bool overflow = value == (uint64_t(1) << (55 + g_aluShift));
+		// Unsigned subtraction also defines negation of the left-aligned
+		// minimum accumulator, whose signed 64-bit negation would overflow.
+		d.var = static_cast<TReg56::MyType>(uint64_t(0) - value);
 		aluMask(d);
 
 		sr_z_update(d);
-	//	TODO: how to update v? test in sim		sr_v_update(d);
+		sr_toggle(CCR_V, overflow);
 		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
 	}
@@ -1395,9 +1312,9 @@ namespace dsp56k
 		return vba;
 	}
 
-	bool DSP::injectInterrupt(uint32_t _interruptVectorAddress)
+	bool DSP::injectInterrupt(uint32_t _interruptVectorAddress, InterruptSource* source, const uint64_t token)
 	{
-		m_pendingInterrupts.push_back({_interruptVectorAddress});
+		m_pendingInterrupts.push_back({_interruptVectorAddress, source, token});
 
 		if(m_interruptFunc == m_execPeripheralsFunc)
 			m_interruptFunc = &dspExecInterrupts;
@@ -1427,7 +1344,7 @@ namespace dsp56k
 		return prio < minPrio;
 	}
 
-	void DSP::injectExternalInterrupt(const TWord _vba)
+	void DSP::injectExternalInterrupt(const TWord _vba, InterruptSource* source, const uint64_t token)
 	{
 		if(m_externalInterruptAbort)
 		{
@@ -1445,13 +1362,16 @@ namespace dsp56k
 		{
 			m_pendingExternalInterrupts.waitNotFull();
 		}
-		m_pendingExternalInterrupts.push_back(_vba);
+		m_pendingExternalInterrupts.push_back({_vba, source, token});
 	}
 
 	void DSP::processExternalInterrupts()
 	{
 		while(!m_pendingExternalInterrupts.empty())
-			injectInterrupt(m_pendingExternalInterrupts.pop_front());
+		{
+			const auto request = m_pendingExternalInterrupts.pop_front();
+			injectInterrupt(request.vector, request.source, request.token);
+		}
 	}
 
 	uint32_t DSP::calcOpcodeCycles(const TWord _pc) const

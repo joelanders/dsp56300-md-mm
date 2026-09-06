@@ -94,6 +94,7 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 		
 		aluRestoreFrom64(alu);						// correction for the pre-shift, and keeps the low byte clear
 
@@ -113,10 +114,11 @@ namespace dsp56k
 			m_asm.sar(alu, _v->get().r8());
 		else
 			m_asm.sar(alu, asmjit::Imm(_immediate));
+		// The 56-bit accumulator is extended/aligned to bits 63:8. Its
+		// last discarded bit is now bit 7, not the host SAR carry bit.
+		copyBitToCCR(alu, 7, CCRB_C);
 		// discards the bits shifted below the accumulator - the hardware has no resolution there
 		aluRestoreFrom64(alu);
-
-		ccr_update_ifCarry(CCRB_C);					// copy the host carry flag to the DSP carry flag
 		
 //		ccr_clear(CCR_V);							// cleared by batch update
 
@@ -143,22 +145,25 @@ namespace dsp56k
 
 	void JitOps::alu_lsl(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		// Every replaced flag must be included, including deferred Z.
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_C | CCR_V));
 		DspValue d(m_block);
 		getALU1(d, ab);
+		// Keep the last shifted-out bit at position 24 instead of aligning
+		// it to native CF. Adding 8 to a 32-bit shift count wraps at count 24,
+		// and using that same offset with a 64-bit shift reads the wrong carry.
 		if(_shiftAmount.isImm24())
 		{
-			m_asm.shl(r32(d.get()), _shiftAmount.imm24() + 8); // + 8 to use native carry flag
+			m_asm.shl(r64(d.get()), _shiftAmount.imm24());
 		}
 		else
 		{
 			ShiftReg s(m_block);
 			m_asm.mov(r32(s), r32(_shiftAmount.get()));
-			m_asm.add(r32(s), asmjit::Imm(8));	// + 8 to use native carry flag
 			m_asm.shl(r64(d.get()), s.get().r8());
 		}
-		ccr_update_ifCarry(CCRB_C);
-		m_asm.shr(r32(d.get()), 8);				// revert shift by 8
+		copyBitToCCR(d.get(), 24, CCRB_C); // also zero for a zero shift count
+		m_asm.and_(r32(d.get()), asmjit::Imm(0xffffff));
 		ccr_update_ifZero(CCRB_Z);
 		copyBitToCCR(d.get(), 23, CCRB_N);
 //		ccr_clear(CCR_V);	already cleared above
@@ -167,7 +172,7 @@ namespace dsp56k
 
 	void JitOps::alu_lsr(TWord ab, const DspValue& _shiftAmount)
 	{
-		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_C | CCR_V));
+		CcrBatchUpdate bu(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_C | CCR_V));
 		DspValue d(m_block);
 		getALU1(d, ab);
 		if(_shiftAmount.isImm24())
@@ -420,13 +425,14 @@ namespace dsp56k
 		m_asm.test_(s);
 		m_asm.cmovz(t,s);
 
-		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
-
 		m_asm.shl(r64(t), asmjit::Imm(24 + g_aluBitOffset));
-		ccr_update_ifZero(CCRB_Z);
-
 		m_asm.mov(r64(d), r64(t));
+		// The destination need not have been loaded: derive N/Z only after
+		// installing the count, and explicitly test it after the CCR update.
+		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
+		copyBitToCCR(d, 47 + g_aluBitOffset, CCRB_N);
+		m_asm.test_(r64(d));
+		ccr_update_ifZero(CCRB_Z);
 	}
 
 	void JitOps::op_Div(TWord op)
@@ -754,6 +760,7 @@ namespace dsp56k
 		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
 
 		m_asm.or_(r.get(), r32(prevCarry));						// Set if bits 47�24 of the result are 0
+		m_asm.and_(r.get(), asmjit::Imm(0xffffff));				// Discard shifted-out bit before testing Z
 		ccr_update_ifZero(CCRB_Z);
 		setALU1(D, r);
 
@@ -779,6 +786,7 @@ namespace dsp56k
 		m_asm.or_(r.get(), r32(prevCarry));						// inject old carry into bit 47 position
 
 		ccr_n_update_by23(r64(r));								// Set if bit 47 of the result is set
+		m_asm.test_(r.get());									// N update clobbers native flags; test the result for Z
 		ccr_update_ifZero(CCRB_Z);								// Set if bits 47-24 of the result are 0
 		setALU1(D, r);
 

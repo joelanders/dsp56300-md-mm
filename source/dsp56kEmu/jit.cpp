@@ -246,6 +246,12 @@ namespace dsp56k
 		for (auto& it : m_chains)
 			it.second->notifyPMemWrite(_offset, it.second.get() == m_currentChain);
 
+		// Loop-map keys identify the two-word DO/DOR setup instruction. After
+		// recompilation its description may survive without a compiled setup
+		// block, so block destruction alone cannot invalidate that description.
+		removeLoop(_offset);
+		if(_offset) removeLoop(_offset - 1);
+
 		m_maxUsedPAddress = std::max(m_maxUsedPAddress, static_cast<size_t>(_offset));
 	}
 
@@ -405,8 +411,24 @@ namespace dsp56k
 	void Jit::destroyAllBlocks()
 	{
 		m_chains.clear();
+		m_loops.clear();
+		m_loopEnds.clear();
 		m_currentChain = nullptr;
 		checkModeChange();
+	}
+
+	void Jit::recompileAllBlocks()
+	{
+		// Block destruction removes loop descriptions, but a paused DSP can be
+		// inside a DO body whose setup instruction will not run again. For an
+		// unchanged program these descriptions remain valid across recompilation.
+		// Keep the destructive invalidation API separate: restoring stale loop
+		// descriptions after program replacement would be incorrect.
+		auto loops = m_loops;
+		auto loopEnds = m_loopEnds;
+		destroyAllBlocks();
+		m_loops = std::move(loops);
+		m_loopEnds = std::move(loopEnds);
 	}
 
 	JitBlockEmitter* Jit::acquireEmitter(JitConfig&& _config)

@@ -1,4 +1,8 @@
 #include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+#include "assembler.h"
 #include "jitdspregpool.h"
 #include "jitunittests.h"
 
@@ -31,6 +35,7 @@ namespace dsp56k
 		runTest(&JitUnittests::signextend_build, &JitUnittests::signextend_verify);
 
 		runTest(&JitUnittests::ccr_u_build, &JitUnittests::ccr_u_verify);
+		runtimeUnnormalizedFlag();
 		runTest(&JitUnittests::ccr_e_build, &JitUnittests::ccr_e_verify);
 		runTest(&JitUnittests::ccr_n_build, &JitUnittests::ccr_n_verify);
 		runTest(&JitUnittests::ccr_s_build, &JitUnittests::ccr_s_verify);
@@ -65,6 +70,118 @@ namespace dsp56k
 
 		parallelMoveXY();
 		boundedDispatch();
+		recompileActiveLoops();
+		conditionalTransferWithDeferredFlags();
+		temporaryRegisterExhaustion();
+	}
+
+	void JitUnittests::runtimeUnnormalizedFlag()
+	{
+		// Exercise the runtime-SR path used when a deferred flag is resolved
+		// without a compile-time mode. Cover all patterns of bits 48..45.
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(uint64_t bits = 0; bits < 16; ++bits)
+		{
+			const uint64_t input = bits << 45;
+			const unsigned lowBit = scaling == 1 ? 47 : scaling == 2 ? 45 : 46;
+			const auto pair = (input >> lowBit) & 3;
+			const bool expectedU = pair == 0 || pair == 3;
+			runTest([&]()
+			{
+				dsp.setSR((scaling << 10) | (expectedU ? 0u : 0x10u));
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+				emit("tst a");
+				// runTest flushes deferred flags after this builder returns.
+				verify(block->getMode() == nullptr);
+			}, [&]()
+			{
+				if(dsp.sr_val(CCRB_U) != expectedU)
+					LOG("Runtime U scaling=" << scaling << " bits=" << bits
+						<< " U=" << dsp.sr_val(CCRB_U) << " expected=" << expectedU);
+				verify(dsp.sr_val(CCRB_U) == expectedU);
+				verify(dsp.aluA() == input);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+			});
+		}
+		dsp.setSR(0);
+	}
+
+	void JitUnittests::temporaryRegisterExhaustion()
+	{
+		runTest([&]()
+		{
+			auto& pool = block->gpPool();
+			std::vector<std::unique_ptr<RegGP>> held;
+			while(pool.available()) held.push_back(std::make_unique<RegGP>(*block));
+			for(const bool weak : {false, true})
+			{
+				bool rejected = false;
+				try { RegGP excess(*block, true, weak); }
+				catch(const std::runtime_error&) { rejected = true; }
+				verify(rejected);
+				verify(pool.available() == 0);
+			}
+			// Failed acquisitions must not damage the pool. Existing weak-register
+			// reclamation remains supported when a weak owner can be released.
+			held.pop_back();
+			RegGP weak(*block, true, true);
+			RegGP replacement(*block);
+			verify(!weak.isValid());
+			verify(replacement.isValid());
+			verify(pool.available() == 0);
+		}, []() {});
+	}
+
+	void JitUnittests::conditionalTransferWithDeferredFlags()
+	{
+		if constexpr(!g_useJIT) return;
+		const auto savedConfig = dsp.getJit().getConfig();
+		for(const unsigned cap : {1u, 32u})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(const unsigned normalizationCase : {0u, 1u, 2u})
+		for(const bool testNr : {false, true})
+		{
+			const bool normalized = normalizationCase != 0;
+			dsp.resetHW();
+			auto config = savedConfig;
+			config.maxInstructionsPerBlock = cap;
+			config.linkJitBlocks = false;
+			dsp.getJit().setConfig(config);
+			dsp.getJit().destroyAllBlocks();
+			emitToMemory("abs a", 0x100);
+			emitToMemory(testNr ? "tnr x0,b" : "tnn x0,b", 0x101);
+			emitToMemory("jmp (r0)", 0x102);
+			dsp.regs().r[0].var = 0x102;
+			dsp.setSR(scaling << 10);
+			// Public U/E definitions: a positive nonzero value whose two MSP
+			// bits are 01 is normalized in each selected scaling mode; 00 isn't.
+			// Independently, Z=1 makes zero normalized (table 12-17).
+			const unsigned normalizationBit = scaling == 1 ? 47 : scaling == 2 ? 45 : 46;
+			const uint64_t input = normalizationCase == 2 ? 0
+				: uint64_t(1) << (normalizationBit - (normalized ? 0 : 1));
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+			dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x11223344556677ull)));
+			dsp.x0(0x654321);
+			dsp.setPC(0x100);
+			dsp.getJit().checkModeChange();
+			unsigned dispatches = 0;
+			while(dsp.getPC().var != 0x102 && dispatches < 3)
+			{
+				dsp.execJit();
+				++dispatches;
+			}
+			if(dispatches != (cap == 1 ? 2u : 1u))
+				std::cout << "Conditional dispatch cap " << cap << " scaling " << scaling
+					<< " normalizationCase " << normalizationCase << " testNr " << testNr
+					<< " dispatches " << dispatches << " PC " << dsp.getPC().var << '\n';
+			verify(dispatches == (cap == 1 ? 2u : 1u));
+			verify(dsp.getPC().var == 0x102);
+			verify(dsp.aluA() == input);
+			verify(dsp.x0() == 0x654321);
+			verify(dsp.aluB() == ((testNr == normalized) ? 0x654321000000ull : 0x11223344556677ull));
+		}
+		dsp.getJit().setConfig(savedConfig);
+		dsp.getJit().destroyAllBlocks();
 	}
 
 	JitUnittests::~JitUnittests()
@@ -187,6 +304,75 @@ namespace dsp56k
 	{
 		for(size_t i=0; i<_count; ++i)
 			block->asm_().nop();
+	}
+
+	void JitUnittests::recompileActiveLoops()
+	{
+		if constexpr(!g_useJIT) return;
+		struct Fixture
+		{
+			DefaultMemoryValidator validator;
+			PeripheralsNop x, y;
+			Memory memory{validator, 0x10000, 0x10000, 0x8000};
+			DSP cpu{memory, &x, &y};
+		};
+		for(const bool nested : {false, true})
+		for(const bool recompile : {false, true})
+		{
+			auto fixture = std::make_unique<Fixture>();
+			auto& cpu = fixture->cpu;
+			auto config = cpu.getJit().getConfig();
+			config.maxInstructionsPerBlock = 1;
+			config.maxDoIterations = 1;
+			config.linkJitBlocks = false;
+			cpu.getJit().setConfig(config);
+			Assembler assembler;
+			TWord pc = 0x100;
+			const auto emit = [&](const char* text)
+			{
+				const auto code = assembler.assemble(text);
+				verify(code.success());
+				for(unsigned i = 0; i < code.wordCount; ++i) cpu.memWriteP(pc++, code.word[i]);
+			};
+			if(nested) { emit("do #$2,>$108"); emit("do #$3,>$106"); }
+			else emit("do #$5,>$104");
+			emit("add b,a"); emit("nop");
+			if(nested) { emit("nop"); emit("nop"); }
+			emit("nop");
+			cpu.regs().sr.var = 0;
+			cpu.regs().lc.var = 0x321;
+			cpu.regs().a.var = 0;
+			cpu.regs().b.var = aluTestValue(0x1000000);
+			cpu.setPC(0x100);
+			const auto pausePc = nested ? 0x105u : 0x103u;
+			const auto endPc = nested ? 0x108u : 0x104u;
+			for(unsigned steps = 0; steps < 10 && cpu.getPC().var != pausePc; ++steps)
+				cpu.execUntilCycles(cpu.getCycles() + 1);
+			verify(cpu.getPC().var == pausePc);
+			verify(cpu.regs().a.var == aluTestValue(0x1000000));
+			verify(cpu.regs().lc.var == (nested ? 3u : 5u));
+			if(recompile) cpu.getJit().recompileAllBlocks();
+			for(unsigned steps = 0; steps < 100 && cpu.getPC().var != endPc; ++steps)
+				cpu.execUntilCycles(cpu.getCycles() + 1);
+			verify(cpu.getPC().var == endPc);
+			verify(cpu.regs().a.var == aluTestValue(nested ? 0x6000000 : 0x5000000));
+			verify(cpu.regs().lc.var == 0x321);
+			verify(!cpu.sr_test_noCache(SR_LF));
+			if(recompile)
+			{
+				// The outer setup has not executed since recompilation: its
+				// retained metadata has no owning compiled setup block.
+				verify(cpu.getJit().getLoops().count(0x100) == 1);
+				if(nested)
+				{
+					cpu.memWriteP(0x101, 0x10b); // change the outer DO endpoint
+					verify(cpu.getJit().getLoops().count(0x100) == 0);
+				}
+				cpu.getJit().destroyAllBlocks();
+				verify(cpu.getJit().getLoops().empty());
+				verify(cpu.getJit().getLoopEnds().empty());
+			}
+		}
 	}
 
 	void JitUnittests::boundedDispatch()

@@ -12,6 +12,7 @@
 #include "opcodes.h"
 #include "jit.h"
 #include "jittypes.h"
+#include "interrupts.h"
 
 #if 0
 #	define LOGJITPC(PC)		LOG(HEX(reinterpret_cast<uint64_t>(this)) << " exec @ " << HEX(PC))
@@ -33,8 +34,6 @@ namespace dsp56k
 	
 	using TInstructionFunc = void (DSP::*)(TWord _op);
 
-	void dspMmCleanGndSinStep(DSP* _dsp) noexcept;
-
 	template<typename Ta, typename Tb> void dspExecPeripherals(DSP* _dsp) noexcept;
 
 	static constexpr bool g_useJIT = g_jitSupported;
@@ -51,7 +50,6 @@ namespace dsp56k
 		friend class Jit;
 		friend class AotRuntime;
 		friend class DebuggerInterface;
-		friend void dspMmCleanGndSinStep(DSP* _dsp) noexcept;
 
 		// _____________________________________________________________________________
 		// types
@@ -120,11 +118,11 @@ namespace dsp56k
 #ifdef HAVE_ARM64
         // Our lock free ring buffer does not work properly on aarch4 :-O
         // https://www.arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/
-		RingBuffer<TWord, 1024, true>				m_pendingInterrupts;	// TODO: array is way too large
-		RingBuffer<TWord, 32, true>					m_pendingExternalInterrupts;
+		RingBuffer<InterruptRequest, 1024, true>				m_pendingInterrupts;	// TODO: array is way too large
+		RingBuffer<InterruptRequest, 32, true>					m_pendingExternalInterrupts;
 #else
-        RingBuffer<TWord, 1024, false>				m_pendingInterrupts;    // TODO: array is way too large
-		RingBuffer<TWord, 32, false>				m_pendingExternalInterrupts;
+        RingBuffer<InterruptRequest, 1024, false>				m_pendingInterrupts;    // TODO: array is way too large
+		RingBuffer<InterruptRequest, 32, false>				m_pendingExternalInterrupts;
 #endif
 
 		std::vector<std::function<void()>>			m_customInterrupts;
@@ -169,14 +167,6 @@ namespace dsp56k
 		std::array<SRegState,Reg_COUNT>	m_prevRegStates;
 
 		TraceMode m_trace = Disabled;
-		bool m_mmCleanGndSin = false;
-		struct MmCleanGndSinState
-		{
-			std::array<TWord, 16> lane0{};
-			std::array<TWord, 16> lane1{};
-			bool pending = false;
-		};
-		MmCleanGndSinState m_mmCleanGndSinState;
 
 		std::string		m_asm;
 		Disassembler	m_disasm;
@@ -200,18 +190,12 @@ namespace dsp56k
 
 		TReg24	getPC							() const									{ return reg.pc; }
 
-		// Optional per-core frame correction. Disabled by default.
-		void setMmCleanGndSin(const bool _enabled) noexcept { m_mmCleanGndSin = _enabled; }
-		bool mmCleanGndSin() const noexcept { return m_mmCleanGndSin; }
-
 		ASMJIT_FORCE_INLINE void exec() noexcept
 		{
 			if(g_useJIT)
 				execJit();
 			else
 			{
-				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
-					dspMmCleanGndSinStep(this);
 				execInterpreter();
 			}
 		}
@@ -228,17 +212,6 @@ namespace dsp56k
 
 			if constexpr(g_useJIT)
 			{
-				// The optional correction is evaluated before every block by execJit().
-				// Keep that specialized core on the reference path until the generated
-				// bounded loop has an equivalent pre-block hook.
-				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
-				{
-					do
-						execJit();
-					while(m_cycles < _targetCycles);
-					return;
-				}
-
 				while(m_cycles < _targetCycles)
 				{
 					const TWord invalidPC = m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
@@ -264,8 +237,6 @@ namespace dsp56k
 				execJitImpl<true>();
 			else
 			{
-				if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
-					dspMmCleanGndSinStep(this);
 				execInterpreter();
 			}
 		}
@@ -278,9 +249,6 @@ namespace dsp56k
 		template<bool InlinePeripheralCheck>
 		ASMJIT_FORCE_INLINE void execJitImpl() noexcept
 		{
-			if(ASMJIT_UNLIKELY(m_mmCleanGndSin))
-				dspMmCleanGndSinStep(this);
-
 			// Optional dispatcher specialization: the ordinary peripheral callback
 			// immediately returns when its exact instruction/cycle deadline is not
 			// due. Preserve the checkpoint but perform that same test inline so the
@@ -328,6 +296,21 @@ namespace dsp56k
 			const auto op = fetchPC();
 
 			execOp(op);
+
+			// DSP56300FM section 13 (DO): LA identifies the last instruction word,
+			// not a branch destination. Complete at that fetch, after the instruction
+			// executes, without recursively running another loop iteration.
+			if(sr_test_noCache(SR_LF)
+				&& ((pcCurrentInstruction + m_currentOpLen - 1) & 0xffffff) == reg.la.var)
+			{
+				if(reg.lc.var <= 1)
+					do_end();
+				else
+				{
+					--reg.lc.var;
+					setPC(hiword(reg.ss[ssIndex()]));
+				}
+			}
 		}
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
@@ -342,6 +325,7 @@ namespace dsp56k
 
 		template<typename Ta, typename Tb> ASMJIT_NOINLINE void execPeripherals() noexcept
 		{
+			perif[0]->beginExec();
 			// we do not have any Y peripherals that need processing atm
 			const auto delayA = static_cast<Ta*>(perif[0])->exec();
 //			const auto delayB = static_cast<Tb*>(perif[1])->exec();
@@ -361,7 +345,7 @@ namespace dsp56k
 		}
 
 		void	execInterrupts					();
-		void	execInterrupt					(uint32_t vba);
+		void	execInterrupt					(uint32_t vba, InterruptSource* source = nullptr, uint64_t token = 0);
 		void	execDefaultPreventInterrupt		();
 
 		bool	readReg							( EReg _reg, TReg8& _res ) const;
@@ -396,11 +380,11 @@ namespace dsp56k
 		void			logSC							( const char* _func ) const;
 
 		TWord			registerInterruptFunc			(std::function<void()>&& _func);
-		bool			injectInterrupt					(uint32_t _interruptVectorAddress);
+		bool			injectInterrupt					(uint32_t _interruptVectorAddress, InterruptSource* source = nullptr, uint64_t token = 0);
 		bool			injectInterruptImmediate		(uint32_t _interruptVectorAddress);
 		bool			isInterruptMasked				(const TWord _vba) const;
 
-		void			injectExternalInterrupt			(const TWord _vba);
+		void			injectExternalInterrupt			(const TWord _vba, InterruptSource* source = nullptr, uint64_t token = 0);
 		void			processExternalInterrupts		();
 
 		// Optional abort predicate for injectExternalInterrupt's producer-side wait. The external
@@ -411,11 +395,16 @@ namespace dsp56k
 		// the shipping single-owner synths are unaffected.
 		void			setExternalInterruptAbortPredicate(std::function<bool()> _p) { m_externalInterruptAbort = std::move(_p); }
 
-		// Optional per-dispatch notification: called from execInterrupt with the serviced vector, used
-		// by the HDI08 host-command arbitration to release its HCP-priority hold exactly when the
-		// host-command vector dispatches. Default: unset -> shipping synths take one always-false
-		// branch per interrupt (behaviour-neutral).
+		// Optional per-dispatch observer. Source-specific acknowledgement uses
+		// the tagged request independently of this vector-only notification.
 		void			setInterruptServicedCallback	(std::function<void(TWord)> _cb) { m_interruptServicedCallback = std::move(_cb); }
+
+		// Queued requests only; unlike hasPendingInterrupts(), a running handler
+		// does not make this true. Read on the DSP/machine owner.
+		bool hasQueuedInterrupts() const
+		{
+			return !m_pendingExternalInterrupts.empty() || !m_pendingInterrupts.empty();
+		}
 
 		bool			hasPendingInterrupts			() const
 		{
@@ -594,14 +583,15 @@ namespace dsp56k
 
 		// -- status register management
 
-		void 	sr_set					( CCRMask _bits )					{ reg.sr.var |= _bits;	}
+		// Explicit writes supersede only the corresponding deferred flags.
+		void 	sr_set					( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var |= _bits; }
 		void 	sr_set					( SRMask _bits )					{ reg.sr.var |= _bits;	}
-		void 	sr_clear				( CCRMask _bits )					{ reg.sr.var &= ~_bits; }
+		void 	sr_clear				( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var &= ~_bits; }
 		void 	sr_clear				( SRMask _bits )					{ reg.sr.var &= ~_bits; }
 
 		void 	sr_toggle				( CCRMask _bits, bool _set )		{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
 		void 	sr_toggle				( SRMask _bits, bool _set )			{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
-		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
+		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ ccrCache.dirty &= ~(1u << _bit); bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
 
 	public:
 		int 	sr_test					( CCRMask _bits ) const				{ updateDirtyCCR(); return sr_test_noCache(_bits); }
@@ -647,7 +637,10 @@ namespace dsp56k
 			1	0	Scale Up	Bits 55,54..............47,46
 			*/
 
-			const uint32_t mask = (0x3fe << sr_val_noCache(SRB_S0) >> sr_val_noCache(SRB_S1)) & 0x3ff;
+			// Keep bit 55 in the signed integer portion in every mode. Shifting
+			// 0x3fe right for scale-up incorrectly drops that sign bit.
+			const auto lowBit = 1 + sr_val_noCache(SRB_S0) - sr_val_noCache(SRB_S1);
+			const uint32_t mask = 0x3ff & ~((1u << lowBit) - 1u);
 
 			const uint32_t d2 = static_cast<uint32_t>(_ab.var >> (46 + g_aluShift));
 

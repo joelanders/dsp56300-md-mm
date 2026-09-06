@@ -1,5 +1,7 @@
 #include "jitregtracker.h"
 
+#include <stdexcept>
+
 #include "jitblock.h"
 #include "jitemitter.h"
 
@@ -314,7 +316,8 @@ namespace dsp56k
 	{
 		if(_weak)
 		{
-			assert(!m_availableRegs.empty() && "no more temporary registers left");
+			if(m_availableRegs.empty())
+				throw std::runtime_error("JIT temporary register pool exhausted (weak allocation)");
 
 			const auto reg = m_availableRegs.back();
 			m_availableRegs.pop_back();
@@ -322,13 +325,15 @@ namespace dsp56k
 			return reg;
 		}
 
-		assert((!m_availableRegs.empty() || !m_weakRegs.empty()) && "no more temporary registers left");
-
 		if(m_availableRegs.empty() && !m_weakRegs.empty())
 		{
 			m_weakRegs.front()->release();
 			assert(!m_availableRegs.empty());
 		}
+		// Assertions may be disabled in production. Never read/pop an empty
+		// vector and silently reuse a live host register in generated code.
+		if(m_availableRegs.empty())
+			throw std::runtime_error("JIT temporary register pool exhausted");
 		const auto ret = m_availableRegs.back();
 		m_availableRegs.pop_back();
 		return ret;

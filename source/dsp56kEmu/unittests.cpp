@@ -53,6 +53,9 @@ namespace dsp56k
 	void UnitTests::runAllTests()
 	{
 		conditionCodes();
+		partialFlagWrites();
+		rotateFlags();
+		logicalShiftFlags();
 		aguModulo();
 		aguMultiWrapModulo();
 		aguBitreverse();
@@ -179,6 +182,40 @@ namespace dsp56k
 
 	void UnitTests::conditionCodes()
 	{
+		// DSP56300FM tables 12-17/18. Test every software-writable CCR
+		// pattern, including Z=1 together with N!=V. The manual's '+' is OR,
+		// not addition or parity. Do not derive this oracle from a backend.
+		for(TWord ccr = 0; ccr < 256; ++ccr)
+		{
+			const bool c = ccr & 1, v = ccr & 2, z = ccr & 4, n = ccr & 8;
+			const bool u = ccr & 16, e = ccr & 32, l = ccr & 64;
+			const bool expected[] = {
+				!c, n == v, !z, !n, !z && (u || e), !e, !l, !z && (n == v),
+				c, n != v, z, n, z || (!u && !e), e, l, z || (n != v)
+			};
+			for(TWord cc = 0; cc < 16; ++cc)
+				runTest([&]()
+				{
+					dsp.setSR(ccr);
+					dsp.setALU(false, TReg56(0x0123456789abcdll));
+					dsp.setALU(true, TReg56(0xfedcba98765432ll));
+					dsp.regs().r[0].var = 0x123456;
+					dsp.regs().r[1].var = 0x654321;
+					emit(0x020801 | (cc << 12)); // Tcc R0,R1, condition encoding from table 12-18
+				}, [&]()
+				{
+					const auto result = expected[cc] ? 0x123456u : 0x654321u;
+					if(dsp.regs().r[1].var != result)
+						LOG("Condition truth table CCR=" << std::hex << ccr << " cc=" << cc
+							<< " R1=" << dsp.regs().r[1].var << " expected=" << result);
+					verify(dsp.regs().r[1].var == result);
+					verify(dsp.regs().r[0].var == 0x123456);
+					verify(dsp.aluA() == 0x0123456789abcdull && dsp.aluB() == 0xfedcba98765432ull);
+					verify(dsp.getSR().var == ccr);
+				});
+		}
+		dsp.setSR(0);
+
 		auto invert = [](ConditionCode _cc)
 		{
 			switch (_cc)
@@ -235,7 +272,7 @@ namespace dsp56k
 		run(+1, {CCCC_Plus, CCCC_GreaterEqual, CCCC_GreaterThan, CCCC_NotEqual, CCCC_CarryClear, CCCC_ExtensionClear});
 		run(-1, {CCCC_Minus, CCCC_LessEqual, CCCC_LessThan, CCCC_NotEqual, CCCC_CarryClear, CCCC_ExtensionClear});
 
-		run(0, {CCCC_Equal, CCCC_LessEqual, CCCC_GreaterEqual, CCCC_CarryClear, CCCC_ExtensionClear, CCCC_NotNormalized});
+		run(0, {CCCC_Equal, CCCC_LessEqual, CCCC_GreaterEqual, CCCC_CarryClear, CCCC_ExtensionClear, CCCC_Normalized});
 
 		run(0xff'ffffff'ffffff, {CCCC_Minus, CCCC_ExtensionClear});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_ExtensionClear});
@@ -244,9 +281,39 @@ namespace dsp56k
 		run(0x00'800000'000000, {CCCC_Plus, CCCC_ExtensionSet});
 
 		run(0x00'c00000'000000, {CCCC_Plus, CCCC_NotNormalized});
-		run(0x00'000000'000000, {CCCC_Plus, CCCC_NotNormalized});
+		run(0x00'000000'000000, {CCCC_Plus, CCCC_Normalized});
 		run(0xff'800000'000000, {CCCC_Minus, CCCC_Normalized});
 		run(0x00'400000'000000, {CCCC_Plus, CCCC_Normalized});
+
+		// DSP56300FM table 5-1: E tests the complete signed integer portion,
+		// including bit 55 in all scaling modes (down: 48, normal: 47, up: 46).
+		for(unsigned scaling = 0; scaling < 3; ++scaling)
+		{
+			const unsigned lowBit = scaling == 0 ? 47 : scaling == 1 ? 48 : 46;
+			for(const uint64_t value : {0ull, 0xffffffffffffffull, 0x003fffffffffffull,
+				0x00400000000000ull, 0x007fffffffffffull, 0x00800000000000ull,
+				0x00ffffffffffffull, 0x01000000000000ull, 0x7ff00000000000ull,
+				0x80000000000000ull, 0x80100000000000ull, 0xff800000000000ull,
+				0xffc00000000000ull})
+			{
+				bool extension = false;
+				for(unsigned bit = lowBit; bit < 55; ++bit)
+					extension |= ((value >> bit) & 1) != ((value >> 55) & 1);
+				for(const bool ab : {false, true})
+					runTest([&]()
+					{
+						dsp.setSR(scaling << SRB_S0);
+						dsp.setALU(ab, TReg56(value));
+						emit(ab ? "tst b" : "tst a");
+					}, [&]()
+					{
+						if(bool(dsp.sr_test(CCR_E)) != extension)
+							LOG("Extension mismatch scaling=" << scaling << " value=" << std::hex << value
+								<< " sr=" << dsp.getSR().var << " expected=" << extension);
+						verify(bool(dsp.sr_test(CCR_E)) == extension);
+					});
+			}
+		}
 	}
 
 	void UnitTests::aguModulo()
@@ -626,6 +693,41 @@ namespace dsp56k
 
 	void UnitTests::addl()
 	{
+		// 56-bit signed arithmetic fits in int64_t here, including 2*D+S.
+		constexpr uint64_t mask = 0x00ffffffffffffffull;
+		const auto signed56 = [](uint64_t v) -> int64_t
+		{
+			return v < (1ull << 55) ? int64_t(v) : int64_t(v) - (1ll << 56);
+		};
+		for(const uint64_t destination : {0ull, 1ull, mask, 1ull << 54, 1ull << 55,
+			0x015a7b3f37c905ull})
+		for(const uint64_t source : {0ull, 1ull, mask, (1ull << 55) - 1,
+			1ull << 55, 0xd55ad0723547d7ull})
+		for(const bool ab : {false, true})
+		{
+			const auto doubled = 2 * signed56(destination);
+			const auto sum = doubled + signed56(source);
+			const bool shiftOverflow = doubled < -(1ll << 55) || doubled >= (1ll << 55);
+			const bool overflow = shiftOverflow || sum < -(1ll << 55) || sum >= (1ll << 55);
+			const bool carry = (((destination << 1) & mask) + source) > mask;
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_V | CCR_C;
+				dsp.setALU(ab, TReg56(destination));
+				dsp.setALU(!ab, TReg56(source));
+				emit(ab ? "addl a,b" : "addl b,a");
+			}, [&]()
+			{
+				verify((ab ? dsp.aluB().var : dsp.aluA().var) == (uint64_t(sum) & mask));
+				verify((ab ? dsp.aluA().var : dsp.aluB().var) == source);
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == overflow);
+				// The manual only guarantees carry without pre-shift overflow.
+				if(!shiftOverflow)
+					verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x222222)));
@@ -756,6 +858,38 @@ namespace dsp56k
 
 	void UnitTests::asl_D()
 	{
+		// Independent bit-by-bit ASL oracle (DSP56300FM 13-15).
+		for(const uint64_t input : {0ull, 1ull, 0x0080000000000000ull,
+			0x0040000000000000ull, 0x00ffffffffffffffull})
+		for(const unsigned count : {0u, 1u, 8u, 55u})
+		for(const bool registerCount : {false, true})
+		{
+			auto expected = input;
+			bool carry = false, overflow = false;
+			for(unsigned bit = 0; bit < count; ++bit)
+			{
+				carry = (expected >> 55) != 0;
+				expected = (expected << 1) & 0x00ffffffffffffffull;
+				overflow |= carry != static_cast<bool>(expected >> 55);
+			}
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(input));
+				dsp.x0(count);
+				const auto instruction = std::string("asl ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) + ",a,b";
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify(dsp.aluA().var == input);
+				verify(dsp.aluB().var == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == overflow);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xaaabcdef123456)));
@@ -838,6 +972,38 @@ namespace dsp56k
 
 	void UnitTests::asr_D()
 	{
+		// DSP56300FM ASR: C receives the last discarded bit, or zero for
+		// a zero count. Use an unsigned 56-bit oracle, not another backend.
+		for(const uint64_t value : {0x0000000000000001ull, 0x00ffffffffffffffull,
+			0x0080000000000000ull, 0x0055aa55aa55aa55ull})
+		for(const unsigned count : {0u, 1u, 7u, 8u, 16u, 24u, 55u})
+		for(const bool destinationB : {false, true})
+		for(const bool registerCount : {false, true})
+		{
+			constexpr uint64_t mask = 0x00ffffffffffffffull;
+			auto expected = value >> count;
+			if(count && (value & (1ull << 55)))
+				expected |= mask ^ (mask >> count);
+			const bool carry = count && ((value >> (count - 1)) & 1);
+			runTest([&]()
+			{
+				dsp.regs().sr.var = CCR_C | CCR_V;
+				dsp.setALU(false, TReg56(value));
+				dsp.x0(count);
+				const auto instruction = std::string("asr ") +
+					(registerCount ? "x0" : "#" + std::to_string(count)) +
+					",a," + (destinationB ? "b" : "a");
+				emit(instruction.c_str());
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB().var : dsp.aluA().var) == expected);
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == carry);
+				verify(!dsp.sr_test(CCR_V));
+				if(destinationB)
+					verify(dsp.aluA().var == value);
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x000599f2204000)));
@@ -1070,6 +1236,47 @@ namespace dsp56k
 
 	void UnitTests::clb()
 	{
+		// DSP56300FM Rev. 5, 13-42: the signed count determines N/Z;
+		// all flags other than N/Z/V are preserved. Check both aliased and
+		// separate destinations, whose prior value must not determine N.
+		const auto testFlags = [&](const uint64_t source, const int count, const bool same)
+		{
+			runTest([&]()
+			{
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(source)));
+				dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0xffffff00000000ull)));
+				dsp.regs().sr.var = 0xff;
+				emit(same ? "clb a,a" : "clb a,b");
+			}, [&]()
+			{
+				const auto expected = (static_cast<uint64_t>(count) << 24) & 0xffffffffffffffull;
+				verify((same ? dsp.aluA() : dsp.aluB()) == expected);
+				verify((dsp.getSR().var & 0xff) == (0xf1u | (count < 0 ? 8u : 0u) | (count == 0 ? 4u : 0u)));
+			});
+		};
+		for(const bool same : {false, true})
+		{
+			testFlags(0, 0, same);
+			testFlags(0xffffffffffffffull, -47, same);
+			for(unsigned bit = 0; bit < 55; ++bit)
+			{
+				testFlags(uint64_t(1) << bit, static_cast<int>(bit) - 46, same);
+				testFlags((~(uint64_t(1) << bit)) & 0xffffffffffffffull, static_cast<int>(bit) - 46, same);
+			}
+		}
+
+		runTest([&]()
+		{
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xfc000000000000ull)));
+			dsp.regs().sr.var = 0;
+			emit("asr a"); // A=FE:000000:000000, E/U/N=1, C/Z/V=0.
+			emit("clb a,b"); // Seven leading ones => count +2, N/Z/V=0.
+		}, [&]()
+		{
+			verify(dsp.aluB() == 0x2000000);
+			verify((dsp.getSR().var & 0xff) == 0x30);
+		});
+
 		auto testClb = [&](const uint64_t _a, const uint64_t _b)
 		{
 			runTest([&]()
@@ -1091,8 +1298,267 @@ namespace dsp56k
 		testClb(0, 0);	// special case
 	}
 
+	void UnitTests::partialFlagWrites()
+	{
+		// Public ISA: logical operations replace N/Z/V but preserve E/U/C.
+		// No SR read may separate ASR from the logical operation: the prior
+		// arithmetic flags must remain deferred until the final observation.
+		const char* operationsA[] = {"and x0,a", "or x0,a", "eor x0,a", "not a"};
+		const char* operationsB[] = {"and x0,b", "or x0,b", "eor x0,b", "not b"};
+		for(const uint64_t input : {0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const TWord x : {0u, 0x800001u, 0xffffffu})
+		for(const bool separate : {false, true})
+		for(unsigned operation = 0; operation < 4; ++operation)
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x0055aaaa123456ull : shifted;
+			const TWord msp = (before >> 24) & 0xffffff;
+			const TWord results[] = {msp & x, msp | x, msp ^ x, (~msp) & 0xffffff};
+			const auto result = results[operation];
+			const uint64_t expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const auto integer = shifted >> 47;
+			const bool extension = integer != 0 && integer != 0x1ff;
+			const bool unnormalized = ((shifted >> 47) & 1) == ((shifted >> 46) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u) | (input & 1);
+			runTest([&]()
+			{
+				dsp.setSR(0);
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0x0055aaaa123456ull)));
+				dsp.x0(x);
+				emit("asr a");
+				emit(separate ? operationsB[operation] : operationsA[operation]);
+			}, [&]()
+			{
+				verify(dsp.aluA() == (separate ? shifted : expected));
+				verify(dsp.aluB() == (separate ? expected : 0x0055aaaa123456ull));
+				// S's standard scaling behavior is a separate question; all other
+				// flags, including unchanged L=0, are checked here.
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify(dsp.x0() == x);
+			});
+		}
+	}
+
+	void UnitTests::rotateFlags()
+	{
+		// DSP56300FM 13-165/166: rotate only the 24-bit MSP through C.
+		// EXP/LSP and E/U are preserved; N/Z describe the MSP, and V=0.
+		for(const bool right : {false, true})
+		for(const bool destinationB : {false, true})
+		for(const uint64_t extension : {0u, 1u, 0x80u, 0xffu})
+		for(const TWord msp : {0u, 1u, 0x400000u, 0x7fffffu, 0x800000u, 0xffffffu})
+		for(const TWord carry : {0u, 1u})
+		for(const TWord preserved : {0u, 0x50u, 0xa0u, 0xf0u})
+		{
+			const uint64_t input = (extension << 48) | (uint64_t(msp) << 24) | 0x123456;
+			const TWord result = right ? (msp >> 1) | (carry << 23)
+				: ((msp << 1) | carry) & 0xffffff;
+			const TWord outCarry = right ? msp & 1u : msp >> 23;
+			const uint64_t expected = (input & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			runTest([&]()
+			{
+				dsp.setSR(preserved | 0x0e | carry); // stale N/Z/V must be replaced
+				dsp.setALU(destinationB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!destinationB, TReg56(0x123456789abcdell));
+				emit(right ? (destinationB ? "ror b" : "ror a") : (destinationB ? "rol b" : "rol a"));
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == 0x123456789abcde);
+				// Disabled standard S computation is outside this regression.
+				const auto expectedCcr = (preserved & 0x7f) | ((result & 0x800000) ? 8u : 0u)
+					| (!result ? 4u : 0u) | outCarry;
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Rotate flags right=" << right << " B=" << destinationB << std::hex
+						<< " input=" << input << " carry=" << carry << " preserved=" << preserved
+						<< " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+			});
+		}
+
+		// Preserve E/U from an arithmetic result, with no intervening SR read,
+		// including when the rotate modifies the other accumulator.
+		for(const bool right : {false, true})
+		for(const bool arithmeticB : {false, true})
+		for(const bool separate : {false, true})
+		for(const uint64_t input : {0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x01400000123456ull : shifted;
+			const TWord msp = (before >> 24) & 0xffffff;
+			const TWord carry = input & 1;
+			const TWord result = right ? (msp >> 1) | (carry << 23)
+				: ((msp << 1) | carry) & 0xffffff;
+			const uint64_t expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const unsigned highFraction = scaling == 1 ? 48 : scaling == 2 ? 46 : 47;
+			const auto integer = shifted >> highFraction;
+			const bool extension = integer != 0 && integer != ((uint64_t(1) << (56 - highFraction)) - 1);
+			const bool unnormalized = ((shifted >> highFraction) & 1) == ((shifted >> (highFraction - 1)) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u)
+				| (right ? msp & 1u : msp >> 23);
+			const bool destinationB = arithmeticB != separate;
+			runTest([&]()
+			{
+				dsp.setSR(scaling << 10);
+				dsp.setALU(arithmeticB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!arithmeticB, TReg56(0x01400000123456ll));
+				emit(arithmeticB ? "asr b" : "asr a");
+				emit(right ? (destinationB ? "ror b" : "ror a") : (destinationB ? "rol b" : "rol a"));
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == (separate ? shifted : 0x01400000123456ull));
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Rotate sequence right=" << right << " arithmeticB=" << arithmeticB
+						<< " separate=" << separate << " scaling=" << scaling << std::hex
+						<< " input=" << input << " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+			});
+		}
+		dsp.setSR(0);
+	}
+
+	void UnitTests::logicalShiftFlags()
+	{
+		// DSP56300FM 13-93..96: shift only the MSP, preserve EXP/LSP/E/U,
+		// replace N/Z/C, and clear V. A zero count explicitly clears C.
+		// Use repeated one-bit operations as an independent oracle, avoiding
+		// the host's variable-count masking and native carry conventions.
+		const auto shift = [](TWord msp, const unsigned count, const bool right, TWord& carry)
+		{
+			carry = 0;
+			for(unsigned i = 0; i < count; ++i)
+			{
+				carry = right ? msp & 1u : msp >> 23;
+				msp = right ? msp >> 1 : (msp << 1) & 0xffffff;
+			}
+			return msp;
+		};
+		const char* sources[] = {"", "x0", "x1", "y0", "y1", "a1", "b1", ""};
+		for(const bool right : {false, true})
+		for(const bool destinationB : {false, true})
+		for(unsigned count = 0; count <= 24; ++count)
+		for(unsigned form = 0; form < 8; ++form)
+		for(const TWord msp : {0u, 1u, 0x400000u, 0x7fffffu, 0x800000u, 0xffffffu})
+		for(const TWord initialCcr : {0u, 0xffu})
+		{
+			if(form == 7 && count != 1)
+				continue;
+			uint64_t input[2] = {0x8155aaaa123456ull, 0x7fabcdef654321ull};
+			input[destinationB] = (input[destinationB] & 0xff000000ffffffull) | (uint64_t(msp) << 24);
+			if(form == 5 || form == 6)
+				input[form - 5] = (input[form - 5] & 0xff000000ffffffull) | (uint64_t(count) << 24);
+			TWord controls[] = {2, 3, 5, 7};
+			if(form >= 1 && form <= 4)
+				controls[form - 1] = count;
+			TWord carry;
+			const auto result = shift((input[destinationB] >> 24) & 0xffffff, count, right, carry);
+			const auto expected = (input[destinationB] & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const auto expectedCcr = (initialCcr & 0x70) | ((result & 0x800000) ? 8u : 0u)
+				| (!result ? 4u : 0u) | carry;
+			const std::string operation = std::string(right ? "lsr " : "lsl ")
+				+ (form == 0 ? "#" + std::to_string(count) + "," : form == 7 ? "" : std::string(sources[form]) + ",")
+				+ (destinationB ? "b" : "a");
+			runTest([&]()
+			{
+				dsp.setSR(initialCcr);
+				dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(input[0])));
+				dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(input[1])));
+				dsp.x0(controls[0]); dsp.x1(controls[1]); dsp.y0(controls[2]); dsp.y1(controls[3]);
+				emit(operation.c_str());
+			}, [&]()
+			{
+				if((destinationB ? dsp.aluB() : dsp.aluA()) != expected || (dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Logical shift " << operation << " count=" << count << std::hex << " input=" << input[destinationB]
+						<< " initialCCR=" << initialCcr << " SR=" << dsp.getSR().var << " expectedCCR=" << expectedCcr);
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == input[!destinationB]);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr); // standard S behavior is separately disabled
+				verify(dsp.x0() == controls[0] && dsp.x1() == controls[1]
+					&& dsp.y0() == controls[2] && dsp.y1() == controls[3]);
+			});
+		}
+
+		// Retire replaced lazy flags while preserving arithmetic E/U, without
+		// reading SR between instructions, even for separate accumulators.
+		for(const bool right : {false, true})
+		for(const bool arithmeticB : {false, true})
+		for(const bool separate : {false, true})
+		for(const uint64_t input : {0ull, 0x02000000000001ull, 0xfc000000000000ull,
+			0x00800000000001ull, 0xff000000000000ull})
+		for(const unsigned scaling : {0u, 1u, 2u})
+		for(const unsigned count : {0u, 1u, 24u})
+		for(const bool registerCount : {false, true})
+		{
+			const uint64_t shifted = (input >> 1) | (input & (uint64_t(1) << 55));
+			const uint64_t before = separate ? 0x01400000123456ull : shifted;
+			TWord carry;
+			const auto result = shift((before >> 24) & 0xffffff, count, right, carry);
+			const auto expected = (before & 0xff000000ffffffull) | (uint64_t(result) << 24);
+			const unsigned highFraction = scaling == 1 ? 48 : scaling == 2 ? 46 : 47;
+			const auto integer = shifted >> highFraction;
+			const bool extension = integer != 0 && integer != ((uint64_t(1) << (56 - highFraction)) - 1);
+			const bool unnormalized = ((shifted >> highFraction) & 1) == ((shifted >> (highFraction - 1)) & 1);
+			const TWord expectedCcr = (extension ? 0x20u : 0u) | (unnormalized ? 0x10u : 0u)
+				| ((result & 0x800000) ? 8u : 0u) | (!result ? 4u : 0u) | carry;
+			const bool destinationB = arithmeticB != separate;
+			const std::string operation = std::string(right ? "lsr " : "lsl ")
+				+ (registerCount ? "x0," : "#" + std::to_string(count) + ",") + (destinationB ? "b" : "a");
+			runTest([&]()
+			{
+				dsp.setSR(scaling << 10);
+				dsp.setALU(arithmeticB, TReg56(static_cast<TReg56::MyType>(input)));
+				dsp.setALU(!arithmeticB, TReg56(0x01400000123456ll));
+				dsp.x0(count);
+				emit(arithmeticB ? "asr b" : "asr a");
+				emit(operation.c_str());
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == expected);
+				verify((destinationB ? dsp.aluA() : dsp.aluB()) == (separate ? shifted : 0x01400000123456ull));
+				if((dsp.getSR().var & 0x7f) != expectedCcr)
+					LOG("Logical shift sequence " << operation << " arithmeticB=" << arithmeticB
+						<< " separate=" << separate << " scaling=" << scaling << std::hex
+						<< " input=" << input << " SR=" << dsp.getSR().var << " expected=" << expectedCcr);
+				verify((dsp.getSR().var & 0x7f) == expectedCcr);
+				verify((dsp.getSR().var & 0xc00) == (scaling << 10));
+				verify(dsp.x0() == count);
+			});
+		}
+		dsp.setSR(0);
+	}
+
 	void UnitTests::clr()
 	{
+		// DSP56300FM Rev. 5, CLR (13-44): E/N/V=0, U/Z=1, C unchanged.
+		// Do not observe SR between instructions: doing so resolves the lazy
+		// flags and would hide a stale pre-CLR result in the interpreter.
+		for(const bool destinationB : {false, true})
+		for(const bool negative : {false, true})
+		for(const TWord carry : {0u, 1u})
+		for(const TWord preserved : {0u, 0xc1u})
+		{
+			runTest([&]()
+			{
+				dsp.setALU(destinationB, TReg56(static_cast<TReg56::MyType>((negative ? 0xffffff00000000ull : 0x1000000000000ull) | carry)));
+				dsp.regs().sr.var = preserved;
+				emit(destinationB ? "asr b" : "asr a");
+				emit(destinationB ? "clr b" : "clr a");
+			}, [&]()
+			{
+				verify((destinationB ? dsp.aluB() : dsp.aluA()) == 0);
+				// ASR supplies C from bit zero; CLR preserves it and sticky S/L.
+				verify((dsp.getSR().var & 0xff) == ((preserved & 0xc0) | 0x14 | carry));
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(true , TReg56(static_cast<TReg56::MyType>(0x99aabbccddeeff)));
@@ -2266,6 +2732,29 @@ namespace dsp56k
 
 	void UnitTests::neg()
 	{
+		// NEG preserves C; V describes this operation, and L latches V.
+		// Only negating the most negative 56-bit value overflows.
+		for(const uint64_t value : {0ull, 1ull, 0x00ffffffffffffffull,
+			0x007fffffffffffffull, 0x0080000000000000ull})
+		for(const unsigned initial : {0u, unsigned(CCR_C | CCR_V), unsigned(CCR_L)})
+		for(const bool ab : {false, true})
+		{
+			const bool overflow = value == 0x0080000000000000ull;
+			runTest([&]()
+			{
+				dsp.regs().sr.var = initial;
+				dsp.setALU(ab, TReg56(value));
+				emit(ab ? "neg b" : "neg a");
+			}, [&]()
+			{
+				verify((ab ? dsp.aluB().var : dsp.aluA().var) ==
+					((0ull - value) & 0x00ffffffffffffffull));
+				verify(static_cast<bool>(dsp.sr_test(CCR_V)) == overflow);
+				verify(static_cast<bool>(dsp.sr_test(CCR_L)) == (overflow || (initial & CCR_L)));
+				verify(static_cast<bool>(dsp.sr_test(CCR_C)) == static_cast<bool>(initial & CCR_C));
+			});
+		}
+
 		runTest([&]()
 		{
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(1)));

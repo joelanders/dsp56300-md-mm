@@ -68,10 +68,16 @@ namespace dsp56k
 		if (_abDst != _abSrc)
 			m_dspRegs.getALU(alu.get(), _abSrc);
 
-		aluSignextendTo64(alu);
+		// Use raw right-aligned bits here so bit 56 can retain carry.
+		if constexpr(g_leftAlignedAlu)
+			m_asm.asr(alu, alu, asmjit::Imm(8));
+		else
+			signextend56to64(alu);
 
 		const RegGP oldAlu(m_block);
 		m_asm.mov(oldAlu, alu);
+		// Zero extension also makes a zero shift produce C=0.
+		m_asm.and_(alu, alu, asmjit::Imm(0x00ffffffffffffffull));
 
 		if(_v)
 			m_asm.lsl(alu, alu, _v->get());
@@ -85,7 +91,7 @@ namespace dsp56k
 		// The easiest way to check this is to shift back and compare if the initial alu value is identical ot the backshifted one
 		{
 			const RegScratch s(m_block);
-			aluSignextendTo64(s, alu);
+			signextend56to64(s, alu);
 			if(_v)
 				m_asm.asr(s, s, _v->get());
 			else
@@ -94,7 +100,10 @@ namespace dsp56k
 		}
 
 		ccr_update_ifNotZero(CCRB_V);
+		ccr_l_update_by_v();
 
+		if constexpr(g_leftAlignedAlu)
+			m_asm.lsl(alu, alu, asmjit::Imm(8));
 		m_dspRegs.mask56(alu);
 
 		ccr_dirty(_abDst, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
@@ -379,10 +388,12 @@ namespace dsp56k
 		m_asm.test_(s);
 		m_asm.csel(r32(t), r32(t), asmjit::a64::regs::wzr, asmjit::arm::CondCode::kNotZero);
 
-		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
-
 		m_asm.lsl(r64(d), r64(t), asmjit::Imm(24 + g_aluBitOffset));
+		// Flags come from the new count, never the old/unloaded destination
+		// or native flags left by an earlier instruction (LSL does not set NZCV).
+		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
+		copyBitToCCR(d, 47 + g_aluBitOffset, CCRB_N);
+		m_asm.test_(r64(d));
 		ccr_update_ifZero(CCRB_Z);
 	}
 
@@ -698,6 +709,7 @@ namespace dsp56k
 		ccr_n_update_by23(r64(r));						// Set if bit 47 of the result is set
 
 		m_asm.orr(r.get(), r.get(), r32(prevCarry.get()));
+		m_asm.and_(r.get(), asmjit::Imm(0xffffff));			// Discard shifted-out bit before testing Z
 		m_asm.test_(r32(r));
 		ccr_update_ifZero(CCRB_Z);							// Set if bits 47�24 of the result are 0
 

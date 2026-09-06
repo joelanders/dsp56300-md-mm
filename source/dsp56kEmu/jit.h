@@ -103,6 +103,10 @@ namespace dsp56k
 		void onDebuggerAttached(DebuggerInterface& _debugger) const;
 
 		void destroyAllBlocks();
+		// Discard compiled code while retaining loop descriptions for the same
+		// program (e.g. configuration changes). Call outside DSP execution only.
+		// Do not use after replacing program memory or restoring another machine.
+		void recompileAllBlocks();
 
 		JitBlockEmitter* acquireEmitter(JitConfig&& _config);
 		JitBlockEmitter* acquireEmitter(TWord _pc);

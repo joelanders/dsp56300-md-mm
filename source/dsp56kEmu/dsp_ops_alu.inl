@@ -270,15 +270,21 @@ namespace dsp56k
 		TReg56&			d = ab ? reg.b : reg.a;
 		const TReg56&	s = ab ? reg.a : reg.b;
 
-		const TReg56 old = d;
-		const TInt64 res = (aluSignextend(d) << 1) + aluSignextend(s);
-		d.var = res;
+		const auto old = static_cast<uint64_t>(d.var);
+		const auto source = static_cast<uint64_t>(s.var);
+		const auto shifted = (old << 1) & (0x00ffffffffffffffull << g_aluShift);
+		const auto res = shifted + source;
+		constexpr auto sign = uint64_t(1) << (55 + g_aluShift);
+		const bool overflow = ((old ^ shifted) & sign) ||
+			(((res ^ shifted) & (res ^ source)) & sign);
+		const bool carry = g_aluShift ? res < shifted : res > 0x00ffffffffffffffull;
+		d.var = static_cast<TReg56::MyType>(res);
 		aluMask(d);
 
 		sr_z_update(d);
-		sr_clear(CCR_V);		// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
-		//sr_l_update_by_v();
-		sr_c_update_arithmetic(old,d);
+		sr_toggle(CCR_V, overflow);
+		sr_l_update_by_v();
+		sr_toggle(CCR_C, carry);
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
@@ -328,6 +334,9 @@ namespace dsp56k
 
 	void DSP::alu_clr(bool ab)
 	{
+		// Retire the preceding result before installing CLR's fixed flags.
+		// Otherwise a later SR read can restore stale E/U/N from that result.
+		updateDirtyCCR();
 		TReg56& dst = ab ? reg.b : reg.a;
 		dst.var = 0;
 
@@ -699,6 +708,8 @@ namespace dsp56k
 	}
 	inline void DSP::op_Clb(const TWord op)
 	{
+		// CLB replaces N but preserves the preceding arithmetic E/U flags.
+		updateDirtyCCR();
 		const auto S = getFieldValue<Clb, Field_S>(op);
 		const auto D = getFieldValue<Clb, Field_D>(op);
 
@@ -737,7 +748,8 @@ namespace dsp56k
 			count = bsr - (64 - 9 - 1);  // range: -47 to +8
 		}
 
-		d.var = static_cast<TInt64>(count) << (24 + g_aluShift);
+		// Form the signed count's bit pattern without left-shifting a negative integer.
+		d.var = static_cast<uint64_t>(count) << (24 + g_aluShift);
 		aluMask(d);
 
 		// N: Set if bit 47 (= bit 23 of the 24-bit result) is set
@@ -1254,22 +1266,18 @@ namespace dsp56k
 
 		auto& d = D ? reg.b.var : reg.a.var;
 
-		const auto c = bitvalue<uint64_t,24 + g_aluShift>(d);	// bit 24 = LSB of a1/b1
-		auto shifted = d;
-		reinterpret_cast<uint64_t&>(shifted) >>= (24 + g_aluShift);	// isolate a1/b1
-		const auto oldBit0 = shifted & 1;
-		shifted >>= 1;									// shift right
-		shifted |= static_cast<TInt64>(sr_val(CCRB_C)) << 23;	// inject old carry into bit 23 (MSB position)
-		shifted &= 0xffffff;
-		shifted <<= (24 + g_aluShift);					// move back
+		// Mask before shifting so EXP bit 0 cannot enter the 24-bit MSP.
+		constexpr uint64_t mspMask = uint64_t(0xffffff) << (24 + g_aluShift);
+		const TWord msp = (static_cast<uint64_t>(d) >> (24 + g_aluShift)) & 0xffffff;
+		const TWord result = (msp >> 1) | (static_cast<TWord>(sr_val(CCRB_C)) << 23);
 
-		d &= static_cast<TInt64>(0xff000000ffffff00ull);
-		d |= shifted;
+		d &= static_cast<TInt64>(~mspMask);
+		d |= static_cast<TInt64>(uint64_t(result) << (24 + g_aluShift));
 
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(shifted));
-		sr_toggle(CCR_Z, shifted == 0);
+		sr_toggle(CCRB_N, bitvalue<TWord, 23>(result));
+		sr_toggle(CCR_Z, result == 0);
 		sr_clear(CCR_V);
-		sr_toggle(CCRB_C, static_cast<Bit>(oldBit0));
+		sr_toggle(CCRB_C, static_cast<Bit>(msp & 1));
 	}
 	inline void DSP::op_Sbc(const TWord op)
 	{
