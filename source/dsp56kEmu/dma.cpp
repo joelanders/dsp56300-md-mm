@@ -102,12 +102,23 @@ namespace dsp56k
 
 		m_dma.removeTriggerTarget(this);
 
+		const bool wasEnabled = static_cast<bool>(bitvalue(m_dcr, De));
 		m_dcr = _controlRegister;
 
 		LOGDMA("DMA set DCR" << m_index << " = " << HEX(_controlRegister));
 
 		if (!bitvalue(m_dcr, De))
+		{
+			// Request transfers are synchronous in this model: there is no
+			// captured request waiting after triggerByRequest returns. A delayed
+			// block already accepted by DE must still reach finishTransfer.
+			if(wasEnabled && m_pendingTransfer <= 0)
+				finishTransfer();
 			return;
+		}
+
+		if(!wasEnabled)
+			m_dma.channelEnabled(m_index);
 
 		if(bitvalue(m_dcr, D3d))
 		{
@@ -253,6 +264,7 @@ namespace dsp56k
 		if(!bittest(m_dcr, De))
 			return;
 
+		m_dma.transferStarted(m_index);
 		if(execTransfer())
 			finishTransfer();
 	}
@@ -767,13 +779,15 @@ namespace dsp56k
 			m_dcr &= ~(1 << De);
 
 		m_dma.clearActiveChannel(m_index);
+		m_dma.transferDone(m_index);
 
 		if(bitvalue(m_dcr, Die))
 			m_peripherals.getDSP().injectInterrupt(Vba_DMAchannel0 + (m_index<<1));
 	}
 
 	Dma::Dma(IPeripherals& _peripherals)
-		: m_dstr((1 << Dtd0) | (1 << Dtd1) | (1 << Dtd2) | (1 << Dtd3) | (1 << Dtd4) | (1 << Dtd5))
+		: m_peripherals(_peripherals)
+		, m_dstr((1 << Dtd0) | (1 << Dtd1) | (1 << Dtd2) | (1 << Dtd3) | (1 << Dtd4) | (1 << Dtd5))
 		, m_channels({
 			  DmaChannel(*this, _peripherals, 0),
 			  DmaChannel(*this, _peripherals, 1),
@@ -812,10 +826,28 @@ namespace dsp56k
 
 	uint32_t Dma::exec() noexcept
 	{
-		if((m_dstr & (1 << Dact)) == 0)
-			return IPeripherals::MaxDelayCycles;
+		auto delay = IPeripherals::MaxDelayCycles;
+		if(m_pendingDoneClear)
+		{
+			const auto now = m_peripherals.getDSP().getInstructionCounter();
+			for(TWord channel = 0; channel < m_channels.size(); ++channel)
+			{
+				const TWord bit = 1u << channel;
+				if(!(m_pendingDoneClear & bit)) continue;
+				if(now >= m_doneClearClock[channel])
+				{
+					m_dstr &= ~bit;
+					m_pendingDoneClear &= ~bit;
+				}
+				else
+					delay = std::min(delay, static_cast<uint32_t>(m_doneClearClock[channel] - now));
+			}
+		}
 
-		auto delay = m_channels[0].exec();
+		if((m_dstr & (1 << Dact)) == 0)
+			return delay;
+
+		delay = std::min(delay, m_channels[0].exec());
 
 		delay = std::min(delay, m_channels[1].exec());
 		delay = std::min(delay, m_channels[2].exec());
@@ -824,6 +856,31 @@ namespace dsp56k
 		delay = std::min(delay, m_channels[5].exec());
 
 		return delay;
+	}
+
+	void Dma::channelEnabled(const TWord _channel)
+	{
+		// DSP56300FM table 10-10: DTD clears three instruction cycles
+		// after DE is set. Schedule even when no channel owns DACT.
+		m_pendingDoneClear |= 1u << _channel;
+		m_doneClearClock[_channel] = m_peripherals.getDSP().getInstructionCounter() + 3;
+		m_peripherals.setDelayCycles(3);
+	}
+
+	void Dma::transferStarted(const TWord _channel)
+	{
+		// A new request after a completed continuous-mode block makes the
+		// channel busy again; do not bypass a pending DE pipeline delay.
+		if(!(m_pendingDoneClear & (1u << _channel)))
+			m_dstr &= ~(1u << _channel);
+	}
+
+	void Dma::transferDone(const TWord _channel)
+	{
+		// Completion/disable supersedes a delayed clear, including a short
+		// transfer that finishes before the enable pipeline has drained.
+		m_pendingDoneClear &= ~(1u << _channel);
+		m_dstr |= 1u << _channel;
 	}
 
 	void Dma::setActiveChannel(const TWord _channel)
