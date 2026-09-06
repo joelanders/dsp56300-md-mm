@@ -71,3 +71,14 @@ The existing CI workflow builds all targets and runs CTest on macOS, Linux and
 Windows, so this new target participates without a separate workflow change.
 CI success and fresh product-integration results must be checked separately;
 the local core results above do not claim either.
+
+Fresh ARM64 product integration also passes with only this DMA implementation
+temporarily applied to main release `7cd7afa0` (plus the new external MM boot
+regression). Its pinned DSP `8c919d2b` has the same tree as `da3aaf31`; no other
+cleanup changes or boot-hook removal were enabled for this comparison. MM
+boot/kit/panel, MD UW/RAM and the MD/MM randomized scheduler/resampler audio
+soak all returned zero. MD ROM peak stayed `0.276559`; RAM correlations remained
+above 0.990. Some RAM measurements changed slightly, so this is a passing
+waveform-fidelity regression, not bit-identical output. The temporary product
+edits were removed afterward. This extraction has not repeated the full MM sine
+or x86-64 product-integration matrix.
