@@ -271,6 +271,12 @@ int runSequenceTests()
 		{{"lsr a"}, 0x2000000, CCR_Z, "jeq", false},
 		{{"tst a", "lsl a"}, 0x00400000000000, 0, "jmi", true},
 		{{"tst a", "lsr a"}, 0xff800000000000, 0, "jmi", false},
+		{{"tst a", "not a"}, 0, 0, "jmi", true},
+		{{"tst a", "and x0,a"}, 0xff800000000000, 0, "jmi", false},
+		{{"tst a", "or x0,a"}, 0x00800000000000, 0, "jmi", true},
+		{{"tst a", "eor x0,a"}, 0x00800000000000, 0, "jmi", true},
+		{{"tst a", "clr b"}, 0x80000000000000, 0, "jmi", false},
+		{{"tst a", "clr b"}, 0x80000000000000, 0, "jes", false},
 		{{"abs a"}, 0x80000000000000, 0, "jls", true},
 		{{"neg a"}, 0x80000000000000, 0, "jls", true},
 		{{"inc a"}, 0x7fffffffffffff, 0, "jls", true},
@@ -305,6 +311,7 @@ int runSequenceTests()
 			++failures;
 			std::cerr << "Branch failure " << test.body.front() << " / " << test.branch
 				<< " jit=" << jit << " optimizer=" << optimize << '\n';
+			for(const auto& instruction : test.body) std::cerr << "  " << instruction << '\n';
 		}
 	}
 	const std::vector<std::string> operations = {

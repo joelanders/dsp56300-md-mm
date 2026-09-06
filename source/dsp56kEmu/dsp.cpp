@@ -1340,6 +1340,8 @@ namespace dsp56k
 
 	void DSP::alu_not(const bool ab)
 	{
+		// Preserve E/U from preceding arithmetic before replacing logical N/Z/V.
+		updateDirtyCCR();
 		auto& d = ab ? reg.b.var : reg.a.var;
 
 		const auto masked = ~d & static_cast<TInt64>(0x00ffffff000000ull << g_aluShift);

@@ -14,6 +14,7 @@ namespace dsp56k
 	//
 	void DSP::alu_and( bool ab, TWord _val )
 	{
+		updateDirtyCCR();
 		TReg56& d = ab ? reg.b : reg.a;
 
 		d.var &= (TInt64(_val)<<(24 + g_aluShift)) | static_cast<TInt64>(0xFF000000FFFFFF00ull);
@@ -31,6 +32,7 @@ namespace dsp56k
 	//
 	void DSP::alu_or( bool ab, TWord _val )
 	{
+		updateDirtyCCR();
 		TReg56& d = ab ? reg.b : reg.a;
 
 		d.var |= (TInt64(_val)<<(24 + g_aluShift));
@@ -47,6 +49,7 @@ namespace dsp56k
 	//
 	void DSP::alu_eor( bool ab, TWord _val )
 	{
+		updateDirtyCCR();
 		TReg56& d = ab ? reg.b : reg.a;
 
 		d.var ^= (TInt64(_val)<<(24 + g_aluShift));
@@ -332,6 +335,7 @@ namespace dsp56k
 
 	void DSP::alu_clr(bool ab)
 	{
+		updateDirtyCCR();
 		TReg56& dst = ab ? reg.b : reg.a;
 		dst.var = 0;
 
