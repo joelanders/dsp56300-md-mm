@@ -625,13 +625,21 @@ namespace dsp56k
 		case 2: convert(x, x1());			convert(y, x0());			return;
 		case 3: convert(x, y1());			convert(y, y0());			return;
 		case 4:
-			x = aluA().var >> 24 & 0xffffff;
-			y = aluA().var & 0xffffff;
-			return;
 		case 5:
-			x = aluB().var >> 24 & 0xffffff;
-			y = aluB().var & 0xffffff;
+		{
+			// Shift in the sign-extended 56-bit domain so scale-up cannot wrap
+			// the host sign bit before the 48-bit limiter sees the value.
+			int64_t value = (_lll == 4 ? reg.a.var : reg.b.var) >> g_aluShift;
+			if(sr_test_noCache(SR_S1)) value *= 2;
+			else if(sr_test_noCache(SR_S0)) value >>= 1;
+			constexpr int64_t minimum = -0x800000000000ll;
+			constexpr int64_t maximum = 0x7fffffffffffll;
+			if(value < minimum) { value = minimum; sr_set(CCR_L); }
+			else if(value > maximum) { value = maximum; sr_set(CCR_L); }
+			x = (static_cast<uint64_t>(value) >> 24) & 0xffffff;
+			y = static_cast<uint64_t>(value) & 0xffffff;
 			return;
+		}
 		case 6: x = getA<TWord>();			y = getB<TWord>();			return;
 		case 7: x = getB<TWord>();			y = getA<TWord>();			return;
 		}

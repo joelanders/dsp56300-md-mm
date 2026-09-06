@@ -31,8 +31,12 @@ namespace dsp56k
 
 		aluRestoreFrom64(ra);
 
-	//	sr_v_update(d);
-	//	sr_l_update_by_v();
+		const RegGP overflowValue(m_block);
+		m_asm.mov(overflowValue, asmjit::Imm(0x80000000000000ull << g_aluBitOffset));
+		m_asm.cmp(ra, overflowValue);
+		ccr_update_ifZero(CCRB_V);
+		ccr_l_update_by_v();
+
 		ccr_dirty(ab, ra, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -742,7 +746,12 @@ namespace dsp56k
 #endif
 
 		aluRestoreFrom64(r);
-		ccr_clear(CCR_V);				// never set in the simulator, even when wrapping around. Carry is set instead
+
+		const RegGP overflowValue(m_block);
+		m_asm.mov(overflowValue, asmjit::Imm(0x7fffffffffffffull << g_aluBitOffset));
+		m_asm.cmp(r, overflowValue);
+		ccr_update_ifZero(CCRB_V);
+		ccr_l_update_by_v();
 
 		ccr_dirty(ab, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
@@ -960,7 +969,11 @@ namespace dsp56k
 
 		aluRestoreFrom64(r);
 
-		ccr_clear(CCR_V);					// never set in the simulator, even when wrapping around. Carry is set instead
+		const RegGP overflowValue(m_block);
+		m_asm.mov(overflowValue, asmjit::Imm(0x80000000000000ull << g_aluBitOffset));
+		m_asm.cmp(r, overflowValue);
+		ccr_update_ifZero(CCRB_V);
+		ccr_l_update_by_v();
 
 		ccr_dirty(ab, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}

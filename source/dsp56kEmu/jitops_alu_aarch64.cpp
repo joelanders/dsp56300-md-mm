@@ -704,9 +704,10 @@ namespace dsp56k
 		copyBitToCCR(r32(r), 23, CCRB_C);				// Set if bit 47 of the destination operand is set, and cleared otherwise
 
 		m_asm.shl(r.get(), asmjit::Imm(1));
-		ccr_n_update_by23(r64(r));						// Set if bit 47 of the result is set
+		ccr_n_update_raw24(r64(r));						// Set if bit 47 of the result is set
 
 		m_asm.orr(r.get(), r.get(), r32(prevCarry.get()));
+		m_asm.and_(r.get(), r.get(), asmjit::Imm(0xffffff));
 		m_asm.test_(r32(r));
 		ccr_update_ifZero(CCRB_Z);							// Set if bits 47�24 of the result are 0
 
@@ -732,7 +733,7 @@ namespace dsp56k
 
 		m_asm.test_(r32(r));
 		ccr_update_ifZero(CCRB_Z);							// Set if bits 47-24 of the result are 0
-		ccr_n_update_by23(r64(r));							// Set if bit 47 of the result is set
+		ccr_n_update_raw24(r64(r));							// Set if bit 47 of the result is set
 
 		setALU1(D, r);
 

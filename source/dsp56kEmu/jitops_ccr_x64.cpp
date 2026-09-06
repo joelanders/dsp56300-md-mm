@@ -291,11 +291,11 @@ namespace dsp56k
 		copyBitToCCR(_alu, 47 + g_aluBitOffset, CCRB_N);
 	}
 
-	void JitOps::ccr_n_update_by23(const JitReg64& _alu)
+	void JitOps::ccr_n_update_raw24(const JitReg64& _alu)
 	{
-		// Negative
+		// The input is an extracted 24-bit field, not an aligned accumulator.
 		// Set if the MSB of the result is set; otherwise, this bit is cleared.
-		copyBitToCCR(_alu, 23 + g_aluBitOffset, CCRB_N);
+		copyBitToCCR(_alu, 23, CCRB_N);
 	}
 
 	void JitOps::ccr_s_update(const JitReg64& _alu)

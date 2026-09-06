@@ -1293,20 +1293,16 @@ namespace dsp56k
 	// _____________________________________________________________________________
 	// alu_abs
 	//
-	void DSP::alu_abs( bool ab )
+	void DSP::alu_abs(bool ab)
 	{
 		TReg56& d = ab ? reg.b : reg.a;
-
-		TInt64 d64 = aluSignextend(d);
-
-		d64 = d64 < 0 ? -d64 : d64;
-
-		d.var = d64;
+		const int64_t old = aluSignextend(d);
+		// Unsigned arithmetic also defines the wraparound of the most negative value.
+		d.var = static_cast<int64_t>(old < 0 ? uint64_t(0) - static_cast<uint64_t>(old) : static_cast<uint64_t>(old));
 		aluMask(d);
-
 		sr_z_update(d);
-	//	sr_v_update(d);
-	//	sr_l_update_by_v();
+		sr_toggle(CCR_V, static_cast<uint64_t>(old) == (uint64_t(0x80000000000000) << g_aluShift));
+		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
 	}
 
