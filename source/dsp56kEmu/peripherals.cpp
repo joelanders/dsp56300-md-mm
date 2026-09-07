@@ -115,8 +115,7 @@ namespace dsp56k
 
 	void IPeripherals::setDelayCycles(const uint32_t _delayCycles) noexcept
 	{
-		m_delayCycles = std::min(m_delayCycles, _delayCycles);
-		m_targetClock = m_dsp->getInstructionCounter() + m_delayCycles;
+		resetDelayCycles(m_dsp->getInstructionCounter(), std::min(m_delayCycles, _delayCycles));
 	}
 
 	void IPeripherals::setCycleDeadline(const uint32_t _delayCycles) noexcept

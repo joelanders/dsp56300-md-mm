@@ -10,6 +10,7 @@
 #include "timers.h"
 #include "types.h"
 #include <array>
+#include <atomic>
 
 namespace dsp56k
 {
@@ -111,20 +112,31 @@ namespace dsp56k
 		virtual void terminate() = 0;
 
 		void setDelayCycles(uint32_t _delayCycles) noexcept;
+		// Host-safe wakeup: never read or mutate the DSP owner's counters.
+		void requestExec() noexcept
+		{
+			m_execRequested.store(true, std::memory_order_release);
+			m_targetClock.store(0, std::memory_order_release);
+		}
+		void beginExec() noexcept { m_execRequested.exchange(false, std::memory_order_acq_rel); }
 		void setCycleDeadline(uint32_t _delayCycles) noexcept;
 		void clearCycleDeadline() noexcept { m_hasCycleDeadline = false; }
 
 		void resetDelayCycles(const uint64_t _instructionCount, const uint32_t _delayCycles) noexcept
 		{
 			m_delayCycles = _delayCycles;
-			m_targetClock = _instructionCount + _delayCycles;
+			// Acquire a preceding host clock publication before inspecting its flag.
+			m_targetClock.exchange(_instructionCount + _delayCycles, std::memory_order_acq_rel);
+			// A host wake racing the owner's reschedule must not be overwritten.
+			if(m_execRequested.load(std::memory_order_acquire))
+				m_targetClock.store(0, std::memory_order_relaxed);
 		}
 
 		uint32_t getDelayCycles() const { return m_delayCycles; }
-		auto getTargetClock() const { return m_targetClock; }
+		auto getTargetClock() const { return m_targetClock.load(std::memory_order_relaxed); }
 		bool isDue(const uint64_t _instructions, const uint64_t _cycles) const
 		{
-			return _instructions >= m_targetClock || (m_hasCycleDeadline && _cycles >= m_targetCycle);
+			return _instructions >= getTargetClock() || (m_hasCycleDeadline && _cycles >= m_targetCycle);
 		}
 
 		// the trampoline inlines the "is a peripheral due" test into its exec loop and needs the address of
@@ -136,7 +148,8 @@ namespace dsp56k
 	private:
 		DSP* m_dsp = nullptr;
 		uint32_t m_delayCycles = 0;
-		uint64_t m_targetClock = 0;
+		std::atomic<uint64_t> m_targetClock{0};
+		std::atomic<bool> m_execRequested{false};
 		uint64_t m_targetCycle = 0;
 		bool m_hasCycleDeadline = false;
 		PeripheralType m_type;

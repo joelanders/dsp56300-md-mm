@@ -10,3 +10,11 @@ target_link_libraries(dsp56kTestRunner PUBLIC dsp56kEmu)
 
 add_test(NAME dsp56300_unitTests COMMAND dsp56kTestRunner)
 set_tests_properties(dsp56300_unitTests PROPERTIES LABELS "UnitTest;dsp56300")
+
+add_executable(dsp56300_hdi08CommandTest hdi08CommandTest.cpp)
+target_link_libraries(dsp56300_hdi08CommandTest PRIVATE dsp56kEmu)
+add_test(NAME dsp56300_hdi08CommandTest COMMAND dsp56300_hdi08CommandTest)
+set_tests_properties(dsp56300_hdi08CommandTest PROPERTIES
+	LABELS "UnitTest;dsp56300" FIXTURES_SETUP DspHostCommandLifecycle)
+set_tests_properties(dsp56300_unitTests PROPERTIES FIXTURES_REQUIRED DspHostCommandLifecycle)
+add_dependencies(dsp56kTestRunner dsp56300_hdi08CommandTest)

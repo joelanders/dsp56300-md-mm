@@ -9,13 +9,14 @@
 #include "dsp56kBase/ringbuffer.h"
 #include "utils.h"
 #include "dma.h"
+#include "interrupts.h"
 
 namespace dsp56k
 {
 	class IPeripherals;
 	class Disassembler;
 
-	class HDI08
+	class HDI08 : public InterruptSource
 	{
 	public:
 		explicit HDI08(IPeripherals& _peripheral);
@@ -200,7 +201,14 @@ namespace dsp56k
 
 		bool hostCommandArbitration() const { return m_hostCommandArbitration; }
 
-		// A command remains busy through interrupt return.
+		bool hostCommandPending() const
+		{
+			return m_hostCommandPending.load(std::memory_order_acquire)
+				|| m_hostCommandHasQueued.load(std::memory_order_acquire);
+		}
+		// DSP/machine-owner only. Cancels pending delivery, never an accepted handler.
+		void cancelHostCommand();
+		// The retained serializer remains busy through interrupt return.
 		bool hostCommandBusy() const
 		{
 			return m_hostCommandArbitration &&
@@ -209,6 +217,14 @@ namespace dsp56k
 		}
 
 	private:
+		// HCIE gates both enqueue and service. Tokens invalidate requests left
+		// in the CPU queue when arbitration is reconfigured while quiescent.
+		bool interruptEnabled(uint64_t token) const override;
+		void interruptDiscarded(uint64_t token) override;
+		void interruptServiced(uint64_t token) override;
+		void tryInjectHostCommand();
+		std::atomic<uint64_t> m_hostCommandGeneration{0};
+		std::atomic<bool> m_hostCommandInjected{false};
 		// Suppress mainline HRX consumption while a command can preempt it.
 		bool hostCommandHoldActive() const;
 
