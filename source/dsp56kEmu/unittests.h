@@ -40,6 +40,8 @@ namespace  dsp56k
 
 		void runAllTests();
 
+		void hdi08HostCommandInterruptEnable();
+
 		void conditionCodes();
 		void aguModulo();
 		void aguMultiWrapModulo();
