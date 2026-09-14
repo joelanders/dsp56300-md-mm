@@ -27,6 +27,11 @@ namespace dsp56k
 
 	static constexpr auto regDspPtr = JitReg64(20);
 
+	// Immutable X/Y MMU bases, established and preserved by every trampoline entry.
+	// These are outside both volatile allocation pools and survive C++ callees.
+	static constexpr auto regMemXBase = JitReg64(27);
+	static constexpr auto regMemYBase = JitReg64(28);
+
 	// compared to X64, we use one additional temp because we do not have a fixed shift register, which leads to one additional temp register
 	static constexpr std::initializer_list<JitReg> g_regGPTemps = { JitReg64(10), JitReg64(11), JitReg64(12), JitReg64(13) };
 

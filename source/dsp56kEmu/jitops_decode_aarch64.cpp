@@ -28,6 +28,37 @@ namespace dsp56k
 			m_asm.bitTest(r32(m_dspRegs.getSR(JitDspRegs::Read)), _bit);
 		};
 
+		if(m_block.getConfig().optimizeCcrSequences)
+		{
+			if(cccc == CCCC_GreaterEqual || cccc == CCCC_LessThan)
+			{
+				const RegGP r(m_block);
+				m_ccrRead |= static_cast<CCRMask>(CCR_N | CCR_V);
+				// Preserve the previous lazy-materialization order; only the final
+				// extraction/comparison is folded into an XOR and single-bit test.
+				updateDirtyCCRWithTemp(r, CCR_N);
+				updateDirtyCCRWithTemp(r, CCR_V);
+				const auto sr = r32(m_dspRegs.getSR(JitDspRegs::Read));
+				static_assert(CCRB_N > CCRB_V);
+				m_asm.eor(r32(r), sr, sr, asmjit::arm::lsl(CCRB_N - CCRB_V));
+				m_asm.bitTest(r32(r), CCRB_N);
+				return cccc == CCCC_GreaterEqual ? asmjit::arm::CondCode::kZero : asmjit::arm::CondCode::kNotZero;
+			}
+			if(cccc == CCCC_Normalized || cccc == CCCC_NotNormalized)
+			{
+				const RegGP r(m_block);
+				constexpr auto mask = static_cast<CCRMask>(CCR_U | CCR_E | CCR_Z);
+				m_ccrRead |= mask;
+				updateDirtyCCRWithTemp(r, CCR_U);
+				updateDirtyCCRWithTemp(r, CCR_E);
+				updateDirtyCCRWithTemp(r, CCR_Z);
+				// This mask is not an ARM logical immediate: keep it in a register.
+				m_asm.mov(r32(r), asmjit::Imm(mask));
+				m_asm.tst(r32(m_dspRegs.getSR(JitDspRegs::Read)), r32(r));
+				return cccc == CCCC_Normalized ? asmjit::arm::CondCode::kZero : asmjit::arm::CondCode::kNotZero;
+			}
+		}
+
 		switch (cccc)
 		{
 		case CCCC_CarrySet:									// CC(LO)		Carry Set	(lower)

@@ -315,7 +315,10 @@ namespace dsp56k
 				// the block pushes as its return address - a "jsset #n,x:pp,handler" style
 				// vector would then return INTO the following vector slot instead of into
 				// the interrupted code.
-				const auto pcReg = m_dspRegPool.get(PoolReg::DspPC, true, true);
+				// Only the dynamic interrupt case can bypass the assignment below.
+				// Normal blocks overwrite PC unconditionally, so loading its old value is dead.
+				const auto pcReg = m_dspRegPool.get(PoolReg::DspPC,
+					fastInterruptMode == JitOps::FastInterruptMode::Dynamic, true);
 
 				const SkipLabel skip(m_asm);
 
@@ -350,12 +353,14 @@ namespace dsp56k
 		_rt.m_encodedCycles = info.cycleCount;
 
 		TWord pMemSize = 0;
+		bool onlyNops = true;
 
 		while(pMemSize < info.memSize)
 		{
 			opPC = _pc + pMemSize;
 
 			m_dsp.memory().getOpcode(opPC, opA, opB);
+			onlyNops &= opA == 0; // the single-word DSP NOP encoding
 
 #if defined(_DEBUG)
 			m_dsp.disassembler().disassemble(opDisasm, opA, opB, 0, 0, 0);
@@ -436,6 +441,11 @@ namespace dsp56k
 		const auto isLoopStart = info.hasFlag(JitBlockInfo::Flags::IsLoopBodyBegin);
 		const auto isLoopEnd = info.terminationReason == JitBlockInfo::TerminationReason::LoopEnd;
 		const auto isLoopBody = isLoopStart && isLoopEnd;
+		const bool combineNopIterations = m_config.combineNopLoopIterations
+			&& isLoopBody && !isFastInterrupt && !m_config.splitOpsByNops && onlyNops
+			&& _rt.getEncodedInstructionCount() >= 1 && _rt.getEncodedInstructionCount() <= 2
+			&& _rt.getEncodedCycleCount() == _rt.getEncodedInstructionCount()
+			&& m_config.maxDoIterations > 1 && asmjit::Support::isPowerOf2(m_config.maxDoIterations);
 
 		bool childIsConditional = false;
 
@@ -512,9 +522,11 @@ namespace dsp56k
 		increaseCycleCount(asmjit::Imm(_rt.getEncodedCycleCount()));
 		m_asm.setCursor(m_asm.lastNode());
 
-			auto jumpIfLoop = [&](const asmjit::Label& _ifTrue, const JitReg32& _regPC, const JitReg32& _regLC, const JitReg32& _temp)
+		auto jumpIfLoop = [&](const asmjit::Label& _ifTrue, const JitReg32& _regPC, const JitReg32& _regLC, const JitReg32& _temp)
 		{
-			if (!isLoopBody)
+			// A slice of one must always return. In particular, ARM64 cannot encode
+			// the otherwise generated TST #0; an omitted test would use stale flags.
+			if (!isLoopBody || m_config.maxDoIterations == 1)
 				return false;
 
 			const SkipLabel skip(m_asm);
@@ -579,9 +591,18 @@ namespace dsp56k
 
 			// It is important that this code does not allocate any temp registers inside the branches. thefore, we prewarm everything
 			RegGP temp(*this);
+			RegGP extraNops(*this, combineNopIterations);
+
+			// LA is only changed by do_end, not by continuing the current loop. If the
+			// body has no pending LA write, reserve its register without reading memory
+			// and write it back only on that exit. The same applies to SR when neither
+			// the body nor a deferred CCR update has a pending write. This leaves the
+			// iteration/peripheral boundaries untouched, including the LF-clear path.
+			const bool deferLA = !m_dspRegPool.isWritten(PoolReg::DspLA);
+			const bool deferSR = !m_dspRegPool.isWritten(PoolReg::DspSR) && !m_dspRegs.ccrDirtyFlags();
 
 			const auto& sr = r32(m_dspRegPool.get(PoolReg::DspSR, true, true));
-			                 r32(m_dspRegPool.get(PoolReg::DspLA, true, true));	// we don't use it here but do_end does
+			const auto la = r32(m_dspRegPool.get(PoolReg::DspLA, !deferLA, true));
 			const auto& lc = r32(m_dspRegPool.get(PoolReg::DspLC, true, true));
 
 			m_dspRegPool.lock(PoolReg::DspSR);
@@ -597,6 +618,24 @@ namespace dsp56k
 
 			m_asm.cmp(lc, asmjit::Imm(1));
 			m_asm.jle(enddo);
+			if(combineNopIterations)
+			{
+				// The existing backedge already executes through the next LC multiple
+				// of maxDoIterations, with no peripheral/C++ call between these NOPs.
+				// Account for those extra iterations and leave the existing enddo/PC/
+				// stack path intact. Its resulting LC forces the same return boundary.
+				const auto extra = r32(extraNops);
+				m_asm.mov(extra, lc);
+				m_asm.dec(extra);
+				m_asm.and_(extra, asmjit::Imm(m_config.maxDoIterations - 1));
+				m_asm.sub(lc, extra);
+				if(_rt.getEncodedInstructionCount() == 2)
+					m_asm.shl(extra, asmjit::Imm(1));
+				increaseInstructionCount(r64(extraNops));
+				increaseCycleCount(r64(extraNops));
+				m_asm.cmp(lc, asmjit::Imm(1));
+				m_asm.jle(enddo);
+			}
 			m_asm.dec(lc);
 
 			if(isLoopBody)
@@ -613,12 +652,24 @@ namespace dsp56k
 
 			m_asm.bind(enddo);
 			ops.do_end(temp);
+			if(deferLA)
+				m_dspRegPool.movDspReg(dsp().regs().la, la);
+			if(deferSR)
+				m_dspRegPool.movDspReg(dsp().regs().sr, sr);
 
 			m_asm.bind(skip);
+			if(deferLA)
+				m_dspRegPool.discardWritten(PoolReg::DspLA);
+			if(deferSR)
+				m_dspRegPool.discardWritten(PoolReg::DspSR);
 
 			m_dspRegPool.unlock(PoolReg::DspSR);
 			m_dspRegPool.unlock(PoolReg::DspLA);
 			m_dspRegPool.unlock(PoolReg::DspLC);
+			// On the continuing/LF-clear paths the write-only LA register has no
+			// defined value. Do not leave it available for subsequent pool reads.
+			if(deferLA)
+				m_dspRegPool.discard(PoolReg::DspLA);
 
 			profileEnd(pl);
 		}
@@ -694,7 +745,7 @@ namespace dsp56k
 		JitReg32 regLC;
 		RegGP tempLC(*this, false);
 
-		if(isLoopBody && m_config.maxDoIterations)
+		if(isLoopBody && m_config.maxDoIterations > 1)
 		{
 			regLC = r32(m_dspRegPool.get(PoolReg::DspLC, true, false));
 

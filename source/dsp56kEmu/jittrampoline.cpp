@@ -17,8 +17,24 @@ namespace dsp56k
 	// hoisted constants for the inlined "is a peripheral due" test
 	constexpr auto g_periphFunc = JitReg64(19);
 	constexpr auto g_ptrTargetClock = JitReg64(21);
-	constexpr auto g_ptrInstructions = JitReg64(27);
-	constexpr auto g_ptrCycles = JitReg64(28);
+
+	static void pushMemoryBases(JitEmitter& _asm, DSP& _dsp)
+	{
+		if(!_dsp.memory().hasMmuSupport())
+			return;
+		_asm.push(regMemXBase);
+		_asm.push(regMemYBase);
+		_asm.mov(regMemXBase, asmjit::Imm(_dsp.memory().getMemAreaPtr(MemArea_X)));
+		_asm.mov(regMemYBase, asmjit::Imm(_dsp.memory().getMemAreaPtr(MemArea_Y)));
+	}
+
+	static void popMemoryBases(JitEmitter& _asm, DSP& _dsp)
+	{
+		if(!_dsp.memory().hasMmuSupport())
+			return;
+		_asm.pop(regMemYBase);
+		_asm.pop(regMemXBase);
+	}
 #else
 	constexpr auto g_ptrDSP = asmjit::x86::r12;
 	constexpr auto g_counter = asmjit::x86::r13;
@@ -61,7 +77,6 @@ namespace dsp56k
 		m_asm.push(r64(g_ptrPC));
 		m_asm.push(r64(g_periphFunc));
 		m_asm.push(r64(g_ptrTargetClock));
-		m_asm.push(r64(g_ptrInstructions));
 #else
 		// regDspPtr survives the whole loop: no block uses it and C++ callees preserve it. Everything
 		// else we need would be destroyed by a block now, so it lives in our own frame instead.
@@ -72,6 +87,7 @@ namespace dsp56k
 
 #ifdef HAVE_ARM64
 		m_asm.push(asmjit::a64::regs::x30);
+		pushMemoryBases(m_asm, m_dsp);
 #endif
 
 #ifdef HAVE_X86_64
@@ -118,7 +134,6 @@ namespace dsp56k
 #ifdef HAVE_ARM64
 		m_asm.mov(g_periphFunc, asmjit::Imm(periphFunc));
 		m_asm.mov(g_ptrTargetClock, asmjit::Imm(targetClock));
-		m_asm.mov(g_ptrInstructions, asmjit::Imm(&m_dsp.getInstructionCounter()));
 #endif
 
 		const auto ptrDspRegs = Jitmem::makeRelativePtr(&m_dsp.regs(), &m_dsp, argDspPtr, 8);
@@ -160,7 +175,7 @@ namespace dsp56k
 			m_asm.cmp(g_funcToCall, g_periphFunc);
 			m_asm.b(asmjit::arm::CondCode::kNE, lCallInt);
 			m_asm.ldr(r64(g_funcArgGPs[0]), Jitmem::makePtr(g_ptrTargetClock, 8));
-			m_asm.ldr(r64(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrInstructions, 8));
+			m_asm.ldr(r64(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.getInstructionCounter(), &m_dsp, g_ptrDSP, 8));
 			m_asm.cmp(r64(g_funcArgGPs[0]), r64(g_funcArgGPs[1]));
 			m_asm.b(asmjit::arm::CondCode::kHI, lSkipInt);
 			m_asm.bind(lCallInt);
@@ -217,10 +232,10 @@ namespace dsp56k
 #endif
 
 #ifdef HAVE_ARM64
+		popMemoryBases(m_asm, m_dsp);
 		m_asm.pop(asmjit::a64::regs::x30);
 #endif
 #ifdef HAVE_ARM64
-		m_asm.pop(r64(g_ptrInstructions));
 		m_asm.pop(r64(g_ptrTargetClock));
 		m_asm.pop(r64(g_periphFunc));
 		m_asm.pop(r64(g_ptrPC));
@@ -262,8 +277,8 @@ namespace dsp56k
 		m_asm.push(r64(g_ptrJitEntries));
 		m_asm.push(r64(g_ptrInterruptFunc));
 		m_asm.push(r64(g_ptrPC));
-		m_asm.push(r64(g_ptrCycles));
 		m_asm.push(asmjit::a64::regs::x30);
+		pushMemoryBases(m_asm, m_dsp);
 #else
 		m_asm.push(r64(regDspPtr));
 		for (const auto& gp : g_trampolineSavedGPs)
@@ -300,10 +315,6 @@ namespace dsp56k
 		m_asm.lea_(g_ptrInterruptFunc, argDspPtr, &m_dsp.getInterruptFunc(), &m_dsp);
 		m_asm.lea_(g_ptrPC           , argDspPtr, &m_dsp.regs().pc.var, &m_dsp);
 
-#ifdef HAVE_ARM64
-		m_asm.mov(g_ptrCycles, asmjit::Imm(&m_dsp.getCycles()));
-#endif
-
 		const auto ptrDspRegs = Jitmem::makeRelativePtr(&m_dsp.regs(), &m_dsp, argDspPtr, 8);
 		assert(ptrDspRegs.offset());
 
@@ -333,7 +344,7 @@ namespace dsp56k
 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
 		m_asm.blr(g_funcToCall);
 
-		m_asm.ldr(r64(g_funcArgGPs[0]), Jitmem::makePtr(g_ptrCycles, 8));
+		m_asm.ldr(r64(g_funcArgGPs[0]), Jitmem::makeRelativePtr(&m_dsp.getCycles(), &m_dsp, g_ptrDSP, 8));
 		m_asm.cmp(r64(g_funcArgGPs[0]), r64(g_counter));
 		m_asm.b(asmjit::arm::CondCode::kLO, label);
 #else
@@ -369,11 +380,11 @@ namespace dsp56k
 #ifdef HAVE_X86_64
 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_stackSize));
 #else
+		popMemoryBases(m_asm, m_dsp);
 		m_asm.pop(asmjit::a64::regs::x30);
 #endif
 
 #ifdef HAVE_ARM64
-		m_asm.pop(r64(g_ptrCycles));
 		m_asm.pop(r64(g_ptrPC));
 		m_asm.pop(r64(g_ptrInterruptFunc));
 		m_asm.pop(r64(g_ptrJitEntries));
@@ -430,9 +441,11 @@ namespace dsp56k
 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_oneStackSize));
 #else
 		m_asm.push(asmjit::a64::regs::x30);
+		pushMemoryBases(m_asm, m_dsp);
 
 		m_asm.blr(g_funcArgGPs[2]);
 
+		popMemoryBases(m_asm, m_dsp);
 		m_asm.pop(asmjit::a64::regs::x30);
 #endif
 

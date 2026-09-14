@@ -76,6 +76,11 @@ namespace dsp56k
 		// host register pressure test
 		void parallelMoveXY();
 		void boundedDispatch();
+		void loopStateWriteback();
+		void nopLoopSlices();
+		void memoryBaseEntries();
+		void peripheralDmaReads();
+		void ccrSequences();
 
 		void emit(TWord _opA, TWord _opB = 0, TWord _pc = 0) override;
 		void execStep() override { dsp.execJit(); }
@@ -88,5 +93,7 @@ namespace dsp56k
 		JitBlock* block = nullptr;
 		JitOps* ops = nullptr;
 		bool m_logging;
+		bool m_optimizeCcrSequences = true;
+		size_t m_lastCodeSize = 0;
 	};
 }

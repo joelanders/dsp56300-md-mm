@@ -66,6 +66,11 @@ namespace dsp56k
 
 		parallelMoveXY();
 		boundedDispatch();
+		loopStateWriteback();
+		nopLoopSlices();
+		memoryBaseEntries();
+		peripheralDmaReads();
+		ccrSequences();
 	}
 
 	void JitUnittests::runtimeUnnormalizedFlag()
@@ -154,6 +159,7 @@ namespace dsp56k
 			JitConfig config;
 			config.dynamicPeripheralAddressing = true;
 			config.aguSupportBitreverse = true;
+			config.optimizeCcrSequences = m_optimizeCcrSequences;
 
 			JitBlock b(m_asm, dsp, rtData, std::move(config));
 			JitBlockRuntimeData rt;
@@ -182,6 +188,7 @@ namespace dsp56k
 		m_asm.ret();
 
 		m_asm.finalize();
+		m_lastCodeSize = code.codeSize();
 
 		TJitFunc func;
 		const auto err = m_rt.add(&func, &code);
@@ -216,10 +223,668 @@ namespace dsp56k
 		m_rt.release(&func);
 	}
 
+	void JitUnittests::ccrSequences()
+	{
+#ifdef HAVE_ARM64
+		const auto oldLogging = m_logging;
+		m_logging = false;
+		size_t checks = 0;
+		std::array<size_t, 2> cleanBranchBytes{};
+		constexpr std::array<ConditionCode, 4> conditions = {
+			CCCC_GreaterEqual, CCCC_LessThan, CCCC_Normalized, CCCC_NotNormalized};
+		constexpr std::array<asmjit::arm::CondCode, 4> hostFlags = {
+			asmjit::arm::CondCode::kZero, asmjit::arm::CondCode::kCS,
+			asmjit::arm::CondCode::kMI, asmjit::arm::CondCode::kVS};
+
+		for(const bool optimized : {false, true})
+		{
+			m_optimizeCcrSequences = optimized;
+			std::cout << "CCR mask/NZCV checks, optimized=" << optimized << std::endl;
+			// Include every CCR mask, not just masks encodable as logical immediates.
+			// The scratch-register fallback and mask zero must remain valid too.
+			for(unsigned mask = 0; mask < 256; ++mask)
+				for(const TWord initial : {0u, 0xffffffu, 0x030055u, 0x0302aau})
+				{
+					dsp.setSR(initial);
+					runTest([&]()
+					{
+						const RegGP r(*block);
+						// Exercise zero, negative/carry and signed-overflow NZCV patterns.
+						const uint64_t value = initial == 0 ? 1 : initial == 0xffffff ? 0 :
+							initial == 0x030055 ? 0x8000000000000000ull : 0xffffffffffffffffull;
+						block->asm_().mov(r64(r), asmjit::Imm(value));
+						block->asm_().cmp(r64(r), asmjit::Imm(1));
+						for(size_t i = 0; i < hostFlags.size(); ++i)
+						{
+							block->asm_().cset(r64(r), hostFlags[i]);
+							block->mem().mov(m_checks[i], r64(r));
+						}
+						{ JitOps::CcrBatchUpdate batch(*ops, static_cast<CCRMask>(mask)); }
+						for(size_t i = 0; i < hostFlags.size(); ++i)
+						{
+							block->asm_().cset(r64(r), hostFlags[i]);
+							block->mem().mov(m_checks[i + 4], r64(r));
+						}
+					}, [&]()
+					{
+						verify(dsp.getSR().var == (initial & ~mask));
+						for(size_t i = 0; i < hostFlags.size(); ++i)
+							verify(m_checks[i] == m_checks[i + 4]);
+					});
+					++checks;
+				}
+
+			// BFI accepts an unmasked source for nonsticky destinations only.
+			std::cout << "CCR bit-copy checks, optimized=" << optimized << std::endl;
+			// Cover every source bit and destination, with deliberately dirty upper bits.
+			for(unsigned sourceBit = 0; sourceBit < 64; ++sourceBit)
+				for(unsigned destinationBit = 0; destinationBit < 8; ++destinationBit)
+					for(const uint64_t source : {0ull, 0xffffffffffffffffull,
+						0xaaaaaaaaaaaaaaaaull, 0x5555555555555555ull})
+					{
+						const TWord initial = 0x030000 | (source & 0xff);
+						const TWord bit = ((source >> sourceBit) & 1) << destinationBit;
+						const bool sticky = destinationBit == CCRB_L || destinationBit == CCRB_S;
+						const TWord expected = sticky ? (initial | bit) :
+							((initial & ~(1u << destinationBit)) | bit);
+						dsp.setSR(initial);
+						runTest([&]()
+						{
+							const RegGP r(*block);
+							block->asm_().mov(r64(r), asmjit::Imm(source));
+							ops->copyBitToCCR(r, sourceBit, static_cast<CCRBit>(destinationBit));
+						}, [&]() { verify(dsp.getSR().var == expected); });
+						++checks;
+					}
+
+			std::cout << "CCR clean-condition checks, optimized=" << optimized << std::endl;
+			for(unsigned scaling = 0; scaling < 4; ++scaling)
+				for(unsigned ccr = 0; ccr < 256; ++ccr)
+					for(const auto condition : conditions)
+					{
+						const TWord initial = 0x030000 | (scaling << SRB_S0) | ccr;
+						const bool nvEqual = bool(ccr & CCR_N) == bool(ccr & CCR_V);
+						const bool normalized = (ccr & (CCR_U | CCR_E | CCR_Z)) == 0;
+						const bool expected = condition == CCCC_GreaterEqual ? nvEqual :
+							condition == CCCC_LessThan ? !nvEqual :
+							condition == CCCC_Normalized ? normalized : !normalized;
+						dsp.setSR(initial);
+						runTest([&]()
+						{
+							const RegGP r(*block);
+							ops->decode_cccc(r, condition);
+							block->mem().mov(m_checks[0], r.get());
+						}, [&]()
+						{
+							cleanBranchBytes[optimized ? 1 : 0] += m_lastCodeSize;
+							verify(m_checks[0] == (expected ? 1u : 0u));
+							verify(dsp.getSR().var == initial);
+						});
+						++checks;
+					}
+		}
+
+		// Differentially exercise each subset of pending lazy flags. Preserve the
+		// old update order, including V's sticky-L update, across scaling modes.
+		constexpr std::array<CCRMask, 5> dirtyFlags = {CCR_N, CCR_V, CCR_U, CCR_E, CCR_Z};
+		std::cout << "CCR lazy-condition differential checks" << std::endl;
+		for(unsigned scaling = 0; scaling < 4; ++scaling)
+			for(unsigned subset = 0; subset < 32; ++subset)
+				for(const uint64_t value : {0ull, 1ull, 0xffffffffffffffffull,
+					0x003fffffffffffull, 0x00400000000000ull, 0x007fffffffffffull,
+					0x00800000000000ull, 0x00ffffffffffffull, 0x0100000000000000ull,
+					0x7fffffffffffffull, 0x80000000000000ull, 0xff800000000000ull})
+					for(const auto condition : conditions)
+					{
+						CCRMask mask = CCR_None;
+						for(size_t i = 0; i < dirtyFlags.size(); ++i)
+							if(subset & (1u << i))
+								mask = static_cast<CCRMask>(mask | dirtyFlags[i]);
+						std::array<uint64_t, 2> reference{};
+						for(const bool optimized : {false, true})
+						{
+							m_optimizeCcrSequences = optimized;
+							dsp.setSR(0x030000 | (scaling << SRB_S0) | (subset & 1 ? 0xff : 0));
+							runTest([&]()
+							{
+								JitDspMode mode;
+								mode.initialize(dsp);
+								block->setMode(&mode);
+								{
+									const RegGP input(*block);
+									block->asm_().mov(r64(input), asmjit::Imm(aluTestValue(value)));
+									ops->ccr_dirty(0, r64(input), mask);
+								}
+								// Like a real branch, decode without retaining an unrelated
+								// temporary: the old lazy NR path needs all four GP temps.
+								const auto cc = ops->decode_cccc(condition);
+								{
+									const RegGP result(*block);
+									block->asm_().cset(r64(result), cc);
+									block->mem().mov(m_checks[0], r64(result));
+								}
+								ops->updateDirtyCCR();
+								block->setMode(nullptr);
+							}, [&]()
+							{
+								const std::array<uint64_t, 2> actual = {m_checks[0], static_cast<uint64_t>(dsp.getSR().var)};
+								if(optimized)
+								{
+									verify(actual == reference);
+								}
+								else
+								{
+									reference = actual;
+								}
+							});
+							++checks;
+						}
+					}
+		verify(cleanBranchBytes[1] < cleanBranchBytes[0]);
+		m_optimizeCcrSequences = true;
+		m_logging = oldLogging;
+		LOG("ARM64 CCR sequences: " << checks << " cases; clean condition fixture bytes "
+			<< cleanBranchBytes[0] << " -> " << cleanBranchBytes[1]);
+#endif
+	}
+
 	void JitUnittests::nop(size_t _count) const
 	{
 		for(size_t i=0; i<_count; ++i)
 			block->asm_().nop();
+	}
+
+	void JitUnittests::memoryBaseEntries()
+	{
+		const auto oldConfig = dsp.getJit().getConfig();
+		auto config = oldConfig;
+		config.enableOptimizer = false;
+		config.linkJitBlocks = false;
+		config.dynamicPeripheralAddressing = true;
+		config.maxInstructionsPerBlock = 2;
+		config.getBlockConfig = {};
+		dsp.getJit().setConfig(config);
+
+		// Exercise both independent internal X/Y and external X/Y/P aliases.
+		for(const TWord addressBase : {TWord(0), dsp.memory().getBridgedMemoryAddress()})
+		for(const unsigned blockCount : {8u, 24u, 64u})
+		{
+			// This fixture's bridged backing is larger than its guest P window.
+			// The fallback C++ translator intentionally rejects those external P
+			// addresses, so its entry-path checks use the internal ranges only.
+			if(addressBase && !dsp.memory().hasMmuSupport()) continue;
+			std::vector<uint64_t> reference;
+			uint64_t targetCycles = 0;
+			for(const unsigned entry : {0u, 1u, 2u})
+			{
+				dsp.getJit().destroyAllBlocks();
+				dsp.resetHW();
+				dsp.setSR(0x30000);
+				dsp.regs().la.var = 0x654321;
+				dsp.regs().lc.var = 0;
+				dsp.regs().r[0].var = addressBase + 0x100;
+				dsp.regs().r[1].var = addressBase + 0x200;
+				dsp.regs().r[2].var = addressBase + 0x300;
+				dsp.regs().r[3].var = addressBase + 0x400;
+				dsp.regs().x.var = dsp.regs().y.var = 0;
+				for(unsigned i = 0; i < 128; ++i)
+				{
+					dsp.memory().set(MemArea_X, addressBase + 0x100 + i, 0x123400 + i);
+					dsp.memory().set(MemArea_Y, addressBase + 0x200 + i, 0);
+					dsp.memory().set(MemArea_Y, addressBase + 0x300 + i, 0x654300 + i);
+					dsp.memory().set(MemArea_X, addressBase + 0x400 + i, 0);
+				}
+				TWord pc = 0x400;
+				pc = emitToMemory("move x:(r0)+,x0", pc);
+				pc = emitToMemory("move x0,y:(r1)+", pc);
+				// The peripheral read calls C++; invariant bases must survive that call.
+				pc = emitToMemory("movep x:<<$ffffc5,y1", pc);
+				pc = emitToMemory("move y:(r2)+,y0", pc);
+				pc = emitToMemory("move y0,x:(r3)+", pc);
+				emitToMemory("bra >$400", pc);
+				dsp.setPC(0x400);
+
+				if(entry == 0) for(unsigned i = 0; i < blockCount; ++i) dsp.execJit();
+				else if(entry == 1) dsp.getJit().getTrampoline().exec(&dsp, blockCount);
+				else dsp.execUntilCycles(targetCycles);
+
+				std::vector<uint64_t> result{dsp.getInstructionCounter(), dsp.getCycles()};
+				for(const auto value : {dsp.regs().x.var, dsp.regs().y.var}) result.push_back(value);
+				result.push_back(dsp.getPC().var);
+				for(unsigned i = 0; i < 4; ++i) result.push_back(dsp.regs().r[i].var);
+				const auto writtenY = dsp.regs().r[1].var - addressBase - 0x200;
+				const auto writtenX = dsp.regs().r[3].var - addressBase - 0x400;
+				for(unsigned i = 0; i < 128; ++i)
+				{
+					const auto y = dsp.memory().get(MemArea_Y, addressBase + 0x200 + i);
+					const auto x = dsp.memory().get(MemArea_X, addressBase + 0x400 + i);
+					verify(y == (i < writtenY ? 0x123400 + i : 0));
+					verify(x == (i < writtenX ? 0x654300 + i : 0));
+					if(addressBase)
+					{
+						// Inspect the allocated P backing, not the smaller guest P
+						// API window in this unit-test Memory configuration.
+						verify(dsp.memory().getMemAreaPtr(MemArea_P)[addressBase + 0x200 + i] == y);
+						verify(dsp.memory().getMemAreaPtr(MemArea_P)[addressBase + 0x400 + i] == x);
+					}
+					result.push_back(y);
+					result.push_back(x);
+				}
+				if(entry == 0) { reference = result; targetCycles = dsp.getCycles(); }
+				else verify(result == reference);
+			}
+		}
+		dsp.getJit().destroyAllBlocks();
+		dsp.getJit().setConfig(oldConfig);
+		std::cout << "Memory base tests: exact internal X/Y and external X/Y/P aliases across all three trampoline entries passed." << std::endl;
+	}
+
+	void JitUnittests::peripheralDmaReads()
+	{
+		unsigned comparisons = 0;
+		for(const bool incrementSource : {false, true})
+		for(const bool optimizer : {false, true})
+		for(const bool dynamic : {false, true})
+		for(const unsigned entry : {0u, 1u, 2u})
+		{
+			std::vector<std::vector<uint64_t>> reference;
+			for(const bool direct : {false, true})
+			{
+				// Each arm owns different peripheral objects. Native addresses must
+				// belong to that DSP, never another instance or a retired one.
+				DefaultMemoryValidator validator;
+				Memory memory(validator, 0x4000);
+				Peripherals56303 px;
+				PeripheralsNop py; // the supported 56303 X / NOP Y product configuration
+				DSP cpu(memory, &px, &py);
+				auto config = cpu.getJit().getConfig();
+				config.enableOptimizer = optimizer;
+				config.inlinePeripheralReads = direct;
+				config.linkJitBlocks = false;
+				config.dynamicPeripheralAddressing = true;
+				config.maxInstructionsPerBlock = 1;
+				cpu.getJit().setConfig(config);
+				cpu.setSR(0x30000);
+				px.resetDelayCycles(0, 1);
+				py.resetDelayCycles(0, 1);
+				px.clearCycleDeadline();
+				py.clearCycleDeadline();
+
+				for(const TWord address : {TWord(HDI08::HORX), TWord(Essi::ESSI0_RX),
+					TWord(Essi::ESSI1_RX), TWord(Essi::ESSI_PDRC), TWord(XIO_DSTR), TWord(XIO_IDR)})
+					verify(px.readAsPtr(address, Movep_ppea) == nullptr);
+
+				auto emitLocal = [&](const std::string& text, TWord pc)
+				{
+					const auto encoded = assembler.assemble(text.c_str());
+					verify(encoded.success());
+					for(unsigned i = 0; i < encoded.wordCount; ++i) cpu.memWriteP(pc++, encoded.word[i]);
+					return pc;
+				};
+				std::array<TWord, 24> endPC{};
+				for(unsigned index = 0; index < 24; ++index)
+				{
+					const TWord address = XIO_DCR5 + index;
+					std::stringstream operand;
+					operand << "<<$" << std::hex << address;
+					TWord pc = 0x200 + index * 16;
+					pc = emitLocal(dynamic ? "move x:(r0),x0" : "movep x:" + operand.str() + ",x0", pc);
+					pc = emitLocal(dynamic ? "move y:(r0),y0" : "movep y:" + operand.str() + ",y0", pc);
+					// The counted trampoline requires groups of eight entries.
+					for(unsigned i = 0; i < 6; ++i) pc = emitLocal("nop", pc);
+					endPC[index] = pc;
+				}
+
+				size_t snapshotIndex = 0;
+				const TWord values[] = {0u, 0x7fffffu, 0x800000u, 0xffffffu, 0x345678u};
+				std::array<const JitBlockInfo*, 24> cached{};
+				for(unsigned phase = 0; phase < 10; ++phase)
+				{
+					if(phase == 4)
+					{
+						cpu.resetHW();
+						cpu.setSR(0x30000);
+						px.resetDelayCycles(0, 1);
+						py.resetDelayCycles(0, 1);
+					}
+					if(phase < 5)
+					{
+						for(unsigned index = 0; index < 24; ++index)
+						{
+							const TWord address = XIO_DCR5 + index;
+							const TWord mask = index % 4 == 0 ? 0x7fffff : 0xffffff; // leave DE disabled
+							px.write(address, values[phase] & mask);
+						}
+					}
+					else if(phase == 5)
+					{
+						{
+							auto& dma = px.getDMA();
+							const TWord source = 0x800;
+							for(unsigned i = 0; i < 4; ++i) memory.set(MemArea_X, source + i, 0x765400 + i);
+							dma.setDCR(0, 0);
+							dma.setDSR(0, source);
+							dma.setDDR(0, source + 0x100);
+							dma.setDCO(0, 3);
+							dma.setDCR(0, ((incrementSource ? 5u : 4u) << DmaChannel::Dam0)
+								| ((incrementSource ? 4u : 5u) << DmaChannel::Dam3)
+								| (1u << DmaChannel::Dtm0) | (1u << DmaChannel::De));
+						}
+					}
+					else
+					{
+						// Autonomous word requests modify already-compiled live reads.
+						{
+							auto& dma = px.getDMA();
+							verify(dma.trigger(DmaChannel::RequestSource::ExternalIRQA));
+							const TWord source = 0x800;
+							verify(dma.getDSR(0) == source + (incrementSource ? phase - 5 : 0));
+							verify(dma.getDDR(0) == source + 0x100 + (incrementSource ? 0 : phase - 5));
+							verify(memory.get(MemArea_X, source + 0x100 + (incrementSource ? 0 : phase - 6))
+								== 0x765400 + (incrementSource ? phase - 6 : 0));
+						}
+					}
+
+					for(unsigned index = 0; index < 24; ++index)
+					{
+						const TWord address = XIO_DCR5 + index;
+						const TWord pc = 0x200 + index * 16;
+						const auto* xp = px.readAsPtr(address, Movep_ppea);
+						verify(xp);
+						verify(*xp == px.read(address, Movep_ppea));
+						cpu.regs().r[0].var = address;
+						cpu.setPC(pc);
+						for(unsigned step = 0; step < 8; step += entry == 1 ? 8 : 1)
+						{
+							if(entry == 0) cpu.execJit();
+							else if(entry == 1) cpu.getJit().getTrampoline().exec(&cpu, 8);
+							else cpu.execUntilCycles(cpu.getCycles() + 1);
+							const auto& r = cpu.regs();
+							std::vector<uint64_t> state;
+							for(const int64_t value : {r.x.var, r.y.var, r.a.var, r.b.var})
+								state.push_back(static_cast<uint64_t>(value));
+							for(const auto value : std::array<int64_t, 6>{r.pc.var, r.sr.var, r.la.var, r.lc.var, r.sp.var, r.sc.var})
+								state.push_back(static_cast<uint64_t>(value));
+							for(const auto value : {cpu.getInstructionCounter(), cpu.getCycles(), px.getTargetClock(), py.getTargetClock()})
+								state.push_back(value);
+							state.push_back(px.getDMA().getDSTR());
+							if(!direct) reference.push_back(state);
+							else { verify(state == reference.at(snapshotIndex)); ++comparisons; }
+							++snapshotIndex;
+						}
+						verify(cpu.getPC().var == endPC[index]);
+						verify(cpu.x0().var == *xp && cpu.y0().var == 0);
+						const auto* info = cpu.getJit().getBlockInfo(pc);
+						verify(info);
+						if(phase == 0 || phase == 4) cached[index] = info;
+						else verify(info == cached[index]);
+					}
+				}
+			}
+		}
+		std::cout << "DMA peripheral reads: " << comparisons
+			<< " exact return-boundary comparisons, live X DMA/Y NOP, cached blocks, reset and DMA requests passed." << std::endl;
+	}
+
+	void JitUnittests::loopStateWriteback()
+	{
+		const auto oldConfig = dsp.getJit().getConfig();
+		auto config = oldConfig;
+		config.enableOptimizer = false; // exercise the emitter, not dead-code cleanup
+		config.linkJitBlocks = false;
+		config.maxInstructionsPerBlock = 0;
+		config.getBlockConfig = {};
+
+		auto snapshot = [&]()
+		{
+			dsp.getSR(); // materialize the interpreter's lazy CCR before comparison
+			const auto& r = dsp.regs();
+			std::vector<int64_t> values{r.x.var, r.y.var, r.a.var, r.b.var,
+				r.pc.var, r.sr.var, r.omr.var, r.la.var, r.lc.var, r.sp.var, r.sc.var};
+			for(unsigned i = 0; i < 8; ++i)
+				for(const auto value : std::array<int64_t, 5>{r.r[i].var, r.n[i].var, r.m[i].var, r.mMask[i], r.mModulo[i]})
+					values.push_back(value);
+			for(const auto& value : r.ss) values.push_back(value.var);
+			values.push_back(dsp.getInstructionCounter());
+			return values;
+		};
+
+		for(const unsigned body : {0u, 1u, 2u, 3u, 4u, 5u})
+		for(const TWord count : {0u, 1u, 2u, 3u, 4u, 5u, 7u, 8u, 9u, 17u, 257u})
+#ifdef NDEBUG
+		for(const TWord stack : {0u, 14u})
+#else
+		// The interpreter deliberately asserts instead of wrapping its stack.
+		// Leave room for the nested body's four pushes in assertion-enabled runs.
+		// Release still checks interpreter wrap; nopLoopSlices checks JIT wrap
+		// against the unfused emitter in both configurations.
+		for(const TWord stack : {0u, 11u})
+#endif
+		{
+			const TWord after = body == 0 ? 0x203 : body == 1 ? 0x204 : 0x210;
+			const auto setup = [&]()
+			{
+				dsp.resetHW();
+				dsp.setSR(0x30014 | (stack ? SR_LF : 0));
+				dsp.regs().la.var = 0x654321;
+				dsp.regs().lc.var = 0x123456;
+				dsp.regs().sp.var = stack;
+				dsp.regs().sc.var = stack;
+				for(unsigned i = 0; i < 16; ++i) dsp.regs().ss[i].var = 0x123456654321ull + i;
+				dsp.setALU(false, TReg56(int64_t(0)));
+				dsp.setALU(true, TReg56(int64_t(0x1000000)));
+				dsp.x0(count);
+				dsp.y0(0);
+				dsp.x1(0);
+				dsp.y1(0);
+				std::stringstream doOp;
+				doOp << "do x0,>$" << std::hex << after;
+				TWord pc = emitToMemory(doOp.str().c_str(), 0x200);
+				verify(pc == 0x202);
+				if(body == 2) pc = emitToMemory("add b,a", pc);
+				if(body == 3) pc = emitToMemory("move #>$20f,la", pc);
+				if(body == 4) pc = emitToMemory("ori #$40,ccr", pc);
+				if(body == 5) pc = emitToMemory("do #$3,>$208", pc);
+				while(pc < after) pc = emitToMemory("nop", pc);
+				verify(pc == after);
+				dsp.setPC(0x200);
+			};
+
+			std::vector<int64_t> reference;
+			uint64_t referenceCycles = 0;
+			for(const unsigned limit : {0u, 1u, 4u, 8u})
+			{
+				config.maxDoIterations = limit;
+				dsp.getJit().destroyAllBlocks();
+				dsp.getJit().setConfig(config);
+				setup();
+				unsigned steps = 0;
+				while(dsp.getPC().var != after && ++steps < 100000)
+				{
+					const bool singleIteration = limit == 1 && body <= 1 && dsp.getPC().var == 0x202;
+					const auto beforeLC = dsp.regs().lc.var;
+					const auto beforeInstructions = dsp.getInstructionCounter();
+					dsp.execJit();
+					if(singleIteration)
+					{
+						verify(dsp.getInstructionCounter() - beforeInstructions == after - 0x202);
+						if(beforeLC > 1) verify(dsp.regs().lc.var == beforeLC - 1);
+					}
+					if(dsp.regs().sp.var == stack + 2 && dsp.getPC().var != after)
+					{
+						verify(dsp.regs().la.var == after - 1);
+						verify(dsp.regs().lc.var >= 1 && dsp.regs().lc.var <= count);
+						verify(dsp.getSR().var & SR_LF);
+					}
+				}
+				verify(steps < 100000);
+				verify(dsp.regs().la.var == 0x654321);
+				verify(dsp.regs().lc.var == 0x123456);
+				verify(dsp.regs().sp.var == stack && dsp.regs().sc.var == stack);
+				if(reference.empty()) { reference = snapshot(); referenceCycles = dsp.getCycles(); }
+				else { verify(snapshot() == reference); verify(dsp.getCycles() == referenceCycles); }
+
+				// A cached loop-ending block can also run outside an active DO loop.
+				if(body <= 1 && count)
+				{
+					dsp.setSR(0x30014);
+					dsp.setPC(0x202);
+					dsp.execJit();
+					verify(dsp.getPC().var == after);
+					verify(dsp.regs().la.var == 0x654321);
+					verify(dsp.regs().lc.var == 0x123456);
+					verify(dsp.getSR().var == 0x30014);
+					verify(dsp.regs().sp.var == stack && dsp.regs().sc.var == stack);
+				}
+			}
+			setup();
+			dsp.execInterpreter(); // the interpreter executes a whole DO internally
+			verify(dsp.getPC().var == after);
+			verify(snapshot() == reference);
+		}
+		dsp.getJit().destroyAllBlocks();
+		dsp.getJit().setConfig(oldConfig);
+		std::cout << "Loop write-back tests: 528 cases, four slice limits, exact interpreter state passed." << std::endl;
+	}
+
+	void JitUnittests::nopLoopSlices()
+	{
+		const auto oldConfig = dsp.getJit().getConfig();
+		auto config = oldConfig;
+		config.enableOptimizer = false;
+		config.linkJitBlocks = false;
+		config.maxInstructionsPerBlock = 0;
+		config.getBlockConfig = {};
+		unsigned cases = 0;
+		auto snapshot = [&]()
+		{
+			dsp.getSR();
+			const auto& r = dsp.regs();
+			std::vector<int64_t> values{r.x.var, r.y.var, r.a.var, r.b.var,
+				r.pc.var, r.sr.var, r.omr.var, r.la.var, r.lc.var, r.sp.var, r.sc.var};
+			for(unsigned i = 0; i < 8; ++i)
+				for(const auto value : std::array<int64_t, 5>{r.r[i].var, r.n[i].var, r.m[i].var, r.mMask[i], r.mModulo[i]})
+					values.push_back(value);
+			for(const auto& value : r.ss) values.push_back(value.var);
+			values.push_back(dsp.getInstructionCounter());
+			values.push_back(dsp.getCycles());
+			values.push_back(peripheralsX.getTargetClock());
+			values.push_back(peripheralsY.getTargetClock());
+			return values;
+		};
+		auto setup = [&](unsigned bodyWords, TWord count, TWord stack, bool nested)
+		{
+			dsp.resetHW();
+			// resetHW does not reset the scheduling deadlines in IPeripherals.
+			// Start both arms with identical, active near-term deadlines.
+			peripheralsX.resetDelayCycles(0, 7);
+			peripheralsY.resetDelayCycles(0, 11);
+			peripheralsX.clearCycleDeadline();
+			peripheralsY.clearCycleDeadline();
+			peripheralsX.setCycleDeadline(5);
+			peripheralsY.setCycleDeadline(9);
+			dsp.setSR(0x30014 | (stack ? SR_LF : 0));
+			dsp.regs().la.var = 0x654321;
+			dsp.regs().lc.var = 0x123456;
+			dsp.regs().sp.var = dsp.regs().sc.var = stack;
+			for(unsigned i = 0; i < 16; ++i) dsp.regs().ss[i].var = 0x123456654321ull + i;
+			dsp.x0(count);
+			const TWord body = nested ? 0x404 : 0x402;
+			const TWord after = body + bodyWords;
+			std::stringstream inner, outer;
+			inner << "do x0,>$" << std::hex << after;
+			outer << "do #$4,>$" << std::hex << after + 1;
+			TWord pc = 0x400;
+			if(nested) pc = emitToMemory(outer.str().c_str(), pc);
+			pc = emitToMemory(inner.str().c_str(), pc);
+			verify(pc == body);
+			for(unsigned i = 0; i < bodyWords; ++i) pc = emitToMemory("nop", pc);
+			if(nested) pc = emitToMemory("nop", pc);
+			dsp.setPC(0x400);
+			return pc;
+		};
+
+		for(const unsigned bodyWords : {1u, 2u})
+		for(const unsigned limit : {2u, 4u, 8u, 16u})
+		for(const TWord count : {0u, 1u, 2u, 3u, 4u, 5u, 7u, 8u, 9u, 17u, 255u, 256u, 257u})
+		for(const TWord stack : {0u, 14u})
+		for(const bool nested : {false, true})
+		{
+			std::vector<std::vector<int64_t>> reference;
+			for(const bool combined : {false, true})
+			{
+				dsp.getJit().destroyAllBlocks();
+				config.maxDoIterations = limit;
+				config.combineNopLoopIterations = combined;
+				dsp.getJit().setConfig(config);
+				const auto after = setup(bodyWords, count, stack, nested);
+				std::vector<std::vector<int64_t>> trace;
+				while(dsp.getPC().var != after && trace.size() < 10000)
+				{
+					dsp.execJit();
+					trace.push_back(snapshot());
+				}
+				verify(trace.size() < 10000);
+				if(count)
+				{
+					// Reuse a previously compiled ending body with LF clear.
+					dsp.setSR(0x30014);
+					dsp.setPC(nested ? 0x404 : 0x402);
+					dsp.execJit();
+					trace.push_back(snapshot());
+				}
+				if(!combined) reference = trace;
+				else
+				{
+					if(trace != reference)
+					{
+						std::cerr << "NOP slice mismatch: words=" << bodyWords << " limit=" << limit
+							<< " count=" << count << " stack=" << stack << " nested=" << nested
+							<< " returns=" << reference.size() << "/" << trace.size() << std::endl;
+						for(size_t step = 0; step < std::min(reference.size(), trace.size()); ++step)
+						{
+							if(reference[step] == trace[step]) continue;
+							for(size_t field = 0; field < reference[step].size(); ++field)
+								if(reference[step][field] != trace[step][field])
+									std::cerr << "  return " << step << " field " << field << ": "
+										<< reference[step][field] << " -> " << trace[step][field] << std::endl;
+							break;
+						}
+					}
+					verify(trace == reference);
+				}
+			}
+			++cases;
+		}
+
+		// Direct cached-body entries include LC=0/1 and large 24-bit counts;
+		// compare one return so the latter do not create million-step tests.
+		for(const unsigned bodyWords : {1u, 2u})
+		for(const unsigned limit : {2u, 4u, 8u, 16u})
+		for(const TWord count : {0u, 1u, 2u, 3u, 4u, 5u, 7u, 0x7fffffu, 0x800000u, 0xffffffu})
+		for(const TWord stack : {0u, 14u})
+		for(const bool loopFlag : {false, true})
+		{
+			std::vector<int64_t> reference;
+			for(const bool combined : {false, true})
+			{
+				dsp.getJit().destroyAllBlocks();
+				config.maxDoIterations = limit;
+				config.combineNopLoopIterations = combined;
+				dsp.getJit().setConfig(config);
+				setup(bodyWords, 3, stack, false);
+				dsp.execJit();
+				dsp.regs().lc.var = count;
+				dsp.setSR(0x30014 | (loopFlag ? SR_LF : 0));
+				dsp.execJit();
+				if(!combined) reference = snapshot();
+				else verify(snapshot() == reference);
+			}
+			++cases;
+		}
+		dsp.getJit().destroyAllBlocks();
+		dsp.getJit().setConfig(oldConfig);
+		std::cout << "NOP slice tests: " << cases << " paired cases with exact state/counters at every return passed." << std::endl;
 	}
 
 	void JitUnittests::boundedDispatch()

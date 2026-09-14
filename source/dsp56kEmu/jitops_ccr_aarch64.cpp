@@ -32,6 +32,15 @@ namespace dsp56k
 
 	void JitOps::copyBitToCCR(const JitRegGP& _src, uint32_t _bitIndex, CCRBit _dstBit)
 	{
+		if(m_block.getConfig().optimizeCcrSequences && _bitIndex == 0 &&
+			_dstBit != CCRB_L && _dstBit != CCRB_S)
+		{
+			// BFI already selects only bit zero. Sticky updates use OR instead,
+			// so they still need the extraction to discard all other source bits.
+			ccr_update(r64(_src), _dstBit);
+			return;
+		}
+
 		const RegGP dst(m_block);
 		if(_bitIndex < 32)
 			m_asm.ubfx(r32(dst), r32(_src), asmjit::Imm(_bitIndex), asmjit::Imm(1));

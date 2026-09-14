@@ -19,12 +19,21 @@ namespace dsp56k
 
 		uint32_t maxInstructionsPerBlock = 0;
 		bool memoryWritesCallCpp = false;
+		// Use live storage for immediate peripheral reads that explicitly support
+		// it. Disable for differential checks against the ordinary read handler.
+		bool inlinePeripheralReads = true;
+		// ARM64-only local CCR sequence reductions. Keep an unoptimized path for
+		// differential checks of flags, lazy updates and conditional execution.
+		bool optimizeCcrSequences = true;
 
 		// 16 bit compatibility mode for AGU operations are not supported by default, set to true if needed
 		bool support16BitSCMode = false;
 
 		// maximum number of iterations of a do loop before the Jit block is exited (and later re-entered), giving a time slice for interrupts/peripherals
 		uint32_t maxDoIterations = 0;
+		// Combine bookkeeping only within the existing bounded slice of a complete
+		// one-/two-NOP body. Keep the switch for exact return-boundary comparisons.
+		bool combineNopLoopIterations = true;
 
 		// needs to be true if there is code that executes code in interrupt regions as regular jumps
 		bool dynamicFastInterrupts = false;

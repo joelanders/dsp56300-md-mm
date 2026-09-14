@@ -256,6 +256,34 @@ namespace dsp56k
 		{
 		case Essi::ESSI0_SSISR:		return &m_essi0.readSR();
 		case Essi::ESSI1_SSISR:		return &m_essi1.readSR();
+
+		// These DMA getters only expose stable channel storage. Read the live
+		// word on every execution; do not include reads with acknowledgement,
+		// queue, pin callback or synchronization side effects in this allowlist.
+		case XIO_DCR5: return &m_dma.getDCR(5);
+		case XIO_DCO5: return &m_dma.getDCO(5);
+		case XIO_DDR5: return &m_dma.getDDR(5);
+		case XIO_DSR5: return &m_dma.getDSR(5);
+		case XIO_DCR4: return &m_dma.getDCR(4);
+		case XIO_DCO4: return &m_dma.getDCO(4);
+		case XIO_DDR4: return &m_dma.getDDR(4);
+		case XIO_DSR4: return &m_dma.getDSR(4);
+		case XIO_DCR3: return &m_dma.getDCR(3);
+		case XIO_DCO3: return &m_dma.getDCO(3);
+		case XIO_DDR3: return &m_dma.getDDR(3);
+		case XIO_DSR3: return &m_dma.getDSR(3);
+		case XIO_DCR2: return &m_dma.getDCR(2);
+		case XIO_DCO2: return &m_dma.getDCO(2);
+		case XIO_DDR2: return &m_dma.getDDR(2);
+		case XIO_DSR2: return &m_dma.getDSR(2);
+		case XIO_DCR1: return &m_dma.getDCR(1);
+		case XIO_DCO1: return &m_dma.getDCO(1);
+		case XIO_DDR1: return &m_dma.getDDR(1);
+		case XIO_DSR1: return &m_dma.getDSR(1);
+		case XIO_DCR0: return &m_dma.getDCR(0);
+		case XIO_DCO0: return &m_dma.getDCO(0);
+		case XIO_DDR0: return &m_dma.getDDR(0);
+		case XIO_DSR0: return &m_dma.getDSR(0);
 		default:					return nullptr;
 		}
 	}

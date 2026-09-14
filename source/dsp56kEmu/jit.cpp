@@ -81,6 +81,12 @@ namespace dsp56k
 		static_assert(!contains(g_nonVolatileGPs, g_dspPoolGps[0]), "first pool reg must be volatile");
 		static_assert(volatilesFirst(g_dspPoolGps, g_nonVolatileGPs), "GP pool registers must list all volatiles before the first non-volatile");
 		static_assert(volatilesFirst(g_dspPoolXmms, g_nonVolatileXMMs), "XMM pool registers must list all volatiles before the first non-volatile");
+#if defined(HAVE_ARM64)
+		static_assert(contains(g_nonVolatileGPs, regMemXBase) && contains(g_nonVolatileGPs, regMemYBase), "MMU bases must survive C++ calls");
+		static_assert(!contains(g_dspPoolGps, regMemXBase) && !contains(g_dspPoolGps, regMemYBase), "MMU bases must not enter the DSP register pool");
+		static_assert(!contains(g_regGPTemps, regMemXBase) && !contains(g_regGPTemps, regMemYBase), "MMU bases must not enter the scratch register pool");
+		static_assert(!regMemXBase.equals(regMemYBase) && !regMemXBase.equals(regDspPtr) && !regMemYBase.equals(regDspPtr), "persistent JIT pointers must be distinct");
+#endif
 	}
 #endif
 	constexpr bool g_traceOps = false;

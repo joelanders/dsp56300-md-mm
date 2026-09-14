@@ -485,11 +485,12 @@ namespace dsp56k
 		{
 		public:
 			CcrBatchUpdate(JitOps& _ops, CCRMask _mask);
+			CcrBatchUpdate(JitOps& _ops, CCRMask _mask, bool _allAssigned);
 			CcrBatchUpdate(JitOps& _ops, CCRMask _maskA, CCRMask _maskB);
 			CcrBatchUpdate(JitOps& _ops, CCRMask _maskA, CCRMask _maskB, CCRMask _maskC);
 			~CcrBatchUpdate();
 		private:
-			void initialize(CCRMask _mask) const;
+			void initialize(CCRMask _mask, bool _allAssigned) const;
 			JitOps& m_ops;
 		};
 		void ccr_update_ifZero(CCRBit _bit);

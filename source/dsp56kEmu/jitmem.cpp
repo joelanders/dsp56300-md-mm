@@ -659,7 +659,8 @@ namespace dsp56k
 
 		auto* periph = m_block.dsp().getPeriph(_area);
 
-		const auto* memPtr = periph->readAsPtr(_offset, _inst);
+		const auto* memPtr = m_block.getConfig().inlinePeripheralReads
+			? periph->readAsPtr(_offset, _inst) : nullptr;
 
 		if(memPtr)
 		{
@@ -911,6 +912,21 @@ namespace dsp56k
 
 	Jitmem::MemoryRef Jitmem::getMemAreaPtr(const EMemArea _area, const TWord _offset, MemoryRef&& _ref, bool _supportIndexedAddressing) const
 	{
+#ifdef HAVE_ARM64
+		// Indexed MMU accesses repeatedly use the same two bases. Borrow the
+		// trampoline's invariant registers instead of materializing a host address
+		// in a volatile scratch register for every DSP memory instruction. The
+		// non-MMU bridge-selection path retains its existing dynamic addressing.
+		if(!_offset && hasMmuSupport() && (_area == MemArea_X || _area == MemArea_Y))
+		{
+			_ref.reset();
+			auto m = noRef();
+			m.reg = _area == MemArea_X ? regMemXBase : regMemYBase;
+			m.baseAddr = getMemAreaHostPtr(_area);
+			m.ptr = makePtr(m.reg, sizeof(TWord));
+			return m;
+		}
+#endif
 		auto* hostPtr = getMemAreaHostPtr(_area) + _offset;
 
 		// nothing to do if _ref is already pointing to it
