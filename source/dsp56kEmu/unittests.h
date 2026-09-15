@@ -40,6 +40,9 @@ namespace  dsp56k
 
 		void runAllTests();
 
+		void esaiResetState();
+		void esaiTransmitControl();
+
 		void conditionCodes();
 		void aguModulo();
 		void aguMultiWrapModulo();

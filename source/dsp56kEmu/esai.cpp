@@ -10,9 +10,6 @@ namespace dsp56k
 	{
 		m_tx.fill(0);
 		m_rx.fill(0);
-
-		m_sr.set(M_TFS);
-		m_sr.set(M_TDE);
 	}
 
 	void Esai::reset()
@@ -24,10 +21,8 @@ namespace dsp56k
 		m_tccr = 0;
 		m_rccr = 0;
 
-		// Reset status register to power-on state (TFS and TDE set)
+		// Hardware, software and ESAI individual reset clear every SAISR flag.
 		m_sr = 0;
-		m_sr.set(M_TFS);
-		m_sr.set(M_TDE);
 
 		// Reset TX/RX data registers
 		m_tx.fill(0);
@@ -70,6 +65,8 @@ namespace dsp56k
 	void Esai::execTX()
 	{
 //		LOG(HEX(&m_periph.getDSP()) << " exec ESAI " << g_memAreaNames[m_area]  <<  " ictr " << m_periph.getDSP().getInstructionCounter());
+		if(m_tcr.test(M_TPR))
+			return;
 
 		const auto tem = getEnabledTransmitters();
 
@@ -177,17 +174,37 @@ namespace dsp56k
 
 	void Esai::writeTransmitControlRegister(TWord _val)
 	{
-		m_sr.clear(M_TUE);
 		LOG_DIAGNOSTIC("Write ESAI TCR " << HEX(_val));
 		const auto tem = getEnabledTransmitters();
+		const auto wasInReset = m_tcr.test(M_TPR);
 		m_tcr = _val;
-		if(tem != getEnabledTransmitters())
+
+		if(m_tcr.test(M_TPR))
 		{
-			// Note: cannot cast m_periph directly here because we might be a Y peripheral
-			if(auto* p = dynamic_cast<Peripherals56362*>(m_periph.getDSP().getPeriph(0)))
-				p->getEsaiClock().restartClock();
-			execTX();
+			resetTransmitSection();
+			return;
 		}
+
+		// Enabling transmitters arms them for a later serial/frame event. If the
+		// section was idle or in personal reset, discard any partial frame so that
+		// the first subsequent event is slot zero, but do not synthesize that event
+		// from the control-register write itself.
+		if(wasInReset || (!tem && getEnabledTransmitters()))
+		{
+			m_txSlotCounter = 0;
+			m_txFrame.clear();
+		}
+	}
+
+	void Esai::resetTransmitSection()
+	{
+		constexpr TWord txStatusMask =
+			(1u << M_TODE) | (1u << M_TEDE) | (1u << M_TDE) |
+			(1u << M_TUE) | (1u << M_TFS);
+		m_sr = static_cast<TWord>(m_sr) & ~txStatusMask;
+		m_writtenTX = 0;
+		m_txSlotCounter = 0;
+		m_txFrame.clear();
 	}
 
 	void Esai::writeTransmitClockControlRegister(TWord _val)
