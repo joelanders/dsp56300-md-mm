@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "jitops.h"
 
 #include "jitops_move.inl"
@@ -462,6 +464,44 @@ namespace dsp56k
 		}
 	}
 
+	void JitOps::op_Movem_aa(TWord op)
+	{
+		// MOVE(M) S,P:aa / MOVE(M) P:aa,D with a 6 bit short absolute address
+		const auto write = getFieldValue<Movem_aa, Field_W>(op);
+		const auto dddddd = getFieldValue<Movem_aa, Field_dddddd>(op);
+		const TWord addr = getFieldValue<Movem_aa, Field_aaaaaa>(op);
+
+		if (write)
+		{
+			copy24ToDDDDDD<Movem_aa>(op, dddddd, UsePooledTemp, [&](DspValue& r)
+			{
+				m_block.mem().readDspMemory(r, MemArea_P, addr);
+			});
+		}
+		else
+		{
+			DspValue r(m_block, UsePooledTemp);
+			decode_dddddd_read(r, dddddd);
+
+			// same self-modifying-code bookkeeping as writePmem()
+			DspValue compare(m_block, UsePooledTemp);
+			auto memRef = m_block.mem().readDspMemory(compare, MemArea_P, addr);
+
+			const auto skip = m_asm.newLabel();
+			m_asm.cmp(r32(compare), r32(r));
+			m_asm.jz(skip);
+
+			m_block.mem().writeDspMemory(MemArea_P, addr, r, std::move(memRef));
+
+			m_block.mem().mov(&m_block.pMemWriteAddress(), addr);
+			m_block.mem().mov(m_block.pMemWriteValue(), r);
+
+			m_asm.bind(skip);
+
+			m_resultFlags |= WritePMem;
+		}
+	}
+
 	void JitOps::op_Movep_ppea(TWord op)
 	{
 		const TWord pp = getFieldValue<Movep_ppea, Field_pppppp>(op) + 0xffffc0;
@@ -470,10 +510,10 @@ namespace dsp56k
 		const EMemArea sp = getFieldValue<Movep_ppea, Field_s>(op) ? MemArea_Y : MemArea_X;
 		const EMemArea sm = getFieldValueMemArea<Movep_ppea>(op);
 
-		auto ea = effectiveAddress<Movep_ppea>(op);
-
 		if (write)
 		{
+			auto ea = effectiveAddress<Movep_ppea>(op);
+
 			if (mmmrrr == MMMRRR_ImmediateData)
 			{
 				m_block.mem().writePeriph(sp, pp, ea);
@@ -489,7 +529,19 @@ namespace dsp56k
 		{
 			DspValue r(m_block);
 			m_block.mem().readPeriph(r, sp, pp, Movep_ppea);
-			writeMemOrPeriph(sm, ea, r);
+
+			if (sm == MemArea_P)
+			{
+				// "movep x:<<M_HRX,p:(r0)+" is how the Nord Modular kernel links module code into
+				// program memory. Needs the same self-modifying-code bookkeeping as movem, or the
+				// JIT keeps executing the blocks it compiled from the previous code.
+				writePmem<Movep_ppea>(op, r);
+			}
+			else
+			{
+				auto ea = effectiveAddress<Movep_ppea>(op);
+				writeMemOrPeriph(sm, ea, r);
+			}
 		}
 	}
 

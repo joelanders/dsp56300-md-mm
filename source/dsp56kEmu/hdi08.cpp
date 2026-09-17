@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "dsp.h"
 #include "interrupts.h"
 #include "hdi08.h"
@@ -532,8 +533,10 @@ namespace dsp56k
 
 	void HDI08::writeStatusRegister(const TWord _val)
 	{
-//		LOG("Write HDI08 HSR " << HEX(_val));
-		m_hsr = _val;
+		// HSR is read-only for the DSP: HRDF/HTDE/HCP are hardware status and HF0/HF1 belong to the
+		// host. A read-modify-write instruction such as BSSET/BCLR on HSR must therefore not be able
+		// to change anything, otherwise a host flag the host just cleared gets re-set by the DSP.
+		(void)_val;
 		m_periph.setDelayCycles(0);
 	}
 
