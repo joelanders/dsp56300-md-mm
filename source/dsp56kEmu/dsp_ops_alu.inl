@@ -571,7 +571,13 @@ namespace dsp56k
 
 	inline void DSP::op_ADC(const TWord op)
 	{
-		errNotImplemented("ADC");
+		// D + S + C -> D, S being X or Y (JJJ 2 and 3). The carry is folded into the source: the sum is exact in
+		// 64 bits, so the carry out of bit 55 is the carry of the whole three term addition.
+		const auto D = getFieldValue<ADC, Field_d>(op);
+		const auto J = getFieldValue<ADC, Field_J>(op);
+		TReg56 s = decode_JJJ_read_56(J + 2, !D);
+		s.var += static_cast<uint64_t>(sr_val(CCRB_C));
+		alu_add(D, s);
 	}
 	inline void DSP::op_Add_SD(const TWord op)
 	{
@@ -1248,7 +1254,12 @@ namespace dsp56k
 	}
 	inline void DSP::op_Sbc(const TWord op)
 	{
-		errNotImplemented("SBC");
+		// D - S - C -> D, see op_ADC
+		const auto D = getFieldValue<Sbc, Field_d>(op);
+		const auto J = getFieldValue<Sbc, Field_J>(op);
+		TReg56 s = decode_JJJ_read_56(J + 2, !D);
+		s.var += static_cast<uint64_t>(sr_val(CCRB_C));
+		alu_sub(D, s);
 	}
 	inline void DSP::op_Sub_SD(const TWord op)
 	{

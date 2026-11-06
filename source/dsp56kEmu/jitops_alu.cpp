@@ -104,6 +104,34 @@ namespace dsp56k
 		alu_add(D, r64(v.get()));
 	}
 
+	void JitOps::op_ADC(TWord op)
+	{
+		alu_adcSbc(getFieldValue<ADC, Field_d>(op), getFieldValue<ADC, Field_J>(op), false);
+	}
+
+	void JitOps::op_Sbc(TWord op)
+	{
+		alu_adcSbc(getFieldValue<Sbc, Field_d>(op), getFieldValue<Sbc, Field_J>(op), true);
+	}
+
+	void JitOps::alu_adcSbc(const TWord _ab, const TWord _j, const bool _subtract)
+	{
+		// D +/- S +/- C -> D, S being X or Y (JJJ 2 and 3). The carry is folded into a private copy of the source
+		// (the sum is exact in 64 bits), then the plain ADD/SUB code produces the result and C.
+		RegGP s(m_block);
+		decode_JJJ_read_56(s, _j + 2, !_ab);
+
+		const RegGP carry(m_block);
+		ccr_getBitValue(carry, CCRB_C);
+
+		m_asm.add(r64(s), r64(carry));
+
+		if(_subtract)
+			alu_sub(_ab, s);
+		else
+			alu_add(_ab, s);
+	}
+
 	void JitOps::op_Add_xx(TWord op)
 	{
 		const auto iiiiii = getFieldValue<Add_xx, Field_iiiiii>(op);

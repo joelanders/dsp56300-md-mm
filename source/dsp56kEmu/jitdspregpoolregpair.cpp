@@ -38,6 +38,10 @@ namespace dsp56k
 			m_pool.clearWritten(m_reg0);
 			m_pool.clearWritten(m_reg1);
 
+			// The partial registers are no longer marked as written and the combined register is not either,
+			// so the merged value has to reach the DSP state here or the writes to the partial registers are lost
+			m_pool.movDspReg(dspReg(), r64(regBase));
+
 			asm_().mov(r64(_dst), r64(regBase));
 		}
 		// If the common reg is already loaded, use it
