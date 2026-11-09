@@ -185,13 +185,21 @@ namespace dsp56k
 		return true;
 	}
 
-	bool Assembler::parseRegister_JJJ(const std::string& _reg, bool _ab, TWord& _value)
+	bool Assembler::parseRegister_JJJ(const std::string& _reg, bool _ab, TWord& _value, bool _24BitOnly/* = false*/)
 	{
 		// _ab: true = destination is b, false = destination is a
-		// JJJ=1 means "other accumulator" (for Add/Sub etc)
-		// Note: for Tfr, JJJ=0 also falls through to mean "other accumulator" in the disassembler
-		// The caller is responsible for handling the JJJ=0 case for Tfr
+		// Add/Sub: 001 = other accumulator, 010/011 = X/Y
+		// Tfr/Cmp/Cmpm/Tcc (_24BitOnly): 000 = other accumulator, 001-011 are illegal (001 decodes as rnd/not/max...)
 		const auto reg = toLower(_reg);
+
+		if (_24BitOnly)
+		{
+			if (!parseRegister_JJJ(reg, _ab, _value))
+				return false;
+			if (_value == 1)
+				_value = 0;
+			return _value == 0 || _value >= 4;
+		}
 
 		if (reg == "b" && !_ab) { _value = 1; return true; }	// b when dest is a
 		if (reg == "a" && _ab) { _value = 1; return true; }	// a when dest is b
@@ -747,11 +755,8 @@ namespace dsp56k
 				TWord d;
 				if (!parseAluD(ops[1], d)) continue;
 				TWord jjj;
-				if (!parseRegister_JJJ(ops[0], d != 0, jjj)) continue;
-
-				// For Tfr, Cmp_S1S2, Cmpm_S1S2: JJJ value 0 is not valid
-				if ((inst == Tfr || inst == Cmp_S1S2 || inst == Cmpm_S1S2) && jjj == 0)
-					continue;
+				const bool is24BitOnly = inst == Tfr || inst == Cmp_S1S2 || inst == Cmpm_S1S2;
+				if (!parseRegister_JJJ(ops[0], d != 0, jjj, is24BitOnly)) continue;
 
 				setFieldValue(word, inst, Field_JJJ, jjj);
 				setFieldValue(word, inst, Field_d, d);
@@ -3022,6 +3027,60 @@ namespace dsp56k
 
 		// Tokenize: first token is mnemonic, rest are operands/moves
 		auto tokens = tokenize(text);
+
+		/*	"do forever, addr" and "dor forever, addr" have to be recognised here, before the normal
+			mnemonic lookup. They used to be handled after it, guarded by the mnemonic not being
+			found - which never happens, because "do" and "dor" are always found as the counted
+			variants, so neither could ever be assembled.
+		*/
+		if (tokens.size() >= 2)
+		{
+			const auto mnem = toLower(tokens[0]);
+
+			if (mnem == "do" || mnem == "dor")
+			{
+				auto rest = toLower(tokens[1]);
+
+				if (rest.substr(0, 7) == "forever")
+				{
+					auto addrStr = rest.substr(7);
+
+					if (!addrStr.empty() && addrStr[0] == ',')
+						addrStr = addrStr.substr(1);
+
+					if (addrStr.empty() && tokens.size() >= 3)
+						addrStr = toLower(tokens[2]);
+
+					if (!addrStr.empty() && addrStr[0] == '>')
+						addrStr = addrStr.substr(1);
+
+					TWord addr;
+
+					if (parseNumber(addrStr, addr))
+					{
+						const auto isDo = mnem == "do";
+						const auto inst = isDo ? DoForever : DorForever;
+
+						result.word[0] = g_opcodes[inst].m_mask1;
+
+						/*	DO FOREVER carries an absolute loop end address, one word behind the
+							last instruction of the loop, so the operand is the address after the
+							loop and the encoding is one less.
+
+							DOR FOREVER carries a displacement instead - op_DorForever computes
+							LA = PC + operand - and there is no PC here to turn an address into
+							one, so the operand is taken as the displacement and stored as it is.
+							That is the same rule Bra_xxxx and Bsr_xxxx follow.
+						*/
+						result.word[1] = isDo ? (addr > 0 ? addr - 1 : 0) : addr;
+						result.wordCount = 2;
+						result.error = AssembleError::OK;
+						return result;
+					}
+				}
+			}
+		}
+
 		if (tokens.empty())
 		{
 			result.error = AssembleError::InvalidInstruction;
@@ -3064,31 +3123,6 @@ namespace dsp56k
 
 		if (it == m_mnemonics.end())
 		{
-			// Try "do forever," as a special mnemonic
-			if (mnemonic == "do" && tokens.size() >= 2 && toLower(tokens[1]).substr(0, 8) == "forever,")
-			{
-				auto addrStr = toLower(tokens[1]).substr(8);
-				if (addrStr.empty() && tokens.size() >= 3)
-					addrStr = tokens[2];
-				// Handle "do forever, addr"
-				it = m_mnemonics.find("do forever,");
-				if (it != m_mnemonics.end())
-				{
-					TWord addr;
-					if (!addrStr.empty() && addrStr[0] == '>') addrStr = addrStr.substr(1);
-					if (parseNumber(addrStr, addr))
-					{
-						const auto inst = DoForever;
-						TWord word = g_opcodes[inst].m_mask1;
-						result.word[0] = word;
-						result.word[1] = addr > 0 ? addr - 1 : 0;
-						result.wordCount = 2;
-						result.error = AssembleError::OK;
-						return result;
-					}
-				}
-			}
-
 			// Still not found
 			if (it == m_mnemonics.end())
 			{
@@ -3199,15 +3233,14 @@ namespace dsp56k
 				// Tcc: S1,D1 [S2,D2]
 				case Tcc_S1D1:
 				{
+					if (!moveStr.empty()) continue;	// S2,D2 present -> Tcc_S1D1S2D2
 					std::vector<std::string> ops;
 					splitOperands(operands, ops);
 					if (ops.size() != 2) continue;
 					TWord d;
 					if (!parseAluD(ops[1], d)) continue;
 					TWord jjj;
-					if (!parseRegister_JJJ(ops[0], d != 0, jjj)) continue;
-					// JJJ < 4 overlaps with parallel move encoding, restrict to safe values
-					if (jjj < 4) continue;
+					if (!parseRegister_JJJ(ops[0], d != 0, jjj, true)) continue;
 					setFieldValue(word, inst, Field_JJJ, jjj);
 					setFieldValue(word, inst, Field_d, d);
 					result.word[0] = word;
@@ -3229,8 +3262,7 @@ namespace dsp56k
 					TWord d;
 					if (!parseAluD(ops1[1], d)) continue;
 					TWord jjj;
-					if (!parseRegister_JJJ(ops1[0], d != 0, jjj)) continue;
-					if (jjj < 4) continue;
+					if (!parseRegister_JJJ(ops1[0], d != 0, jjj, true)) continue;
 					TWord ttt, TTT;
 					if (!parseRegisterR(ops2[0], ttt)) continue;
 					if (!parseRegisterR(ops2[1], TTT)) continue;

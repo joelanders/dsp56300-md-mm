@@ -45,6 +45,9 @@ opcodefields.h
 opcodeinfo.h
 opcodetypes.h
 peripherals.cpp peripherals.h
+dax.cpp dax.h
+shi.cpp shi.h
+externalbusdevice.h
 registers.cpp registers.h
 timers.cpp timers.h
 types.cpp types.h

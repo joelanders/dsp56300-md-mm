@@ -14,6 +14,17 @@ namespace dsp56k
 	void JitOps::XYto56(const JitReg64& _dst, int _xy) const
 	{
 		m_dspRegs.getXY(_dst, _xy);
+		if(isSixteenBitArithmetic())
+		{
+			// X1[23..8] -> bits 47..32, X0[23..8] -> bits 31..16 (FM figure 3-10)
+			const RegGP t(m_block);
+			m_asm.mov(r64(t), _dst);
+			m_asm.and_(r32(t), asmjit::Imm(0xffff00));
+			m_asm.shl(r64(t), asmjit::Imm(8));
+			m_asm.shr(_dst, asmjit::Imm(32));
+			m_asm.shl(_dst, asmjit::Imm(32));
+			m_asm.or_(_dst, r64(t));
+		}
 		signextend48to56(_dst);
 		if constexpr (g_leftAlignedAlu)
 			m_asm.shl(_dst, asmjit::Imm(8));	// the result feeds ALU arithmetic, so match the ALU representation
@@ -31,12 +42,8 @@ namespace dsp56k
 
 		aluRestoreFrom64(ra);
 
-		const RegGP overflowValue(m_block);
-		m_asm.mov(overflowValue, asmjit::Imm(0x80000000000000ull << g_aluBitOffset));
-		m_asm.cmp(ra, overflowValue);
-		ccr_update_ifZero(CCRB_V);
-		ccr_l_update_by_v();
-
+		// the minimum has no positive counterpart and stays the minimum, which is ABS's only overflow
+		ccr_vl_update_ifEqual(ra, static_cast<uint64_t>(1) << (55 + g_aluBitOffset));
 		ccr_dirty(ab, ra, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -51,12 +58,15 @@ namespace dsp56k
 			if(!m_disableCCRUpdates)
 			{
 				CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+				// signed overflow of the 56 bit result is signed overflow of the host word when left-aligned
 #ifdef HAVE_ARM64
 				m_asm.adds(alu, alu, _v);
+				ccr_update_ifCarry(CCRB_C);
+				ccr_vl_update_ifOverflow();
 #else
 				m_asm.add(alu, _v);
+				ccr_c_update_vl_ifOverflow();
 #endif
-				ccr_update_ifCarry(CCRB_C);
 			}
 			else
 			{
@@ -65,6 +75,9 @@ namespace dsp56k
 		}
 		else
 		{
+		const RegGP overflow(m_block);
+		m_asm.mov(overflow, alu);
+
 		m_asm.add(alu, _v);
 
 		if(!m_disableCCRUpdates)
@@ -73,7 +86,17 @@ namespace dsp56k
 
 			copyBitToCCR(alu, 56, CCRB_C);
 
-//			ccr_clear(CCR_V);						// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
+			// V: the sign of the result differs from the signs of both operands
+			{
+				const RegGP operand(m_block);
+				m_asm.mov(operand, _v);
+				m_asm.xor_(operand, alu.get());
+				m_asm.xor_(overflow, alu.get());
+				m_asm.and_(overflow, operand.get());
+			}
+			m_asm.shr(overflow, asmjit::Imm(55));
+			m_asm.and_(overflow, asmjit::Imm(1));
+			ccr_vl_update(overflow);
 		}
 		}
 
@@ -103,12 +126,14 @@ namespace dsp56k
 			if(!m_disableCCRUpdates)
 			{
 				CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+				// signed overflow of the 56 bit result is signed overflow of the host word when left-aligned
 #ifdef HAVE_ARM64
 				m_asm.subs(alu, alu, _v);
 				ccr_update_ifNotCarry(CCRB_C);	// ARM carry means unsigned >=, inverted vs 56k/x64
+				ccr_vl_update_ifOverflow();
 #else
 				m_asm.sub(alu, _v);
-				ccr_update_ifCarry(CCRB_C);
+				ccr_c_update_vl_ifOverflow();
 #endif
 			}
 			else
@@ -118,6 +143,9 @@ namespace dsp56k
 		}
 		else
 		{
+		const RegGP overflow(m_block);
+		m_asm.mov(overflow, alu);
+
 		m_asm.sub(alu, _v);
 
 		if(!m_disableCCRUpdates)
@@ -126,7 +154,17 @@ namespace dsp56k
 
 			copyBitToCCR(alu, 56, CCRB_C);
 
-//			ccr_clear(CCR_V); batch cleared
+			// V: the operands differ in sign and the result does not share the sign of the minuend
+			{
+				const RegGP operand(m_block);
+				m_asm.mov(operand, overflow.get());
+				m_asm.xor_(operand, _v);
+				m_asm.xor_(overflow, alu.get());
+				m_asm.and_(overflow, operand.get());
+			}
+			m_asm.shr(overflow, asmjit::Imm(55));
+			m_asm.and_(overflow, asmjit::Imm(1));
+			ccr_vl_update(overflow);
 		}
 		}
 
@@ -159,6 +197,73 @@ namespace dsp56k
 		alu_add(D, r64(v.get()));
 	}
 
+	void JitOps::op_ADC(TWord op)
+	{
+		alu_adcSbc(getFieldValue<ADC, Field_d>(op), getFieldValue<ADC, Field_J>(op), false);
+	}
+
+	void JitOps::op_Sbc(TWord op)
+	{
+		alu_adcSbc(getFieldValue<Sbc, Field_d>(op), getFieldValue<Sbc, Field_J>(op), true);
+	}
+
+	void JitOps::alu_adcSbc(const TWord _ab, const TWord _j, const bool _subtract)
+	{
+		// ADC: D + S + C -> D, SBC: D - S - C -> D, S being X or Y. C, V and L describe the whole three term
+		// operation, which is what the host's own add and subtract with carry produce, so they are taken as for
+		// ADD and SUB. The host carry enters at bit 0 though, below the left-aligned accumulator. Those low bits
+		// are zero in both operands: a subtraction borrows through them as it is, an addition carries through
+		// them once they are all ones in the source. Either way they end up all ones or all zeros and are cleared.
+		const auto v = decode_JJJ_read_56(_j + 2, !_ab);	// JJJ 2 and 3 are X and Y
+
+		const RegGP carry(m_block);
+		ccr_getBitValue(carry, CCRB_C);						// before the batch below clears it
+
+		AluRef alu(m_block, _ab);
+
+		CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+
+		constexpr auto belowAccumulator = (static_cast<uint64_t>(1) << g_aluBitOffset) - 1;
+
+#ifdef HAVE_ARM64
+		if(_subtract)
+			m_asm.eor(r32(carry), r32(carry), asmjit::Imm(1));		// ARM subtracts the inverted carry
+		else
+			m_asm.orr(r64(v.get()), r64(v.get()), asmjit::Imm(belowAccumulator));
+
+		m_asm.cmp(r32(carry), asmjit::Imm(1));						// host C = carry
+
+		if(_subtract)
+		{
+			m_asm.sbcs(alu, alu, r64(v.get()));
+			ccr_update_ifNotCarry(CCRB_C);	// ARM carry means unsigned >=, inverted vs 56k/x64
+		}
+		else
+		{
+			m_asm.adcs(alu, alu, r64(v.get()));
+			ccr_update_ifCarry(CCRB_C);
+		}
+		ccr_vl_update_ifOverflow();
+
+		m_asm.and_(alu, alu, asmjit::Imm(~belowAccumulator));
+#else
+		if(!_subtract)
+			m_asm.or_(r64(v.get()).r8(), asmjit::Imm(belowAccumulator));
+
+		m_asm.bt(r32(carry), asmjit::Imm(0));						// host CF = carry
+
+		if(_subtract)
+			m_asm.sbb(alu, r64(v.get()));
+		else
+			m_asm.adc(alu, r64(v.get()));
+		ccr_c_update_vl_ifOverflow();
+
+		m_asm.and_(alu, asmjit::Imm(~belowAccumulator));
+#endif
+
+		ccr_dirty(_ab, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
+	}
+
 	void JitOps::op_Add_xx(TWord op)
 	{
 		const auto iiiiii = getFieldValue<Add_xx, Field_iiiiii>(op);
@@ -184,41 +289,63 @@ namespace dsp56k
 		// D = 2 * D + S
 
 		const auto ab = getFieldValue<Addl, Field_d>(op);
+
+		// C and V are both written below. Clearing them up front is also what lets x64 fold the carry in
+		// with a single adc.
 		CcrBatchUpdate bu(*this, CCR_C, CCR_V);
-		AluRef aluD(m_block, ab);
-		aluExtendTo64(aluD);
+
+		AluReg aluD(m_block, ab);
+
+		aluSignextendTo64(aluD);
+
+		// V is set when either stage overflows: the doubling, when bit 55 changes, or the addition. C comes from
+		// the addition alone, sim56300 leaves it clear when the doubling pushes out a set bit 55. As for the
+		// carry, the host flags describe the 56 bit value because the accumulator is left-aligned.
 		const RegGP overflow(m_block);
-		m_asm.mov(overflow, aluD);
 
 #ifdef HAVE_ARM64
+		m_asm.eor(r64(overflow), r64(aluD.get()), r64(aluD.get()), asmjit::arm::lsl(1));	// bit 63 = bit 63 ^ bit 62
+		m_asm.lsr(r64(overflow), r64(overflow), asmjit::Imm(63));
 		m_asm.lsl(aluD, aluD, asmjit::Imm(1));
 #else
 		m_asm.sal(aluD, asmjit::Imm(1));
+		m_asm.set(asmjit::x86::CondCode::kOverflow, overflow.get().r8());		// a one bit SAL sets OF to bit 63 ^ bit 62
 #endif
-		m_asm.xor_(overflow, aluD.get());
-		const RegGP shifted(m_block);
-		m_asm.mov(shifted, aluD);
 		{
 			AluReg aluS(m_block, ab ? 0 : 1, true);
 
-			aluExtendTo64(aluS);
+			aluSignextendTo64(aluS);
 
 #ifdef HAVE_ARM64
 			m_asm.adds(aluD, aluD, aluS.get());
 #else
 			m_asm.add(aluD, aluS.get());
 #endif
-			ccr_update_ifCarry(CCRB_C);
-			// Addition overflows when the result sign differs from both inputs.
-			m_asm.xor_(shifted, aluD.get());
-			m_asm.xor_(aluS, aluD.get());
-			m_asm.and_(shifted, aluS.get());
-			m_asm.or_(overflow, shifted.get());
 		}
 
-		copyBitToCCR(overflow, 63, CCRB_V);
-		ccr_l_update_by_v();
-		aluRestoreFrom64(aluD);
+#ifdef HAVE_ARM64
+		ccr_update_ifCarry(CCRB_C);
+		{
+			const RegScratch addOverflow(m_block);
+			m_asm.cset(addOverflow, asmjit::arm::CondCode::kVS);
+			m_asm.orr(r64(overflow), r64(overflow), r64(addOverflow));
+		}
+#else
+		{
+			// OF of the addition before the carry, which the batch folds in with an adc that rewrites OF
+			const RegScratch addOverflow(m_block);
+			m_asm.set(asmjit::x86::CondCode::kOverflow, addOverflow.get().r8());
+			ccr_update_ifCarry(CCRB_C);
+			m_asm.or_(overflow.get().r8(), addOverflow.get().r8());
+		}
+#endif
+		ccr_vl_update(overflow);
+
+		// D = 2 * D + S: the shift is to the LEFT, so the spare low byte stays zero, and adding another
+		// accumulator keeps it that way. Contrast op_Addr below, which shifts right and does need the mask.
+		if constexpr (!g_leftAlignedAlu)
+			m_dspRegs.mask56(aluD);
+
 		ccr_dirty(ab, aluD, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -412,16 +539,22 @@ namespace dsp56k
 			alu_abs(_v);
 		}
 
-		// C and V are both cleared. Only C is updated as V is cleared always
+		// C comes from the borrow. V is a signed overflow of the 56 bit difference, which with both operands in
+		// ALU alignment is signed overflow of the host word. CMPM compares magnitudes and leaves V clear.
 		{
 			CcrBatchUpdate u(*this, static_cast<CCRMask>(CCR_C | CCR_V));
 
 #ifdef HAVE_ARM64
 			m_asm.subs(d, d, _v);
 			ccr_update_ifNotCarry(CCRB_C);		// we, THAT is unexpected: On ARM, carry means unsigned >= while it means unsigned < on 56k and intel
+			if(!_magnitude)
+				ccr_vl_update_ifOverflow();
 #else
 			m_asm.sub(d, _v);
-			ccr_update_ifCarry(CCRB_C);
+			if(_magnitude)
+				ccr_update_ifCarry(CCRB_C);
+			else
+				ccr_c_update_vl_ifOverflow();
 #endif
 		}
 
@@ -464,8 +597,21 @@ namespace dsp56k
 		ccr_clear(CCR_V);
 	}
 
-	void JitOps::alu_mpy(TWord ab, DspValue& _s1, DspValue& _s2, bool _negate, bool _accumulate, bool _s1Unsigned, bool _s2Unsigned, bool _round)
+	void JitOps::alu_mpy(TWord ab, DspValue& _s1, DspValue& _s2, bool _negate, bool _accumulate, bool _s1Unsigned, bool _s2Unsigned, bool _round, const uint32_t _s1Shift)
 	{
+		// _s1Shift is how much of g_mpyProductShift the caller already folded into _s1
+		assert(_s1Shift <= g_mpyProductShift);
+
+		if (_s2.isImmediate())
+		{
+			// The immediate is a SIGNED 24-bit fractional value, but DspValue stores it raw.
+			// The interpreter sign extends it through TReg24; without the same here, every
+			// immediate >= $800000 multiplies as a large positive instead of a negative - on
+			// x64 through imul's constant, on aarch64 through the register smull materialises.
+			// The Virus firmware only uses `maci #>$7fdf3b`, below that threshold, which is why
+			// the two engines agreed until now.
+			_s2.imm() = TReg24(_s2.imm24()).signextend<int64_t>();
+		}
 //		assert( sr_test(SR_S0) == 0 && sr_test(SR_S1) == 0 );
 
 		AluRef d(m_block, ab, _accumulate, true);
@@ -504,7 +650,13 @@ namespace dsp56k
 #else
 		if(_s2.isImmediate())
 		{
-			const int64_t i = static_cast<int64_t>(_s2.imm24()) * 2;
+			// Same accounting as the register path: g_mpyProductShift of scale is needed, minus
+			// whatever the caller already folded into _s1's sign extension. The constant can
+			// absorb one bit of it for free (imm * 2 still fits an imm32); the rest is a shift,
+			// and when _s1 arrives pre-scaled there is nothing left to do at all.
+			const auto remainingShift = g_mpyProductShift - _s1Shift;
+
+			const int64_t i = _s2.imm() << (remainingShift ? 1 : 0);	// sign extended above
 
 			if(_negate)
 			{
@@ -512,7 +664,7 @@ namespace dsp56k
 			}
 			else
 			{
-				if (asmjit::Support::isPowerOf2(i))
+				if (i > 0 && asmjit::Support::isPowerOf2(i))
 				{
 					const auto shift = static_cast<uint32_t>(log2(i));
 					m_asm.shl(r64(_s1), asmjit::Imm(shift));
@@ -522,9 +674,9 @@ namespace dsp56k
 					m_asm.imul(r64(_s1), asmjit::Imm(i));
 				}
 			}
-			// scale the product into the ALU representation before it meets the accumulator
-			if constexpr (g_leftAlignedAlu)
-				m_asm.shl(r64(_s1), asmjit::Imm(8));
+
+			if (remainingShift > 1)
+				m_asm.shl(r64(_s1), asmjit::Imm(remainingShift - 1));
 
 			if (_accumulate)
 			{
@@ -541,38 +693,29 @@ namespace dsp56k
 			m_asm.imul(r64(_s1), r64(_s2));
 			_s2.release();
 
-			// scale the product into the ALU representation before it meets the accumulator
-			if constexpr (g_leftAlignedAlu)
-				m_asm.shl(r64(_s1), asmjit::Imm(8));
+			// The product needs scaling by one for the fractional multiply plus g_aluBitOffset for
+			// the left-aligned accumulator. decode_QQQQ_read can bake that into the sign extension
+			// of _s1 for free (see signextend24to64), in which case nothing is left to do here and
+			// the accumulate is a plain add instead of a shift plus a scaled lea.
+			const auto remainingShift = g_mpyProductShift - _s1Shift;
 
-			if(!_accumulate && !_negate)
+			if (remainingShift)
+				m_asm.shl(r64(_s1), asmjit::Imm(remainingShift));
+
+			if (_accumulate)
 			{
-				m_asm.lea(r64(d.get()), asmjit::x86::ptr(r64(_s1.get()), r64(_s1.get())));
+				aluSignextendTo64(d);
+
+				if (_negate)
+					m_asm.sub(d, r64(_s1));
+				else
+					m_asm.add(d, r64(_s1));
 			}
 			else
 			{
-				if (_accumulate)
-					aluSignextendTo64(d);
-
-				if(_accumulate && !_negate)
-				{
-					m_asm.lea(d, asmjit::x86::ptr(d, r64(_s1), 1));
-				}
-				else
-				{
-					// fractional multiplication requires one post-shift to be correct
-					m_asm.add(r64(_s1), r64(_s1));	// add r,r is faster than shl r,1 on Haswell, can run on more ports and has a TP of 0.25 vs 0.5
-
-					if(_accumulate && _negate)
-					{
-						m_asm.sub(d, r64(_s1));
-					}
-					else/* if(_negate)*/
-					{
-						m_asm.neg(r64(_s1));
-						m_asm.mov(d, r64(_s1));
-					}
-				}
+				if (_negate)
+					m_asm.neg(r64(_s1));
+				m_asm.mov(d, r64(_s1));
 			}
 		}
 #endif
@@ -617,9 +760,9 @@ namespace dsp56k
 			DspValue s1(m_block);
 			DspValue s2(m_block);
 
-			decode_QQQQ_read(s1, true, s2, true, qqq);
+			decode_QQQQ_read(s1, true, s2, true, qqq, g_mpyOperandShift);
 
-			alu_mpy(ab, s1, s2, negative, mulAcc, false, false, round);
+			alu_mpy(ab, s1, s2, negative, mulAcc, false, false, round, g_mpyOperandShift);
 		}
 	}
 
@@ -732,31 +875,92 @@ namespace dsp56k
 		const auto D = getFieldValue<Cmpm_S1S2, Field_d>(op);
 		const auto JJJ = getFieldValue<Cmpm_S1S2, Field_JJJ>(op);
 		const auto r = decode_JJJ_read_56(JJJ, !D);
-		alu_cmp(D, r64(r.get()), true);
+
+		// alu_cmp takes the magnitude in place. For S1 = the other accumulator r is that accumulator's live pool
+		// register, CMPM would leave |S1| in it for the rest of the block
+		const RegGP s1(m_block);
+		m_asm.mov(r64(s1), r64(r.get()));
+		alu_cmp(D, r64(s1), true);
+	}
+
+	void JitOps::op_Cmpu_S1S2(TWord op)
+	{
+		const auto D = getFieldValue<Cmpu_S1S2, Field_d>(op);
+		const auto ggg = getFieldValue<Cmpu_S1S2, Field_ggg>(op);
+
+		// ggg only defines 0 (the other accumulator) and 4..7 (x0, y0, x1, y1). Those encodings are
+		// identical to the ones JJJ uses, so the existing decoder covers every valid CMPU operand.
+		assert((ggg == 0 || ggg >= 4) && "invalid ggg value for CMPU");
+
+		// Nothing needs to be flushed first: the batch below clears the dirty flags of every bit CMPU
+		// writes, and CMPU never becomes the last modifying ALU op, so regLastModAlu keeps pointing at
+		// the previous result. E and U therefore stay lazy across the compare and are still evaluated
+		// from that previous result, which is exactly what "unchanged by the instruction" means.
+
+		const auto v = decode_JJJ_read_56(ggg, !D);
+
+		AluReg d(m_block, D, true);		// read only, CMPU does not store a result
+
+		const RegGP s1(m_block);
+		m_asm.mov(r64(s1), r64(v.get()));
+
+		// CMPU compares two 48 bit UNSIGNED operands, the accumulator extension takes no part in it.
+		// Shifting both operands up so that bit 47 lands on bit 63 hands the whole comparison to the
+		// host flags: borrow, zero and sign then all describe the 48 bit result, and the bits below are
+		// zero so they can neither produce a borrow of their own nor disturb the zero test.
+		constexpr auto shift = 16 - g_aluBitOffset;
+
+		m_asm.shl(r64(d), asmjit::Imm(shift));
+		m_asm.shl(r64(s1), asmjit::Imm(shift));
+
+		{
+			// One batch clears C, V, Z and N up front so that each of them can be OR'ed in below. V is
+			// "always cleared" and so needs nothing beyond that clear, and having C pre-cleared is what
+			// lets the carry be folded in with a single adc.
+			CcrBatchUpdate u(*this, static_cast<CCRMask>(CCR_C | CCR_V | CCR_Z | CCR_N));
+
+#ifdef HAVE_ARM64
+			m_asm.subs(r64(d), r64(d), r64(s1));
+			ccr_update_ifNotCarry(CCRB_C);	// on ARM carry means unsigned >=, while it means unsigned < on 56k and intel
+#else
+			m_asm.sub(r64(d), r64(s1));
+			ccr_update_ifCarry(CCRB_C);
+#endif
+
+			m_asm.test_(r64(d));
+			ccr_update_ifZero(CCRB_Z);		// "set if bits 47-0 of the result are 0"
+
+			// N is not the sign of the difference: sim56300 sets it together with C, from the unsigned
+			// borrow, which is what lets the signed branches after a CMPU (blt, bge, ble) act as unsigned
+			// ones. $000001 against $ffffff gives N and C with bit 47 of the difference clear. C is in the
+			// status register by now, so N is a copy of it.
+			copyBitToCCR(m_dspRegs.getSR(JitDspRegs::Read), CCRB_C, CCRB_N);
+		}
 	}
 
 	void JitOps::op_Dec(TWord op)
 	{
 		const auto ab = getFieldValue<Dec, Field_d>(op);
+
+		// C and V are written below. Clearing both up front folds the carry in with an adc and leaves V and L to be
+		// set out of line on the rare overflow.
+		CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+
 		AluRef r(m_block, ab);
 
 		aluExtendTo64(r);	// reach the 64 bit boundary to use the host carry bit (free when left-aligned)
 
+		// DEC overflows only by wrapping the minimum round to the maximum, which is signed overflow of the host word
 #ifdef HAVE_ARM64
 		m_asm.subs(r, r, asmjit::Imm(0x100));
 		ccr_update_ifNotCarry(CCRB_C);
+		ccr_vl_update_ifOverflow();
 #else
 		m_asm.sub(r, asmjit::Imm(0x100));
-		ccr_update_ifCarry(CCRB_C);
+		ccr_c_update_vl_ifOverflow();
 #endif
 
 		aluRestoreFrom64(r);
-
-		const RegGP overflowValue(m_block);
-		m_asm.mov(overflowValue, asmjit::Imm(0x7fffffffffffffull << g_aluBitOffset));
-		m_asm.cmp(r, overflowValue);
-		ccr_update_ifZero(CCRB_V);
-		ccr_l_update_by_v();
 
 		ccr_dirty(ab, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
@@ -783,13 +987,10 @@ namespace dsp56k
 #else
 		m_asm.imul(r64(s1), r64(s2));
 #endif
-		// fractional multiplication requires one post-shift to be correct
-		m_asm.sal(r64(s1), asmjit::Imm(1));
-
-		// scale the product into the ALU representation. Note the accumulator's own sar by 24 below
-		// already yields the correct left-aligned form, since (d >> 24) << 8 == (d << 8) >> 24.
-		if constexpr (g_leftAlignedAlu)
-			m_asm.sal(r64(s1), asmjit::Imm(8));
+		// One shift, not two: the fractional post-shift and the left-alignment scale are both
+		// applied to the same register, so they combine. Note the accumulator's own sar by 24
+		// below already yields the correct left-aligned form, since (d >> 24) << 8 == (d << 8) >> 24.
+		m_asm.sal(r64(s1), asmjit::Imm(g_mpyProductShift));
 
 		if (negate)
 			m_asm.neg(r64(s1));
@@ -816,33 +1017,6 @@ namespace dsp56k
 		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
-	void JitOps::op_Merge(TWord op)
-	{
-		const auto sss = getFieldValue<Merge, Field_SSS>(op);
-		const bool ab = getFieldValue<Merge, Field_D>(op);
-
-		DspValue source(m_block);
-		DspValue result(m_block);
-		decode_sss_read(source, sss);
-		getALU1(result, ab);
-
-		// DSP56300FM 13-108: D1 = {S[11:0], D1[11:0]}.
-		m_asm.and_(r32(source), asmjit::Imm(0x0fff));
-		m_asm.and_(r32(result), asmjit::Imm(0x0fff));
-		m_asm.shl(r32(source), asmjit::Imm(12));
-		m_asm.or_(r32(result), r32(source));
-		setALU1(ab, result);
-
-		copyBitToCCR(r64(result), 23, CCRB_N);
-#ifdef HAVE_ARM64
-		m_asm.test_(r32(result));
-#else
-		m_asm.test(r32(result), asmjit::Imm(0xffffff));
-#endif
-		ccr_update_ifZero(CCRB_Z);
-		ccr_clear(CCR_V);
-	}
-
 	void JitOps::op_Eor_SD(TWord op)
 	{
 		const auto D = getFieldValue<Or_SD, Field_d>(op);
@@ -860,61 +1034,96 @@ namespace dsp56k
 		alu_eor(ab, r);
 	}
 
-	void JitOps::op_Extractu_S1S2(TWord op)
+	void JitOps::op_Eor_xxxx(TWord op)
 	{
-		const auto sss = getFieldValue<Extractu_S1S2, Field_SSS>(op);
-		const bool abDst = getFieldValue<Extractu_S1S2, Field_D>(op);
-		const bool abSrc = getFieldValue<Extractu_S1S2, Field_s>(op);
+		const auto ab = getFieldValue<Eor_xxxx, Field_d>(op);
 
+		DspValue r(m_block);
+		getOpWordB(r);
+		alu_eor(ab, r);
+	}
+
+	void JitOps::decodeBitfieldControl(const DspValue& _control, const JitRegGP& _width, const JitRegGP& _offset)
+	{
+		_control.copyTo(_width, 24);
+		_control.copyTo(_offset, 24);
+
+		if(m_block.getMode() && m_block.getMode()->testSR(SRB_SA))
+		{
+			m_asm.shr(r32(_width), asmjit::Imm(16));
+			m_asm.shr(r32(_offset), asmjit::Imm(8));
+		}
+		else
+			m_asm.shr(r32(_width), asmjit::Imm(12));
+		m_asm.and_(r32(_width), asmjit::Imm(0x3f));
+		m_asm.and_(r32(_offset), asmjit::Imm(0x3f));
+	}
+
+	void JitOps::alu_extract(const TWord abDst, const TWord abSrc, DspValue& widthOffset, const bool signExtend)
+	{
 		ccr_clear(CCR_C);
 		ccr_clear(CCR_V);
 
-		DspValue widthOffset(m_block);
-		decode_sss_read(widthOffset, sss);
-
-		const ShiftReg width(m_block);
-		m_asm.mov(r32(width), r32(widthOffset));
-		m_asm.shr(r32(width), asmjit::Imm(12));
-		m_asm.and_(r32(width), asmjit::Imm(0x3f));
-
-		RegGP offset(m_block);
-		m_asm.mov(r32(offset), r32(widthOffset));
-		m_asm.and_(r32(offset), asmjit::Imm(0x3f));
-
-		m_asm.neg(width);
-		m_asm.add(width, asmjit::Imm(56));
-
-		const auto& mask = r64(widthOffset);
-		m_asm.mov(mask, asmjit::Imm(g_alu_max_56_u));
-		m_asm.shr(mask, shiftOperand(width.get()));
+		RegGP width(m_block);
+		ShiftReg shift(m_block);
+		decodeBitfieldControl(widthOffset, width.get(), shift.get());
+		widthOffset.release();
 
 		AluReg s(m_block, abSrc, abSrc != abDst);
-
-		// the bit offsets are relative to the 56-bit value, so work right-aligned and convert the result back
 		if constexpr (g_leftAlignedAlu)
 			m_asm.shr(s, asmjit::Imm(8));
+
 #ifdef HAVE_X86_64
 		if (JitEmitter::hasBMI2())
-		{
-			m_asm.shrx(s, s, offset.get());
-		}
+			m_asm.shrx(s, s, shift.get());
 		else
 #endif
-		{
-			const ShiftReg& shift = width;
-			m_asm.mov(shift, offset.get());
 			m_asm.shr(s, shiftOperand(shift.get()));
-		}
 
-		m_asm.and_(s, mask);
+		const auto zeroWidth = m_asm.newLabel();
+		const auto extracted = m_asm.newLabel();
+		m_asm.test_(r32(width));
+		m_asm.jz(zeroWidth);
+		if(signExtend)
+		{
+			// Shift the field's sign bit to the host sign bit and arithmetic-shift it back.
+			m_asm.mov(r32(shift), r32(width));
+			m_asm.neg(r32(shift));
+			m_asm.add(r32(shift), asmjit::Imm(64));
+#ifdef HAVE_ARM64
+			m_asm.shl(s, r64(shift));
+			m_asm.asr(s, s, r64(shift));
+#else
+			m_asm.shl(s, shift.get().r8());
+			m_asm.sar(s, shift.get().r8());
+#endif
+		}
+		else
+		{
+			const RegGP mask(m_block);
+			m_asm.mov(r64(mask), asmjit::Imm(1));
+			m_asm.mov(r32(shift), r32(width));
+#ifdef HAVE_ARM64
+			m_asm.shl(r64(mask), r64(shift));
+#else
+			m_asm.shl(r64(mask), shift.get().r8());	// x86 shift counts must live in cl
+#endif
+			m_asm.dec(r64(mask));
+			m_asm.and_(s, r64(mask));
+		}
+		m_asm.jmp(extracted);
+		m_asm.bind(zeroWidth);
+		m_asm.xor_(s, s);
+		m_asm.bind(extracted);
+		width.release();
+#ifdef HAVE_ARM64
+		shift.release();
+#endif
 
 		if constexpr (g_leftAlignedAlu)
 			m_asm.shl(s, asmjit::Imm(8));
 
-		offset.release();
-
 		JitReg64 aluD;
-
 		if (abSrc != abDst)
 		{
 			AluRef d(m_block, abDst, false, true);
@@ -922,11 +1131,65 @@ namespace dsp56k
 			aluD = d.get();
 		}
 		else
-		{
 			aluD = s.get();
-		}
 
 		ccr_dirty(abDst, aluD, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
+	}
+
+	void callDSPSaBitfield(DSP* _dsp, const TWord _control, const TWord _packed)
+	{
+		_dsp->saBitfield(_control, _packed);
+	}
+
+	// In Sixteen-bit Arithmetic mode the bitfield instructions call out to the interpreter rather than
+	// being inlined. The mode is rare, the semantics are involved - a 40 bit EXT:MSP:LSP view, two
+	// different control word layouts and two different width fields - and sharing one implementation is
+	// what stops the two engines from drifting apart. The block is compiled for a known mode, so the
+	// branch itself costs nothing at runtime.
+	bool JitOps::saBitfield(const TWord _packed, const TWord _control)
+	{
+		if(!isSixteenBitArithmetic())
+			return false;
+
+		m_block.dspRegPool().releaseAll();	// the callee reads and writes the DSP object directly
+		callDSPFunc(&callDSPSaBitfield, _control, _packed);
+		return true;
+	}
+
+	void JitOps::op_Extract_S1S2(TWord op)
+	{
+		const auto sss = getFieldValue<Extract_S1S2, Field_SSS>(op);
+		const bool abDst = getFieldValue<Extract_S1S2, Field_D>(op);
+		const bool abSrc = getFieldValue<Extract_S1S2, Field_s>(op);
+		if(saBitfield(0 | (1 << 2) | (static_cast<TWord>(abDst) << 3) | (static_cast<TWord>(abSrc) << 4) | (sss << 8), 0))
+			return;
+		DspValue widthOffset(m_block);
+		decode_sss_read(widthOffset, sss);
+		alu_extract(abDst, abSrc, widthOffset, true);
+	}
+
+	void JitOps::op_Extract_CoS2(TWord op)
+	{
+		const bool abDst = getFieldValue<Extract_CoS2, Field_D>(op);
+		const bool abSrc = getFieldValue<Extract_CoS2, Field_s>(op);
+		const auto control = getOpWordB();	// exactly once, it advances the operand word count
+		if(saBitfield(0 | (0 << 2) | (static_cast<TWord>(abDst) << 3) | (static_cast<TWord>(abSrc) << 4), control))
+			return;
+		DspValue widthOffset(m_block, control, DspValue::Immediate24);
+		alu_extract(abDst, abSrc, widthOffset, true);
+	}
+
+	void JitOps::op_Extractu_S1S2(TWord op)
+	{
+		const auto sss = getFieldValue<Extractu_S1S2, Field_SSS>(op);
+		const bool abDst = getFieldValue<Extractu_S1S2, Field_D>(op);
+		const bool abSrc = getFieldValue<Extractu_S1S2, Field_s>(op);
+
+		if(saBitfield(1 | (1 << 2) | (static_cast<TWord>(abDst) << 3) | (static_cast<TWord>(abSrc) << 4) | (sss << 8), 0))
+			return;
+		DspValue widthOffset(m_block);
+		decode_sss_read(widthOffset, sss);
+		alu_extract(abDst, abSrc, widthOffset, false);
 	}
 
 	void JitOps::op_Extractu_CoS2(TWord op)
@@ -934,51 +1197,36 @@ namespace dsp56k
 		const bool abDst = getFieldValue<Extractu_CoS2, Field_D>(op);
 		const bool abSrc = getFieldValue<Extractu_CoS2, Field_s>(op);
 
-		const auto widthOffset = getOpWordB();
-		const auto width = (widthOffset >> 12) & 0x3f;
-		const auto offset = widthOffset & 0x3f;
-
-		const auto mask = g_alu_max_56_u >> (56 - width);
-
-		AluReg d(m_block, abDst, false, abSrc != abDst);
-
-		if (abSrc != abDst)
-			m_dspRegs.getALU(d, abSrc);
-
-		// the offset is relative to the 56-bit value, so fold the alignment into the shift and put the
-		// result back into the ALU representation afterwards
-		m_asm.shr(d, asmjit::Imm(offset + g_aluBitOffset));
-		m_asm.and_(d, asmjit::Imm(mask));
-
-		if constexpr (g_leftAlignedAlu)
-			m_asm.shl(d, asmjit::Imm(8));
-
-		ccr_clear(CCR_C);
-		ccr_clear(CCR_V);
-		ccr_dirty(abDst, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
+		const auto control = getOpWordB();	// exactly once, it advances the operand word count
+		if(saBitfield(1 | (0 << 2) | (static_cast<TWord>(abDst) << 3) | (static_cast<TWord>(abSrc) << 4), control))
+			return;
+		DspValue widthOffset(m_block, control, DspValue::Immediate24);
+		alu_extract(abDst, abSrc, widthOffset, false);
 	}
 
 	void JitOps::op_Inc(TWord op)
 	{
 		const auto ab = getFieldValue<Dec, Field_d>(op);
+
+		// C and V are written below. Clearing both up front folds the carry in with an adc and leaves V and L to be
+		// set out of line on the rare overflow.
+		CcrBatchUpdate bu(*this, CCR_C, CCR_V);
+
 		AluRef r(m_block, ab);
 
 		aluExtendTo64(r);		// reach the 64 bit boundary to use the host carry bit (free when left-aligned)
 
+		// INC overflows only by wrapping the maximum round to the minimum, which is signed overflow of the host word
 #ifdef HAVE_ARM64
 		m_asm.adds(r, r, asmjit::Imm(0x100));
+		ccr_update_ifCarry(CCRB_C);
+		ccr_vl_update_ifOverflow();
 #else
 		m_asm.add(r, asmjit::Imm(0x100));
+		ccr_c_update_vl_ifOverflow();
 #endif
-		ccr_update_ifCarry(CCRB_C);
 
 		aluRestoreFrom64(r);
-
-		const RegGP overflowValue(m_block);
-		m_asm.mov(overflowValue, asmjit::Imm(0x80000000000000ull << g_aluBitOffset));
-		m_asm.cmp(r, overflowValue);
-		ccr_update_ifZero(CCRB_V);
-		ccr_l_update_by_v();
 
 		ccr_dirty(ab, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
@@ -989,6 +1237,8 @@ namespace dsp56k
 		const auto qqq = getFieldValue<Insert_S1S2, Field_qqq>(op);
 		const auto sss = getFieldValue<Insert_S1S2, Field_SSS>(op);
 
+		if(saBitfield(2 | (1 << 2) | (static_cast<TWord>(D) << 3) | (qqq << 5) | (sss << 8), 0))
+			return;
 		DspValue src(m_block, UsePooledTemp);
 		DspValue co(m_block);
 
@@ -1003,11 +1253,13 @@ namespace dsp56k
 		const auto D   = getFieldValue<Insert_CoS2, Field_D>(op);
 		const auto qqq = getFieldValue<Insert_CoS2, Field_qqq>(op);
 
+		const auto control = getOpWordB();	// exactly once, it advances the operand word count
+		if(saBitfield(2 | (0 << 2) | (static_cast<TWord>(D) << 3) | (qqq << 5), control))
+			return;
 		DspValue src(m_block, UsePooledTemp);
-		DspValue co(m_block);
+		DspValue co(m_block, control, DspValue::Immediate24);
 
 		decode_qqq_read(src, qqq);
-		getOpWordB(co);
 
 		alu_insert(D, src, co);
 	}
@@ -1073,7 +1325,12 @@ namespace dsp56k
 
 	void JitOps::op_Max(TWord)
 	{
-		AluRef a(m_block, 0, true);
+		// MAX only writes the destination accumulator B; A is a read-only source.
+		// Take A as a read-only temp copy (NOT an AluRef, which defaults to write=true):
+		// a writeback of A here gets latched and, when MAX carries a parallel move into A
+		// (e.g. the coef builder's `max a,b  x1,a`, $20AE1D), the deferred A
+		// writeback clobbers that move in the parallel-op epilog. See unittest max_parallel().
+		AluReg a(m_block, 0, true);
 		AluReg b(m_block, 1, false);
 
 		aluSignextendTo64(a);
@@ -1088,7 +1345,6 @@ namespace dsp56k
 #endif
 		ccr_update_ifLess(CCRB_C);
 
-		m_dspRegs.mask56(a);
 		m_dspRegs.mask56(b);
 	}
 
@@ -1134,54 +1390,134 @@ namespace dsp56k
 		m_dspRegs.mask56(refB);
 	}
 
-	void JitOps::op_Maci_xxxx(TWord op)
+	template <Instruction Inst> void JitOps::mpyImmediate(const TWord op, const bool _accumulate, const bool _round)
 	{
-		const bool	ab = getFieldValue<Maci_xxxx, Field_d>(op);
-		const bool	negate = getFieldValue<Maci_xxxx, Field_k>(op);
-		const TWord qq = getFieldValue<Maci_xxxx, Field_qq>(op);
+		const bool	ab = getFieldValue<Inst, Field_d>(op);
+		const bool	negate = getFieldValue<Inst, Field_k>(op);
+		const TWord qq = getFieldValue<Inst, Field_qq>(op);
 
 		DspValue s(m_block);
-		getSignedOpWordB(s);
+		getOpWordB(s);
 
 		DspValue reg(m_block);
-		decode_qq_read(reg, qq, true);
+		decode_qq_read(reg, qq, true, g_mpyOperandShift);
 
-		alu_mpy(ab, reg, s, negate, true, false, false, false);
+		alu_mpy(ab, reg, s, negate, _accumulate, false, false, _round, g_mpyOperandShift);
 	}
 
 	void JitOps::op_Mpyi(TWord op)
 	{
-		const bool	ab = getFieldValue<Mpyi, Field_d>(op);
-		const bool	negate = getFieldValue<Mpyi, Field_k>(op);
-		const TWord qq = getFieldValue<Mpyi, Field_qq>(op);
+		mpyImmediate<Mpyi>(op, false, false);
+	}
 
+	void JitOps::op_Merge(TWord op)
+	{
+		const auto D   = getFieldValue<Merge, Field_D>(op);
+		const auto sss = getFieldValue<Merge, Field_SSS>(op);
+
+		// Sixteen-bit Arithmetic mode halves the operation: bits 15-8 of the source join bits 39-32 of
+		// the destination and the 16 bit result goes to bits 47-32. Writing an accumulator in SA mode
+		// also clears the least significant byte of each half (manual 3.4 note 2, and the reference
+		// simulator agrees: merge x1,a with x1=$abcdef a=$ff112233445566 gives $ffcd2200445500).
+		// The block is compiled for a known mode, so this is decided once at emit time.
+		if(isSixteenBitArithmetic())
+		{
+			DspValue s(m_block);
+			decode_sss_read(s, sss);
+
+			AluRef d(m_block, D);
+
+			const RegGP merged(m_block);
+			m_asm.mov(r32(merged), r32(s));
+			m_asm.shr(r32(merged), asmjit::Imm(8));
+			m_asm.and_(r32(merged), asmjit::Imm(0xff));
+			m_asm.shl(r32(merged), asmjit::Imm(8));
+
+			{
+				const RegGP dMid(m_block);
+				m_asm.mov(r64(dMid), r64(d));
+				m_asm.shr(r64(dMid), asmjit::Imm(32 + g_aluBitOffset));
+				m_asm.and_(r32(dMid), asmjit::Imm(0xff));
+				m_asm.or_(r32(merged), r32(dMid));
+			}
+
+			{
+				CcrBatchUpdate u(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_V));
+
+				m_asm.test_(r32(merged));
+				ccr_update_ifZero(CCRB_Z);
+
+				{
+					const RegGP mask(m_block);
+					m_asm.mov(r64(mask), asmjit::Imm(~((static_cast<uint64_t>(0xffff) << (32 + g_aluBitOffset)) | (static_cast<uint64_t>(0xff) << (24 + g_aluBitOffset)) | (static_cast<uint64_t>(0xff) << g_aluBitOffset))));
+					m_asm.and_(r64(d), r64(mask));
+				}
+
+				m_asm.shl(r64(merged), asmjit::Imm(32 + g_aluBitOffset));
+				m_asm.or_(r64(d), r64(merged));
+
+				ccr_n_update_by47(r64(d));
+			}
+			return;
+		}
+
+		// {S[11-0],D[35-24]} -> D[47-24], a 24 bit operation that leaves the rest of D alone.
 		DspValue s(m_block);
-		getSignedOpWordB(s);
+		decode_sss_read(s, sss);
 
-		DspValue reg(m_block);
-		decode_qq_read(reg, qq, true);
+		AluRef d(m_block, D);
 
-		alu_mpy(ab, reg, s, negate, false, false, false, false);
+		const RegGP merged(m_block);
+		m_asm.mov(r32(merged), r32(s));
+		m_asm.and_(r32(merged), asmjit::Imm(0xfff));
+		m_asm.shl(r32(merged), asmjit::Imm(12));
+
+		{
+			const RegGP dMid(m_block);
+			m_asm.mov(r64(dMid), r64(d));
+			m_asm.shr(r64(dMid), asmjit::Imm(24 + g_aluBitOffset));	// ALU bit 24 down to bit 0
+			m_asm.and_(r32(dMid), asmjit::Imm(0xfff));
+			m_asm.or_(r32(merged), r32(dMid));
+		}
+
+		// N, Z and V only. E and U are unchanged, so this must not become the last modifying ALU op -
+		// no ccr_dirty here, exactly as in CMPU.
+		{
+			CcrBatchUpdate u(*this, static_cast<CCRMask>(CCR_N | CCR_Z | CCR_V));
+
+			m_asm.test_(r32(merged));
+			ccr_update_ifZero(CCRB_Z);		// "set if bits 47-24 of the result are 0"
+
+			// write the field into D[47-24] and take N from bit 47 of what landed there
+			{
+				// the complement is materialized directly: aarch64 asmjit has no not_ for general
+				// purpose registers, only the vector form
+				const RegGP mask(m_block);
+				m_asm.mov(r64(mask), asmjit::Imm(~(static_cast<uint64_t>(0xffffff) << (24 + g_aluBitOffset))));
+				m_asm.and_(r64(d), r64(mask));
+			}
+
+			m_asm.shl(r64(merged), asmjit::Imm(24 + g_aluBitOffset));
+			m_asm.or_(r64(d), r64(merged));
+
+			ccr_n_update_by47(r64(d));
+		}
 	}
 
 	void JitOps::op_Mpyri(TWord op)
 	{
-		// MPYRI (+/-)#xxxx,S,D  -  multiply immediate with rounding.
-		// Mirror of op_Mpyi (MPYI) with the rounding flag of alu_mpy set, matching the
-		// interpreter's op_Mpyri (alu_mpy + alu_rnd). getSignedOpWordB() fetches the immediate
-		// extension word and advances m_opSize to 2, which also keeps the JIT block emitter
-		// in sync over this two-word instruction.
-		const bool	ab = getFieldValue<Mpyri, Field_d>(op);
-		const bool	negate = getFieldValue<Mpyri, Field_k>(op);
-		const TWord qq = getFieldValue<Mpyri, Field_qq>(op);
+		// MPYRI is MPYI with rounding, which alu_mpy applies itself
+		mpyImmediate<Mpyri>(op, false, true);
+	}
 
-		DspValue s(m_block);
-		getSignedOpWordB(s);
+	void JitOps::op_Maci_xxxx(TWord op)
+	{
+		mpyImmediate<Maci_xxxx>(op, true, false);
+	}
 
-		DspValue reg(m_block);
-		decode_qq_read(reg, qq, true);
-
-		alu_mpy(ab, reg, s, negate, false, false, false, true);
+	void JitOps::op_Macri_xxxx(TWord op)
+	{
+		mpyImmediate<Macri_xxxx>(op, true, true);
 	}
 
 	void JitOps::op_Neg(TWord op)
@@ -1193,17 +1529,57 @@ namespace dsp56k
 		m_asm.neg(r);
 		m_dspRegs.mask56(r);
 
-		// Only negating the minimum 56-bit value produces that value again.
-		// Compare explicitly so this works for either accumulator alignment.
-		{
-			const RegScratch minimum(m_block);
-			m_asm.mov(minimum, asmjit::Imm(uint64_t(1) << (55 + g_aluBitOffset)));
-			m_asm.cmp(r, minimum);
-		}
-		ccr_update_ifZero(CCRB_V);
-		ccr_l_update_by_v();
+		// The 56 bit minimum is the only input that overflows: it negates to itself. Comparing the
+		// result against it works for either accumulator alignment, and V was simply cleared here.
+		ccr_vl_update_ifEqual(r, static_cast<uint64_t>(1) << (55 + g_aluBitOffset));
 
 		ccr_dirty(D, r, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
+	}
+
+	void JitOps::op_Norm(TWord op)
+	{
+		const auto rrr = getFieldValue<Norm, Field_RRR>(op);
+		const auto D = getFieldValue<Norm, Field_d>(op);
+
+		// NORM branches on the E/U/Z values established before this
+		// instruction.  Flush any lazy flags first, then keep the accumulator
+		// and address register live across all three runtime paths.
+		updateDirtyCCR(static_cast<CCRMask>(CCR_E | CCR_U | CCR_Z));
+		const DspValue sr(m_block, PoolReg::DspSR, true, false);
+		AluRef alu(m_block, D, true, true);
+		alu.get();
+		DspValue r = makeDspValueRegR(m_block, rrr, true, true);
+
+		// NORM leaves the carry bit unchanged (FM 13-146) but the ASL/ASR helpers write it
+		const RegGP savedSR(m_block);
+		m_asm.mov(r32(savedSR), r32(sr));
+
+		const auto shiftRight = m_asm.newLabel();
+		const auto done = m_asm.newLabel();
+
+		m_asm.bitTest(r32(sr), CCRB_E);
+		m_asm.jnz(shiftRight);
+		m_asm.bitTest(r32(sr), CCRB_U);
+		m_asm.jz(done);
+		m_asm.bitTest(r32(sr), CCRB_Z);
+		m_asm.jnz(done);
+
+		alu_asl(D, D, nullptr, 1);
+		copyBitToCCR(r32(savedSR), CCRB_C, CCRB_C);
+		m_asm.dec(r32(r));
+		m_dspRegs.maskSC1624(r32(r));
+		// Do not defer these flags past the NOP path at the join point.
+		updateDirtyCCR();
+		m_asm.jmp(done);
+
+		m_asm.bind(shiftRight);
+		alu_asr(D, D, nullptr, 1);
+		copyBitToCCR(r32(savedSR), CCRB_C, CCRB_C);
+		m_asm.inc(r32(r));
+		m_dspRegs.maskSC1624(r32(r));
+		updateDirtyCCR();
+
+		m_asm.bind(done);
 	}
 
 	void JitOps::op_Nop(TWord op)
@@ -1216,44 +1592,48 @@ namespace dsp56k
 		//     ASR S,D
 		// else
 		//     ASL -S,D
-		//
-		// The two arms MUST branch through the If() helper: a hand-rolled jnz/jmp/bind with the
-		// register pool live emits the pool's first-touch loads (e.g. of SR) into whichever arm is
-		// compiled first, so the other arm runs on an unloaded host register and the block-exit
-		// spill writes host garbage into the emulated register - a nondeterminism source, not just
-		// a wrong value (SR bits 8-23 could differ per run, changing the scaling
-		// mode and thus MAC/limiting results downstream).
 
 		const auto sss = getFieldValue(Normf, Field_sss, op);
 		const auto D = getFieldValue(Normf, Field_D, op);
 
-		// The shift count lives in the ShiftReg (pushed/restored host register, not pool-managed on
-		// x64), so it survives the pool release that If() performs before branching.
-		const ShiftReg shifter(m_block);
-		{
-			DspValue src(m_block);
-			decode_sss_read(src, sss);
-			m_asm.mov(r32(shifter), r32(src));
-		}
+		// Both arms below go through the CCR helpers, which fetch SR from the register pool. The pool is
+		// compile-time state: a load or spill emitted inside the first arm is taken as done in the second
+		// arm too, although that path never executes it, and whatever got spilled there (an address register,
+		// typically) comes back stale after the join. Pin SR and the accumulator before branching and flush
+		// the deferred CCR bits so that both arms start from the same pool and dirty state, as op_Norm does.
+		updateDirtyCCR();
+		const DSPReg sr(m_block, PoolReg::DspSR, true, true);
 
-		If(m_block, m_blockRuntimeData,
-			[&](const asmjit::Label& _toFalse)
-			{
-				m_asm.bitTest(shifter, 23);
-				m_asm.jnz(_toFalse);
-			},
-			[&]	// S[23] == 0: ASR
-			{
-				alu_asr(D, D, &shifter);
-			},
-			[&]	// S[23] == 1: ASL by the negated count
-			{
-				m_asm.shl(r32(shifter), asmjit::Imm(8));
-				m_asm.neg(shifter);
-				m_asm.shr(r32(shifter), asmjit::Imm(8));
-				alu_asl(D, D, &shifter);
-			},
-			true, true, true);
+		AluRef alu(m_block, D, true, true);
+		alu.get();	// force to lock already now
+
+		DspValue src(m_block);
+		decode_sss_read(src, sss);
+
+		const ShiftReg shifter(m_block);
+		m_asm.mov(r32(shifter), r32(src));
+		src.release();	// dead from here, and this op is at the limit of the register pool
+
+		// NORMF leaves C alone (FM 13-147), so it passes _updateCarry false rather than having the
+		// caller save and restore the bit - a spare register is exactly what op_Normf does not have.
+		const auto asl = m_asm.newLabel();
+		const auto end = m_asm.newLabel();
+
+		m_asm.bitTest(shifter, 23);
+		m_asm.jnz(asl);
+
+		// ASR
+		alu_asr(D, D, &shifter, 0, false);
+		m_asm.jmp(end);
+
+		// ASL
+		m_asm.bind(asl);
+		m_asm.shl(r32(shifter), asmjit::Imm(8));
+		m_asm.neg(shifter);
+		m_asm.shr(r32(shifter), asmjit::Imm(8));
+		alu_asl(D,D, &shifter, 0, false);
+
+		m_asm.bind(end);
 	}
 
 	void JitOps::op_Or_SD(TWord op)
@@ -1355,32 +1735,40 @@ namespace dsp56k
 
 	void JitOps::op_Subr(TWord op)
 	{
-		// D = D/2 - S (reverse subtract: subtract source from half of destination)
+		// D = D/2 - S. Mirrors the interpreter op_Subr: arithmetic halve of D keeping the 56-bit
+		// format, subtract S, then Z and C explicitly with E/U/N deferred. C is the accumulator MSB
+		// (bit 55) changing, as the interpreter's sr_c_update_arithmetic does. V, L and S are untouched.
 		const auto ab = getFieldValue<Subr, Field_d>(op);
 
 		AluReg aluD(m_block, ab);
 
-		// D/2: arithmetic shift right by 1, maintaining 56-bit format
-		m_asm.sal(aluD, asmjit::Imm(8));
+		// keep the pre-op value: C is set when accumulator bit 55 changes between old and new
+		const RegGP oldD(m_block);
+		m_asm.mov(oldD.get(), aluD.get());
+
+		// D/2, arithmetic, keeping the left-aligned 56-bit layout (same idiom as op_Addr). The old
+		// sal 8 / sar 1 / shr 8 was the right-aligned recipe: on the left-aligned ALU it discarded the
+		// extension byte and took the sign from bit 47 instead of bit 55.
+		aluExtendTo64(aluD);
 		m_asm.sar(aluD, asmjit::Imm(1));
-		m_asm.shr(aluD, asmjit::Imm(8));
+		aluRestoreFrom64(aluD);
 
 		{
 			AluRef aluS(m_block, ab ? 0 : 1, true, false);
 			m_asm.sub(aluD, aluS.get());
 		}
 
-		{
-			const RegScratch aluMax(m_block);
-			m_asm.mov(aluMax, asmjit::Imm(g_alu_max_56_u));
-			m_asm.cmp(aluD, aluMax);
-		}
+		m_dspRegs.mask56(aluD);
 
-		ccr_update_ifGreater(CCRB_C);
+		// Z first, from an explicit test, before any bit-copy clobbers the host flags.
+		m_asm.test_(aluD);
+		ccr_update_ifZero(CCRB_Z);
+
+		// C = accumulator bit 55 changed. oldD XOR new leaves the change at bit 55.
+		m_asm.xor_(oldD.get(), aluD.get());
+		copyBitToCCR(oldD.get(), 55 + g_aluBitOffset, CCRB_C);
 
 		ccr_dirty(ab, aluD, static_cast<CCRMask>(CCR_E | CCR_U | CCR_N));
-		ccr_n_update_by55(aluD);
-		ccr_s_update(aluD);
 	}
 
 	void JitOps::op_Tcc_S1D1(TWord op)

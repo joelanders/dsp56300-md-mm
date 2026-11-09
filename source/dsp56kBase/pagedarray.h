@@ -58,6 +58,27 @@ namespace dsp56k
 			}
 		}
 
+		// as forEachAllocated, but passes the index of every entry of an allocated page
+		template<typename F> void forEachPrivate(F&& _visit)
+		{
+			for (size_t p = 0; p < m_pages.size(); ++p)
+			{
+				if (!m_pages[p])
+					continue;
+				const auto count = std::min(PageSize, m_maxSize - p * PageSize);
+				for (size_t i = 0; i < count; ++i)
+					_visit(p * PageSize + i);
+			}
+		}
+
+		bool ensureBlocksForRange(size_t _first, size_t _last)
+		{
+			bool res = false;
+			for (auto i = _first - _first % PageSize; i <= _last && i < m_maxSize; i += PageSize)
+				res |= ensureBlockForIndex(i);
+			return res;
+		}
+
 		size_t size() const { return m_size; }
 		void clear()
 		{

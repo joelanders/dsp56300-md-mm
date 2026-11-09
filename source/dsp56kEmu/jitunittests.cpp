@@ -2,6 +2,7 @@
 #include "jitdspregpool.h"
 #include "jitunittests.h"
 
+#include "externalbusdevice.h"
 #include "jitasmjithelpers.h"
 #include "jitblock.h"
 #include "jitblockruntimedata.h"
@@ -44,6 +45,7 @@ namespace dsp56k
 
 		runTest(&JitUnittests::transferSaturation_build, &JitUnittests::transferSaturation_verify);
 		transferSaturation48();
+		transferSaturationScaleUp();
 
 		{
 			constexpr auto T=true;
@@ -68,6 +70,14 @@ namespace dsp56k
 
 		parallelMoveXY();
 		boundedDispatch();
+
+		parallelAluMoveSameAccumulator();
+
+		blockDestroyedWhileRunning();
+		branchOutOfPMemory();
+		receivePollAfterClockRestart();
+		receivePollBtstBranchAfterClockRestart();
+		doLoopExitOnPendingInterrupt();
 	}
 
 	void JitUnittests::runtimeUnnormalizedFlag()
@@ -179,6 +189,12 @@ namespace dsp56k
 			o.updateDirtyCCR();
 
 			pusher.end();
+
+			// out-of-line code for rare paths, which a real block emits after its exit: jump over it here
+			const auto afterColdCode = m_asm.newLabel();
+			m_asm.jmp(afterColdCode);
+			b.emitColdCode();
+			m_asm.bind(afterColdCode);
 		}
 
 		m_asm.ret();
@@ -678,6 +694,37 @@ namespace dsp56k
 		verify(m_checks[2] == 0x334455);
 	}
 
+	// Scale Up on the path that reads S1 at run time, as without a known mode (sim56300, SR $000b00)
+	void JitUnittests::transferSaturationScaleUp()
+	{
+		const auto sr = dsp.regs().sr.var;
+		dsp.setSR(0x000b00);
+
+		runTest([&]()
+		{
+			const RegGP temp(*block);
+
+			block->asm_().mov(temp, asmjit::Imm(aluTestValue(0x00807ffeff000000)));
+			ops->transferSaturation24(temp, temp);
+			block->mem().mov(m_checks[0], temp);
+
+			block->asm_().mov(temp, asmjit::Imm(aluTestValue(0x00407ffeff000000)));
+			ops->transferSaturation24(temp, temp);
+			block->mem().mov(m_checks[1], temp);
+
+			block->asm_().mov(temp, asmjit::Imm(aluTestValue(0x00807ffeff000000)));
+			ops->transferSaturation16(temp, temp);
+			block->mem().mov(m_checks[2], temp);
+		}, [&]()
+		{
+			verify(m_checks[0] == 0x800000);
+			verify(m_checks[1] == 0x7fffff);
+			verify(m_checks[2] == 0xff8000);
+		});
+
+		dsp.setSR(sr);
+	}
+
 	void JitUnittests::transferSaturation48()
 	{
 		runTest([&]()
@@ -863,6 +910,10 @@ namespace dsp56k
 
 	void JitUnittests::decode_dddddd_read()
 	{
+		// Full-accumulator MOVE results below are the normal 24-bit transfer
+		// contract.  Make the mode explicit now that SA is selected at runtime.
+		dsp.setSR(dsp.getSR().var & ~SR_SA);
+
 		runTest([&]()
 		{
 			m_checks.fill(0);
@@ -1290,6 +1341,294 @@ namespace dsp56k
 			dsp.set_m(0, 0xffffff);
 			dsp.set_m(4, 0xffffff);
 		});
+	}
+
+	/*	lsr a  #$0,a0 ($280023): the ALU half shifts A1, the move half clears A0, and both land - sim56300
+		turns a1=$000002 a0=$000001 into a1=$000001 a0=$000000. The move used to take the write latch the
+		ALU had already written and seed it again from the unshifted accumulator, losing the shift.
+		JIT only: the interpreter's exec_parallel lets a changed ALU result replace the whole accumulator
+		and leaves a0=$000001 here.
+	*/
+	void JitUnittests::parallelAluMoveSameAccumulator()
+	{
+		runTest([&]()
+		{
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x00000002000001)));
+			emit(0x280023);
+		}, [&]()
+		{
+			verify(dsp.aluA().var == 0x00000001000000);
+		});
+	}
+
+	/*	Generated code calls peripherals and external bus devices, and those can write P memory. The block that is running
+		may be one of the blocks that such a write destroys, and it has to keep its code until it has returned. Here an
+		external bus device overwrites the first instruction of the block that writes to it. The block runs to its end
+		with the code it was built from, and the next run at that address runs the new instruction.
+	*/
+	void JitUnittests::blockDestroyedWhileRunning()
+	{
+		constexpr TWord g_pc = 0x3000;
+		constexpr TWord g_device = 0x100000;
+		constexpr TWord g_incA = 0x000008;
+
+		struct Device final : IExternalBusDevice
+		{
+			explicit Device(DSP& _dsp) : dsp(_dsp) {}
+
+			TWord read(TWord) override { return 0; }
+
+			void write(TWord, TWord) override
+			{
+				const auto* allocator = dsp.getJit().getRuntime()->allocator();
+
+				usedBefore = allocator->statistics().usedSize();
+				dsp.memWriteP(g_pc, g_incA);
+				usedAfter = allocator->statistics().usedSize();
+			}
+
+			DSP& dsp;
+			size_t usedBefore = 0;
+			size_t usedAfter = 0;
+		};
+
+		Device device(dsp);
+
+		const auto oldConfig = dsp.getJit().getConfig();
+		auto config = oldConfig;
+		config.externalBusBegin = g_device;
+		config.externalBusEnd = g_device + 1;
+		dsp.getJit().setConfig(config);
+		dsp.setExternalBusDevice(&device);
+
+		dsp.resetHW();
+		dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0)));
+		dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0)));
+
+		TWord pc = g_pc;
+		pc = emitToMemory("inc b", pc);
+		pc = emitToMemory("move b,x:>$100000", pc);
+		pc = emitToMemory("inc b", pc);
+		verify(pc == g_pc + 4);
+		emitToMemory(0x0af080, g_pc, pc);						// jmp >g_pc
+
+		dsp.setPC(g_pc);
+		execStep();
+
+		verify(device.usedAfter == device.usedBefore);			// the block that is running kept its code
+		verify(dsp.getJit().getRuntime()->allocator()->statistics().usedSize() < device.usedBefore);
+		verify(dsp.aluA().var == 0);
+		verify(dsp.aluB().var == 2);
+		verify(dsp.getPC().toWord() == g_pc);
+
+		execStep();
+
+		verify(dsp.aluA().var == 1);
+		verify(dsp.aluB().var == 3);
+
+		dsp.setExternalBusDevice(nullptr);
+		dsp.getJit().setConfig(oldConfig);
+	}
+
+	/*	A first bootstrap stage ends by jumping back into the bootstrap ROM, which the emulator does not have: the device
+		sees the PC there and hands the DSP the next stage itself. It keeps blocks unlinked until then, and a block that
+		ends in that jump has to compile and return to the caller with the PC out of P memory.
+	*/
+	void JitUnittests::branchOutOfPMemory()
+	{
+		constexpr TWord g_pc = 0x3100;
+		constexpr TWord g_bootRom = 0xff0000;
+
+		const auto oldConfig = dsp.getJit().getConfig();
+		auto config = oldConfig;
+		config.linkJitBlocks = false;
+		dsp.getJit().setConfig(config);
+
+		dsp.resetHW();
+		emitToMemory(0x0af080, g_bootRom, g_pc);		// jmp >$ff0000
+
+		dsp.setPC(g_pc);
+		execStep();
+
+		verify(dsp.getPC().toWord() == g_bootRom);
+
+		dsp.getJit().setConfig(oldConfig);
+	}
+
+	/*	A poll for the first received word right after the serial clock restarted. The clock converts the cycles to
+		its next slot to instructions with the ratio it measured last, here on code that ran a cycle per instruction.
+		The poll runs several cycles per instruction and reached that deadline slots after its slot. A poll that
+		loops to itself fast forwards to the slot instead
+	*/
+	void JitUnittests::receivePollAfterClockRestart()
+	{
+		constexpr TWord g_pc = 0x3200;
+		constexpr uint32_t g_cyclesPerSample = 72;
+
+		auto& esai = peripheralsX.getEsai();
+		auto& clock = peripheralsX.getEsaiClock();
+
+		const auto oldSource = clock.getClockSource();
+		const auto oldCycles = clock.getCyclesPerSample();
+
+		dsp.resetHW();
+
+		clock.setCyclesPerSample(g_cyclesPerSample);
+		clock.setClockSource(EsxiClock::ClockSource::Cycles);
+
+		for(uint32_t i=0; i<4; ++i)
+		{
+			clock.restartClock();
+			dsp.fastForward(16, 16);
+			clock.exec();
+		}
+
+		emitToMemory("brclr #8,x:<<$ffffb3,>$0", g_pc);	// RDF, loops to itself
+		dsp.memWriteP(g_pc + 1, 0);
+		emitToMemory("nop", g_pc + 2);
+
+		esai.writeReceiveClockControlRegister(1 << Esai::M_RDC0);		// two slots per frame
+		esai.writeEmptyAudioIn(2);
+		esai.writeReceiveControlRegister((1 << Esai::M_RMOD0) | (1 << Esai::M_RE0));	// restarts the clock
+
+		const auto start = dsp.getCycles();
+
+		dsp.setPC(g_pc);
+		execUntil(g_pc + 2);
+
+		verify(dsp.getCycles() - start < g_cyclesPerSample * 3 / 2);
+
+		esai.writeReceiveControlRegister(0);
+		clock.setCyclesPerSample(oldCycles);
+		clock.setClockSource(oldSource);
+	}
+
+	/*	The same poll in two instructions, a btst of the status register and a branch on carry back to it, as the Nord
+		Lead 2X waits for its transmit frame sync. Spinning, it ran past the slot like the one-instruction form did
+	*/
+	void JitUnittests::receivePollBtstBranchAfterClockRestart()
+	{
+		constexpr uint32_t g_cyclesPerSample = 72;
+
+		auto& esai = peripheralsX.getEsai();
+		auto& clock = peripheralsX.getEsaiClock();
+
+		const auto oldSource = clock.getClockSource();
+		const auto oldCycles = clock.getCyclesPerSample();
+
+		for(uint32_t variant=0; variant<2; ++variant)
+		{
+			const TWord pc = 0x3240 + variant * 0x10;
+
+			dsp.resetHW();
+
+			clock.setCyclesPerSample(g_cyclesPerSample);
+			clock.setClockSource(EsxiClock::ClockSource::Cycles);
+
+			for(uint32_t i=0; i<4; ++i)
+			{
+				clock.restartClock();
+				dsp.fastForward(16, 16);
+				clock.exec();
+			}
+
+			TWord end;
+
+			if(variant == 0)
+			{
+				dsp.memWriteP(pc, 0x017328);			// btst #8,x:<<$ffffb3		RDF
+				dsp.memWriteP(pc + 1, 0x0af0a0);		// jcc >pc
+				dsp.memWriteP(pc + 2, pc);
+				end = pc + 3;
+			}
+			else
+			{
+				dsp.memWriteP(pc, 0x0b7028);			// btst #8,x:>$ffffb3
+				dsp.memWriteP(pc + 1, 0xffffb3);
+				dsp.memWriteP(pc + 2, 0x0d1040);		// bcc >pc, relative to the bcc
+				dsp.memWriteP(pc + 3, 0xfffffe);
+				end = pc + 4;
+			}
+			emitToMemory("nop", end);
+
+			esai.writeReceiveClockControlRegister(1 << Esai::M_RDC0);		// two slots per frame
+			esai.writeEmptyAudioIn(2);
+			esai.writeReceiveControlRegister((1 << Esai::M_RMOD0) | (1 << Esai::M_RE0));	// restarts the clock
+
+			const auto start = dsp.getCycles();
+
+			dsp.setPC(pc);
+			execUntil(end);
+
+			verify(dsp.getCycles() - start < g_cyclesPerSample * 3 / 2);
+
+			esai.writeReceiveControlRegister(0);
+		}
+
+		clock.setCyclesPerSample(oldCycles);
+		clock.setClockSource(oldSource);
+	}
+
+	/*	A DO loop whose body is one block runs all of its iterations inside that block. An interrupt that reached the
+		queue right before the block started waited for the end of the loop, the chip takes it in the first iteration.
+		With doLoopExitOnPendingInterrupt the block is left at the end of an iteration while an interrupt is queued.
+		The interrupt here reaches the queue the way an external one does, when the peripherals run before the block
+	*/
+	void JitUnittests::doLoopExitOnPendingInterrupt()
+	{
+		constexpr TWord g_iterations = 16;
+
+		const auto oldConfig = dsp.getJit().getConfig();
+
+		// the PC and LC that the interrupt is taken with
+		auto taken = std::make_shared<std::pair<TWord, TWord>>();
+		const auto vba = dsp.registerInterruptFunc([this, taken]
+		{
+			*taken = {dsp.getPC().toWord(), dsp.regs().lc.var};
+		});
+
+		// each run has its own code, so its blocks are compiled with its config
+		auto run = [&](const TWord _pc, const bool _exitOnInterrupt)
+		{
+			auto config = oldConfig;
+			config.doLoopExitOnPendingInterrupt = _exitOnInterrupt;
+			dsp.getJit().setConfig(config);
+
+			dsp.resetHW();
+			dsp.regs().r[0] = TReg24(0);
+			dsp.regs().m[0] = TReg24(0xffffff);
+
+			const TWord loopBegin = _pc + 2;
+			const TWord loopEnd = _pc + 4;					// the first address after the loop
+
+			emitToMemory(0x061080, loopEnd - 1, _pc);		// do #16,>loopEnd: LA is the last instruction
+			emitToMemory("nop", _pc + 2);
+			emitToMemory("move (r0)+", _pc + 3);
+			emitToMemory(0x0af080, loopEnd, loopEnd);		// jmp >loopEnd, parks the DSP after the loop
+
+			dsp.setPC(_pc);
+			execStep();
+			verify(dsp.getPC().toWord() == loopBegin);
+
+			dsp.injectExternalInterrupt(vba);
+			peripheralsX.resetDelayCycles(dsp.getInstructionCounter(), 0);
+
+			*taken = {0, 0};
+			for(uint32_t i = 0; i < 64 && (dsp.getPC().toWord() != loopEnd || dsp.hasPendingInterrupts()); ++i)
+				execStep();
+
+			verify(dsp.regs().r[0].var == g_iterations);
+		};
+
+		// taken after the first iteration
+		run(0x3300, true);
+		verify(taken->first == 0x3302 && taken->second == g_iterations - 1);
+
+		// without, the loop ends first
+		run(0x3340, false);
+		verify(taken->first == 0x3344);
+
+		dsp.getJit().setConfig(oldConfig);
 	}
 
 	void JitUnittests::emit(const TWord _opA, TWord _opB, TWord _pc)

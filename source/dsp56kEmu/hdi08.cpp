@@ -59,12 +59,11 @@ namespace dsp56k
 			dsp56k::bitset<TWord, HSR_HCP>(m_hsr, m_hostCommandPending.load(std::memory_order_acquire) ? 1 : 0);
 
 		// Apply pending host flags, if applicable
-		const auto hf01 = m_pendingHostFlags01.load(std::memory_order_acquire);
+		// taken in one go: a second change stored between a load and a store of -1 would be lost for good
+		const auto hf01 = m_pendingHostFlags01.exchange(-1, std::memory_order_acq_rel);
 
 		if(hf01 < 0)
 			return m_hsr;
-
-		m_pendingHostFlags01.store(-1, std::memory_order_release);
 
 		m_hsr &= ~0x18;
 		m_hsr |= static_cast<uint32_t>(hf01);
@@ -368,10 +367,14 @@ namespace dsp56k
 		return m_dataRX.full();
 	}
 
-	void HDI08::terminate()
+	void HDI08::injectHostCommand(const TWord _vector)
 	{
-		while(!m_dataRX.full())
-			m_dataRX.push_back(0);
+		m_periph.getDSP().injectExternalInterrupt(_vector);
+	}
+
+	bool HDI08::hostCommandsFull() const
+	{
+		return m_periph.getDSP().pendingExternalInterruptsFull();
 	}
 
 	TWord HDI08::readHDR() const
@@ -384,6 +387,9 @@ namespace dsp56k
 	{
 //		LOG("Write HDR: " << HEX(_val));
 		m_hdr = _val;
+
+		if(m_callbackWriteHDR)
+			m_callbackWriteHDR(_val);
 	}
 
 	TWord HDI08::readHDDR() const
@@ -458,6 +464,11 @@ namespace dsp56k
 	{
 		if(!m_transmitDataAlwaysEmpty && !m_dataTX.empty() && (!m_transmitDataBuffered || m_dataTX.full()))
 		{
+			// A DSP that writes faster than the host reads overwrites its own word, exactly as the hardware
+			// does. Only a different word is worth a line: a program that answers the same value in a loop
+			// logged several hundred thousand times per second and starved the emulation of everything else.
+			if(m_dataTX.front() != _val)
+				LOG("Write HDI08 HOTX: Discarding " << HEX(m_dataTX.front()) << ", HOTX is full, replacing with " << HEX(_val));
 			m_dataTX.front() = _val;
 			// A replacement is a new production event too. Host bridges must
 			// observe it so the retained word cannot inherit an older timestamp.
@@ -530,11 +541,11 @@ namespace dsp56k
 		}
 	}
 
-	void HDI08::writeStatusRegister(const TWord _val)
+	void HDI08::writeStatusRegister(TWord)
 	{
-//		LOG("Write HDI08 HSR " << HEX(_val));
-		m_hsr = _val;
-		m_periph.setDelayCycles(0);
+		// HSR is read-only for the DSP: HRDF, HTDE and HCP are status, HF0 and HF1 belong to the host. A BSET or BCLR on
+		// it wrote back what it had read, and could set a host flag again that the host had just cleared, or corrupt
+		// HTDE (helica1, dsp56300 PR #15). Nothing changes, so the peripherals need not run early either
 	}
 
 	void HDI08::writePortControlRegister(const TWord _val)

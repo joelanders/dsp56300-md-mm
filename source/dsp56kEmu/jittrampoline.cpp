@@ -39,12 +39,40 @@ namespace dsp56k
 	{
 	}
 
+	void JitTrampoline::releaseCode(const TJitFunc _func)
+	{
+		if(m_running)
+			m_retiredCode.push_back(_func);
+		else
+			m_dsp.getJit().getRuntime()->release(_func);
+	}
+
+	void JitTrampoline::releaseRetiredCode() noexcept
+	{
+		auto* rt = m_dsp.getJit().getRuntime();
+
+		for (const auto func : m_retiredCode)
+			rt->release(func);
+
+		m_retiredCode.clear();
+	}
+
+	void JitTrampoline::initCodeHolder(asmjit::CodeHolder& _codeHolder)
+	{
+		_codeHolder.init(m_runtime.environment());
+
+		// The logger sends every emitted instruction through OutputDebugString, which waits for an attached debugger
+		// or debug output reader. We are generated in the Jit constructor, so only the JitConfig default reaches this.
+		if (m_dsp.getJit().getConfig().asmjitDiagnostics)
+			_codeHolder.setLogger(&m_logger);
+
+		_codeHolder.setErrorHandler(&m_errorHandler);
+	}
+
 	void JitTrampoline::generateExecLoopFunc()
 	{
 		asmjit::CodeHolder codeHolder;
-		codeHolder.init(m_runtime.environment());
-		codeHolder.setLogger(&m_logger);
-		codeHolder.setErrorHandler(&m_errorHandler);
+		initCodeHolder(codeHolder);
 
 		JitEmitter m_asm(&codeHolder);
 
@@ -74,7 +102,7 @@ namespace dsp56k
 		m_asm.push(asmjit::a64::regs::x30);
 #endif
 
-#ifdef HAVE_X86_64
+#ifndef HAVE_ARM64
 #ifdef _WIN32
 		static constexpr uint32_t g_shadow = 32;
 #else
@@ -130,7 +158,7 @@ namespace dsp56k
 		m_asm.lea(regDspPtr, ptrDspRegs);
 #endif
 
-#ifdef HAVE_X86_64
+#ifndef HAVE_ARM64
 		m_asm.mov(asmjit::x86::rax, asmjit::Imm(periphFunc));
 		m_asm.mov(asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotPeriphFunc, 8), asmjit::x86::rax);
 		m_asm.mov(asmjit::x86::rax, asmjit::Imm(targetClock));
@@ -212,7 +240,7 @@ namespace dsp56k
 #endif
 		m_asm.jnz(label);
 
-#ifdef HAVE_X86_64
+#ifndef HAVE_ARM64
 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_additionalStackSize));
 #endif
 
@@ -397,9 +425,7 @@ namespace dsp56k
 	void JitTrampoline::generateExecOneFunc()
 	{
 		asmjit::CodeHolder codeHolder;
-		codeHolder.init(m_runtime.environment());
-		codeHolder.setLogger(&m_logger);
-		codeHolder.setErrorHandler(&m_errorHandler);
+		initCodeHolder(codeHolder);
 
 		JitEmitter m_asm(&codeHolder);
 
@@ -415,7 +441,7 @@ namespace dsp56k
 
 		m_asm.mov(regDspPtr, g_funcArgGPs[0]);
 
-#ifdef HAVE_X86_64
+#ifndef HAVE_ARM64
 #ifdef _WIN32
 		static constexpr int g_oneShadow = 32;
 #else

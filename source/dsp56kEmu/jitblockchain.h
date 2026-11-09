@@ -71,6 +71,12 @@ namespace dsp56k
 
 		void notifyPMemWrite(TWord _addr, bool _isCurrentChain);
 
+		// drop the single instruction blocks kept for reuse at this address
+		void releaseSingleOpCache(TWord _pc);
+
+		// recompile what holds LA of a loop that has just become known, see Jit::addLoop
+		void forgetLoopEnd(TWord _loopEnd);
+
 		size_t getFuncSize() const
 		{
 			return m_jitFuncs.size();
@@ -91,6 +97,8 @@ namespace dsp56k
 		void destroyParents(JitBlockRuntimeData* _block);
 		void destroy(JitBlockRuntimeData* _block);
 
+		bool makeRoomForFirstInstruction(TWord _pc);
+
 		void release(JitBlockRuntimeData* _block);
 		void occupyArea(JitBlockRuntimeData* _block);
 		void unoccupyArea(const JitBlockRuntimeData* _block);
@@ -98,9 +106,9 @@ namespace dsp56k
 		bool isBeingGeneratedRecursive(const JitBlockRuntimeData* _block) const;
 		bool isBeingGenerated(const JitBlockRuntimeData* _block) const;
 
-		bool ensureCacheSize(size_t _address);
+		bool ensureCacheSize(size_t _first, size_t _last);
 		bool ensureFuncSize(size_t _address);
-		bool ensureSize(size_t _address);
+		bool ensureSize(size_t _first, size_t _last);
 
 		void onFuncsResized() const;
 
@@ -109,6 +117,9 @@ namespace dsp56k
 
 		PagedArray<JitCacheEntry> m_jitCache;
 		MmuArray<TJitFunc> m_jitFuncs;
+
+		std::map<TWord, JitBlockRuntimeData*> m_generatingBlocks;
+		std::vector<TWord> m_loopEndsToForget;
 
 		std::unique_ptr<AsmJitLogger> m_logger;
 		std::unique_ptr<AsmJitErrorHandler> m_errorHandler;

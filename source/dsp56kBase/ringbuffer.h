@@ -69,6 +69,28 @@ namespace dsp56k
 			m_readSem.notify();
 		}
 
+		bool try_push_back(const T& _val)
+		{
+			if(!m_writeSem.tryWait())
+				return false;
+
+			m_data[wrapCounter(loadWriteRlx())] = _val;
+			incWriteCount(1);
+			m_readSem.notify();
+			return true;
+		}
+
+		bool try_push_back(T&& _val)
+		{
+			if(!m_writeSem.tryWait())
+				return false;
+
+			m_data[wrapCounter(loadWriteRlx())] = std::move(_val);
+			incWriteCount(1);
+			m_readSem.notify();
+			return true;
+		}
+
 		template<typename TFunc>
 		void emplace_back(const TFunc& _fillEntry)
 		{
@@ -141,6 +163,17 @@ namespace dsp56k
 			return res;
 		}
 
+		bool try_pop_front(T& _result)
+		{
+			if(!m_readSem.tryWait())
+				return false;
+
+			_result = std::move(front());
+			incReadCount(1);
+			m_writeSem.notify();
+			return true;
+		}
+
 		T& operator[](const size_t _i)
 		{
 			return get(_i);
@@ -159,6 +192,22 @@ namespace dsp56k
 		T& front()
 		{
 			return m_data[wrapCounter(loadReadRlx())];
+		}
+
+		// Whether an entry passes _pred, looked at between one snapshot of both ends. Safe on a thread that does not
+		// pop: what the consumer pops meanwhile may still be seen, but nothing that is still there is skipped, as with
+		// an index from front() that the consumer moves on under the loop
+		template<typename TPred> bool anyOf(const TPred& _pred) const
+		{
+			const auto r = loadReadAcq();
+			const auto w = loadWriteAcq();
+
+			for(auto i = r; i != w && i - r < C; ++i)
+			{
+				if(_pred(m_data[wrapCounter(i)]))
+					return true;
+			}
+			return false;
 		}
 
 		void clear()
