@@ -35,9 +35,9 @@ namespace dsp56k
 				// use dst as temp
 				replaceHigh(_dst, r64(regBase), r32(reg1));
 			}
-			m_pool.clearWritten(m_reg0);
-			m_pool.clearWritten(m_reg1);
-
+			// Keep the partial registers marked as written: only they are stored back to the DSP state, the combined
+			// register is a read cache. Clearing the flags here (and storing immediately instead) loses the writes when
+			// this merge is emitted inside conditionally executed code such as IFcc and the condition is false.
 			asm_().mov(r64(_dst), r64(regBase));
 		}
 		// If the common reg is already loaded, use it
