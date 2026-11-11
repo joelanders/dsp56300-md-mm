@@ -115,7 +115,11 @@ namespace dsp56k
 
 		void setDelayCycles(uint32_t _delayCycles) noexcept;
 		void setCycleDeadline(uint32_t _delayCycles) noexcept;
-		void clearCycleDeadline() noexcept { m_hasCycleDeadline = false; }
+		void clearCycleDeadline() noexcept
+		{
+			m_hasCycleDeadline = false;
+			m_targetCycle = NoCycleDeadline;
+		}
 
 		void resetDelayCycles(const uint64_t _instructionCount, const uint32_t _delayCycles) noexcept
 		{
@@ -132,13 +136,18 @@ namespace dsp56k
 		// the counter. A relaxed load of an aligned 64 bit atomic is a plain load, which is what it emits.
 		const uint64_t* getTargetClockPtr() const { return reinterpret_cast<const uint64_t*>(&m_targetClock); }
 
+		// Same for the cycle-domain deadline. It holds NoCycleDeadline whenever m_hasCycleDeadline is false, so
+		// "cycles >= *getTargetCyclePtr()" alone is the second half of isDue().
+		const uint64_t* getTargetCyclePtr() const { return &m_targetCycle; }
+
 		auto getType() const { return m_type; }
 
 	private:
 		DSP* m_dsp = nullptr;
 		// advisory pacing hint, read cross-thread by DSP exec
 		std::atomic<uint64_t> m_targetClock{0};
-		uint64_t m_targetCycle = 0;
+		static constexpr uint64_t NoCycleDeadline = ~uint64_t(0);
+		uint64_t m_targetCycle = NoCycleDeadline;
 		bool m_hasCycleDeadline = false;
 		PeripheralType m_type;
 	};

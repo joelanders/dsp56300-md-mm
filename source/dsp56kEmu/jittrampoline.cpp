@@ -291,6 +291,9 @@ namespace dsp56k
 		m_asm.push(r64(g_ptrInterruptFunc));
 		m_asm.push(r64(g_ptrPC));
 		m_asm.push(r64(g_ptrCycles));
+		m_asm.push(r64(g_periphFunc));
+		m_asm.push(r64(g_ptrTargetClock));
+		m_asm.push(r64(g_ptrInstructions));
 		m_asm.push(asmjit::a64::regs::x30);
 #else
 		m_asm.push(r64(regDspPtr));
@@ -307,7 +310,9 @@ namespace dsp56k
 		static constexpr uint32_t g_slotDsp = g_shadow;
 		static constexpr uint32_t g_slotTarget = g_shadow + 8;
 		static constexpr int g_pushCount = static_cast<int>(std::size(g_trampolineSavedGPs)) + 1;
-		static constexpr int g_slotBytes = static_cast<int>(g_shadow) + 16;
+		static constexpr uint32_t g_slotPeriphFunc = g_shadow + 16;
+		static constexpr uint32_t g_slotClockPtr = g_shadow + 24;
+		static constexpr int g_slotBytes = static_cast<int>(g_shadow) + 32;
 		static constexpr uint32_t g_stackSize = static_cast<uint32_t>(g_slotBytes + (((8 - 8*g_pushCount - g_slotBytes) % 16 + 16) % 16));
 		static_assert(((8 - 8*g_pushCount - static_cast<int>(g_stackSize)) % 16) == 0, "rsp must be 16 byte aligned at the call");
 		m_asm.sub(asmjit::x86::regs::rsp, asmjit::Imm(g_stackSize));
@@ -328,8 +333,24 @@ namespace dsp56k
 		m_asm.lea_(g_ptrInterruptFunc, argDspPtr, &m_dsp.getInterruptFunc(), &m_dsp);
 		m_asm.lea_(g_ptrPC           , argDspPtr, &m_dsp.regs().pc.var, &m_dsp);
 
+		// Constants for the inlined "is a peripheral due" test, see generateExecLoopFunc(). This loop also
+		// has to honor the cycle-domain deadline, which sits next to the instruction-domain one.
+		const auto* const periphFunc = reinterpret_cast<const void*>(m_dsp.getExecPeripheralsFunc());
+		const auto* const targetClock = m_dsp.getPeriph(0)->getTargetClockPtr();
+		const auto targetCycleOffset = static_cast<int32_t>(
+			reinterpret_cast<const uint8_t*>(m_dsp.getPeriph(0)->getTargetCyclePtr())
+			- reinterpret_cast<const uint8_t*>(targetClock));
+
 #ifdef HAVE_ARM64
 		m_asm.mov(g_ptrCycles, asmjit::Imm(&m_dsp.getCycles()));
+		m_asm.mov(g_periphFunc, asmjit::Imm(periphFunc));
+		m_asm.mov(g_ptrTargetClock, asmjit::Imm(targetClock));
+		m_asm.mov(g_ptrInstructions, asmjit::Imm(&m_dsp.getInstructionCounter()));
+#else
+		m_asm.mov(asmjit::x86::rax, asmjit::Imm(periphFunc));
+		m_asm.mov(asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotPeriphFunc, 8), asmjit::x86::rax);
+		m_asm.mov(asmjit::x86::rax, asmjit::Imm(targetClock));
+		m_asm.mov(asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotClockPtr, 8), asmjit::x86::rax);
 #endif
 
 		const auto ptrDspRegs = Jitmem::makeRelativePtr(&m_dsp.regs(), &m_dsp, argDspPtr, 8);
@@ -348,9 +369,26 @@ namespace dsp56k
 		m_asm.bind(label);
 
 #ifdef HAVE_ARM64
+		// Exactly DSP::execPeriph(): call only if another interrupt func is installed or a peripheral
+		// is due by instruction count or by cycle deadline.
+		const auto lCallInt = m_asm.newLabel();
+		const auto lSkipInt = m_asm.newLabel();
+
 		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_ptrInterruptFunc, 8));
+		m_asm.cmp(g_funcToCall, g_periphFunc);
+		m_asm.b(asmjit::arm::CondCode::kNE, lCallInt);
+		m_asm.ldr(r64(g_funcArgGPs[0]), Jitmem::makePtr(g_ptrTargetClock, 8));
+		m_asm.ldr(r64(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrInstructions, 8));
+		m_asm.cmp(r64(g_funcArgGPs[0]), r64(g_funcArgGPs[1]));
+		m_asm.b(asmjit::arm::CondCode::kLS, lCallInt);
+		m_asm.ldr(r64(g_funcArgGPs[0]), asmjit::a64::ptr(g_ptrTargetClock, targetCycleOffset));
+		m_asm.ldr(r64(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrCycles, 8));
+		m_asm.cmp(r64(g_funcArgGPs[0]), r64(g_funcArgGPs[1]));
+		m_asm.b(asmjit::arm::CondCode::kHI, lSkipInt);
+		m_asm.bind(lCallInt);
 		m_asm.mov(g_funcArgGPs[0], g_ptrDSP);
 		m_asm.blr(g_funcToCall);
+		m_asm.bind(lSkipInt);
 
 		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_ptrJitEntries, 8));
 		m_asm.ldr(r32(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrPC, 4));
@@ -367,12 +405,28 @@ namespace dsp56k
 #else
 		const auto dsp = asmjit::x86::rax;
 		const auto scratchA = asmjit::x86::r10;
+		const auto scratchB = asmjit::x86::r11;
+
+		// Exactly DSP::execPeriph(), see the ARM path above
+		const auto lCallInt = m_asm.newLabel();
+		const auto lSkipInt = m_asm.newLabel();
 
 		m_asm.mov(dsp, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotDsp, 8));
 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getInterruptFunc(), &m_dsp, dsp, 8));
+		m_asm.cmp(g_funcToCall, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotPeriphFunc, 8));
+		m_asm.jne(lCallInt);
+		m_asm.mov(scratchA, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotClockPtr, 8));
+		m_asm.mov(scratchB, asmjit::x86::ptr(scratchA, 0, 8));
+		m_asm.cmp(scratchB, Jitmem::makeRelativePtr(&m_dsp.getInstructionCounter(), &m_dsp, dsp, 8));
+		m_asm.jbe(lCallInt);
+		m_asm.mov(scratchB, asmjit::x86::ptr(scratchA, targetCycleOffset, 8));
+		m_asm.cmp(scratchB, Jitmem::makeRelativePtr(&m_dsp.getCycles(), &m_dsp, dsp, 8));
+		m_asm.ja(lSkipInt);
+		m_asm.bind(lCallInt);
 		m_asm.mov(g_funcArgGPs[0], dsp);
 		m_asm.call(g_funcToCall);
 		m_asm.mov(dsp, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotDsp, 8));
+		m_asm.bind(lSkipInt);
 
 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
@@ -401,6 +455,9 @@ namespace dsp56k
 #endif
 
 #ifdef HAVE_ARM64
+		m_asm.pop(r64(g_ptrInstructions));
+		m_asm.pop(r64(g_ptrTargetClock));
+		m_asm.pop(r64(g_periphFunc));
 		m_asm.pop(r64(g_ptrCycles));
 		m_asm.pop(r64(g_ptrPC));
 		m_asm.pop(r64(g_ptrInterruptFunc));
