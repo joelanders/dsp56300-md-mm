@@ -153,6 +153,13 @@ namespace dsp56k
 
 	TWord Peripherals56303::read(TWord _addr, Instruction _inst)
 	{
+		if(m_dmaRegisterHook && _addr >= XIO_DCR5 && _addr <= XIO_DSR0)
+		{
+			TWord value = 0;
+			if(m_dmaRegisterHook(_addr, value, false))
+				return value;
+		}
+
 		switch (_addr)
 		{
 		case HDI08::HSR:			return m_hi08.readStatusRegister();
@@ -268,6 +275,9 @@ namespace dsp56k
 
 	void Peripherals56303::write(TWord _addr, TWord _val)
 	{
+		if(m_dmaRegisterHook && _addr >= XIO_DCR5 && _addr <= XIO_DSR0 && m_dmaRegisterHook(_addr, _val, true))
+			return;
+
 		switch (_addr)
 		{
 		case HDI08::HSR:			m_hi08.writeStatusRegister(_val);		return;

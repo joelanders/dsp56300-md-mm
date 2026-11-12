@@ -12,6 +12,7 @@
 #include "timers.h"
 #include "types.h"
 #include <array>
+#include <functional>
 #include <atomic>
 
 namespace dsp56k
@@ -179,6 +180,15 @@ namespace dsp56k
 		//
 	public:
 		Peripherals56303();
+
+		/*	Lets the owner of the DSP answer accesses to the DMA registers (DCR5 to DSR0) itself. The hook gets the
+			register address and, for a write, the value; for a read it fills the value in. Returning true means the
+			access was handled and the DMA controller is not involved; returning false leaves it to the controller.
+			Used where a product replaces a DMA-driven transfer with a direct one and has to keep answering the
+			firmware's reads of the transfer's progress.
+		*/
+		using DmaRegisterHook = std::function<bool(TWord _addr, TWord& _value, bool _write)>;
+		void setDmaRegisterHook(DmaRegisterHook&& _hook) { m_dmaRegisterHook = std::move(_hook); }
 		
 		TWord read(TWord _addr, Instruction _inst) override;
 		const TWord* readAsPtr(TWord _addr, Instruction _inst) override;
@@ -213,6 +223,7 @@ namespace dsp56k
 
 	private:
 		Dma m_dma;
+		DmaRegisterHook m_dmaRegisterHook;
 		EssiClock m_essiClock;
 		Essi m_essi0;
 		Essi m_essi1;
