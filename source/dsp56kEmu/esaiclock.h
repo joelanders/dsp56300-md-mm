@@ -51,6 +51,17 @@ namespace dsp56k
 		// A nonzero fine period schedules an ESSI independently of the audio base tick. Zero keeps the base-plus-divider clock
 		void setEsaiFinePeriod(Esxi* _esai, uint32_t _finePeriod);
 		void setExactCycleDeadlineEnabled(bool _enabled) { m_exactCycleDeadlineEnabled = _enabled; }
+
+		/*	The base tick as an exact cycle deadline even when no port runs on the fine schedule. The instruction
+			count that a cycle delay converts to is an estimate; with a fine port its deadlines come often enough to
+			hide that, without one the base tick is served a slot or more late whenever the cycles per instruction
+			change, and two slots then run back to back.
+		*/
+		void setExactBaseTickDeadline(bool _enabled) { m_exactBaseTickDeadline = _enabled; }
+
+		// Where a port on the fine schedule stands: the clock value of its last slot and its slot period.
+		// False if the port is not on the fine schedule.
+		bool getEsaiFineSchedule(const Esxi* _esai, uint64_t& _lastClock, uint32_t& _period) const;
 		bool usesExactCycleDeadline() const;
 		uint32_t getNextCycleDeadline() const { return m_nextCycleDeadline; }
 		bool shiftEsaiFineAnchor(const Esxi* _esai, int64_t _cycles);	// one-time fine-phase step
@@ -151,6 +162,7 @@ namespace dsp56k
 		// Cached "any entry has a nonzero finePeriod", keeps exec() free of the fine-schedule loop when it is unused
 		bool m_hasFineEsais = false;
 		bool m_exactCycleDeadlineEnabled = false;
+		bool m_exactBaseTickDeadline = false;
 
 		TickCallback m_tickCallback;
 	};

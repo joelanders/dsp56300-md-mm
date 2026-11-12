@@ -160,7 +160,22 @@ namespace dsp56k
 	bool EsxiClock::usesExactCycleDeadline() const
 	{
 		// Exact cycle-domain deadlines are opt-in; other integrations retain their instruction-domain polling contract
-		return m_exactCycleDeadlineEnabled && m_hasFineEsais && m_clockSource == ClockSource::Cycles;
+		return (m_exactBaseTickDeadline || (m_exactCycleDeadlineEnabled && m_hasFineEsais))
+			&& m_clockSource == ClockSource::Cycles;
+	}
+
+	bool EsxiClock::getEsaiFineSchedule(const Esxi* _esai, uint64_t& _lastClock, uint32_t& _period) const
+	{
+		for(const auto& entry : m_esais)
+		{
+			if(entry.esai == _esai && entry.finePeriod)
+			{
+				_lastClock = entry.fineLastClock;
+				_period = entry.finePeriod;
+				return true;
+			}
+		}
+		return false;
 	}
 
 	void EsxiClock::setEsaiFinePeriod(Esxi* _esai, const uint32_t _finePeriod)
