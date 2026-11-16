@@ -67,6 +67,7 @@ namespace dsp56k
 		rep_div();
 
 		parallelMoveXY();
+		partialXYWriteThenFullRead();
 		boundedDispatch();
 	}
 
@@ -1289,6 +1290,32 @@ namespace dsp56k
 		{
 			dsp.set_m(0, 0xffffff);
 			dsp.set_m(4, 0xffffff);
+		});
+	}
+
+	void JitUnittests::partialXYWriteThenFullRead()
+	{
+		// A write to x0 or x1 (y0, y1) followed in the same block by an ALU op that reads all of x (add x,b): the
+		// halves must still reach x when the block ends (they were merged for the read and then lost).
+		dsp.regs().x.var = 0;
+		dsp.regs().y.var = 0;
+		dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x00123456abcdef)));
+		dsp.setALU(true, TReg56(static_cast<TReg56::MyType>(0)));
+
+		runTest([&]()
+		{
+			emit(0x210400);	// move a0,x0
+			emit(0x218500);	// move a1,x1
+			emit(0x200028);	// add x,b
+			emit(0x210600);	// move a0,y0
+			emit(0x200030);	// add y,a
+		}, [&]()
+		{
+			verify(dsp.regs().x.var == 0x123456abcdef);
+			verify(dsp.regs().y.var == 0x000000abcdef);
+			TReg56 b;	// through readReg: the JIT keeps the accumulators left aligned in regs()
+			dsp.readReg(Reg_B, b);
+			verify(b.var == 0x00123456abcdef);
 		});
 	}
 
