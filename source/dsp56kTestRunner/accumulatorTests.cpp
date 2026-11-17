@@ -4,6 +4,7 @@
 #include "dsp56kEmu/dsp.h"
 #include "dsp56kBase/logging.h"
 
+#include <cstdio>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -515,6 +516,13 @@ int main(int _argc, char** _argv)
 			return runManualAccumulatorTests(false);
 		if(_argc != 1)
 			throw std::string("Unknown accumulator-test option");
+		// The differential and expected-value tests below drive the JIT directly. A build without one
+		// (DSP56K_FORCE_INTERPRETER, or a host the JIT does not support) has no JIT entry point to call.
+		if(!g_jitSupported)
+		{
+			std::fprintf(stderr, "No JIT in this build, running the interpreter-only accumulator tests\n");
+			return runManualAccumulatorTests(true);
+		}
 		const int expected = runExpectedTests();
 		const int differential = runDifferentialTests();
 		const int sequences = runSequenceTests();

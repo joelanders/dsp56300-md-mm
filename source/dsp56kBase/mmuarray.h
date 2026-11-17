@@ -166,6 +166,19 @@ namespace dsp56k
 			return ensureBlockFallback(_index);
 		}
 
+		// Ensure private memory for every block that holds an element of [_first, _last]. A write to an element of a block
+		// that is not private goes to the default block, which every block that is not private shares
+		bool ensureBlocksForRange(size_t _first, size_t _last)
+		{
+			if (!m_useMmu)
+				return ensureBlockFallback(_last);
+
+			bool res = false;
+			for (auto i = _first - _first % m_blockSize; i <= _last; i += m_blockSize)
+				res |= ensureBlockMmu(i);
+			return res;
+		}
+
 		// Ensure size covers at least _index+1 entries (non-MMU grow, MMU no-op if in range)
 		bool ensureSize(size_t _index)
 		{
@@ -183,6 +196,28 @@ namespace dsp56k
 				return false;
 			}
 			return ensureBlockFallback(_index);
+		}
+
+		// Calls _func with the index of every element that may differ from the fill: all of them in fallback mode, else
+		// those of the blocks that ensureBlockForIndex() made private. Reading the others maps the default block into
+		// every page of the range, which takes seconds for a large one
+		template<typename TFunc> void forEachPrivate(TFunc _func)
+		{
+			if (!m_useMmu)
+			{
+				for (size_t i = 0; i < m_size; ++i)
+					_func(i);
+				return;
+			}
+
+			for (size_t b = 0; b < m_numBlocks; ++b)
+			{
+				if (!m_blockIsPrivate[b])
+					continue;
+
+				for (size_t i = b * m_blockSize; i < (b + 1) * m_blockSize; ++i)
+					_func(i);
+			}
 		}
 
 		void setResizedCallback(ResizedCallback _cb) { m_resizedCallback = std::move(_cb); }

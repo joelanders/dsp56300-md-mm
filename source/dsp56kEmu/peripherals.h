@@ -3,6 +3,8 @@
 #include "dma.h"
 #include "esai.h"
 #include "esaiclock.h"
+#include "dax.h"
+#include "shi.h"
 #include "essi.h"
 #include "gpio.h"
 #include "hdi08.h"
@@ -10,6 +12,8 @@
 #include "timers.h"
 #include "types.h"
 #include <array>
+#include <functional>
+#include <atomic>
 
 namespace dsp56k
 {
@@ -112,32 +116,39 @@ namespace dsp56k
 
 		void setDelayCycles(uint32_t _delayCycles) noexcept;
 		void setCycleDeadline(uint32_t _delayCycles) noexcept;
-		void clearCycleDeadline() noexcept { m_hasCycleDeadline = false; }
+		void clearCycleDeadline() noexcept
+		{
+			m_hasCycleDeadline = false;
+			m_targetCycle = NoCycleDeadline;
+		}
 
 		void resetDelayCycles(const uint64_t _instructionCount, const uint32_t _delayCycles) noexcept
 		{
-			m_delayCycles = _delayCycles;
-			m_targetClock = _instructionCount + _delayCycles;
+			m_targetClock.store(_instructionCount + _delayCycles, std::memory_order_relaxed);
 		}
 
-		uint32_t getDelayCycles() const { return m_delayCycles; }
-		auto getTargetClock() const { return m_targetClock; }
+		auto getTargetClock() const { return m_targetClock.load(std::memory_order_relaxed); }
 		bool isDue(const uint64_t _instructions, const uint64_t _cycles) const
 		{
-			return _instructions >= m_targetClock || (m_hasCycleDeadline && _cycles >= m_targetCycle);
+			return _instructions >= getTargetClock() || (m_hasCycleDeadline && _cycles >= m_targetCycle);
 		}
 
 		// the trampoline inlines the "is a peripheral due" test into its exec loop and needs the address of
 		// the counter. A relaxed load of an aligned 64 bit atomic is a plain load, which is what it emits.
 		const uint64_t* getTargetClockPtr() const { return reinterpret_cast<const uint64_t*>(&m_targetClock); }
 
+		// Same for the cycle-domain deadline. It holds NoCycleDeadline whenever m_hasCycleDeadline is false, so
+		// "cycles >= *getTargetCyclePtr()" alone is the second half of isDue().
+		const uint64_t* getTargetCyclePtr() const { return &m_targetCycle; }
+
 		auto getType() const { return m_type; }
 
 	private:
 		DSP* m_dsp = nullptr;
-		uint32_t m_delayCycles = 0;
-		uint64_t m_targetClock = 0;
-		uint64_t m_targetCycle = 0;
+		// advisory pacing hint, read cross-thread by DSP exec
+		std::atomic<uint64_t> m_targetClock{0};
+		static constexpr uint64_t NoCycleDeadline = ~uint64_t(0);
+		uint64_t m_targetCycle = NoCycleDeadline;
 		bool m_hasCycleDeadline = false;
 		PeripheralType m_type;
 	};
@@ -169,6 +180,15 @@ namespace dsp56k
 		//
 	public:
 		Peripherals56303();
+
+		/*	Lets the owner of the DSP answer accesses to the DMA registers (DCR5 to DSR0) itself. The hook gets the
+			register address and, for a write, the value; for a read it fills the value in. Returning true means the
+			access was handled and the DMA controller is not involved; returning false leaves it to the controller.
+			Used where a product replaces a DMA-driven transfer with a direct one and has to keep answering the
+			firmware's reads of the transfer's progress.
+		*/
+		using DmaRegisterHook = std::function<bool(TWord _addr, TWord& _value, bool _write)>;
+		void setDmaRegisterHook(DmaRegisterHook&& _hook) { m_dmaRegisterHook = std::move(_hook); }
 		
 		TWord read(TWord _addr, Instruction _inst) override;
 		const TWord* readAsPtr(TWord _addr, Instruction _inst) override;
@@ -203,6 +223,7 @@ namespace dsp56k
 
 	private:
 		Dma m_dma;
+		DmaRegisterHook m_dmaRegisterHook;
 		EssiClock m_essiClock;
 		Essi m_essi0;
 		Essi m_essi1;
@@ -237,9 +258,12 @@ namespace dsp56k
 		EsaiClock& getEsaiClock()		{ return m_esaiClock; }
 		Esai& getEsai()					{ return m_esai; }
 		HDI08& getHDI08()				{ return m_hdi08; }
+		SHI& getSHI()					{ return m_shi; }
+		DAX& getDAX()					{ return m_dax; }
 		Dma& getDMA()					{ return m_dma; }
 		EsaiPortC& getPortC()			{ return m_portC; }
 		const Timers& getTimers() const	{ return m_timers; }
+		Timers& getTimers()				{ return m_timers; }
 
 		void setSymbols(Disassembler& _disasm) const override;
 
@@ -250,16 +274,36 @@ namespace dsp56k
 			m_disableTimers = _disable;
 		}
 
+		// the derivative number the ID register reports, used by firmware to tell the members of the
+		// DSP56300 family apart. $362 unless a board is populated with a different derivative
+		void setDeviceId(const TWord _id)
+		{
+			m_deviceId = _id;
+		}
+
 		void setDSP(DSP* _dsp) override;
 
+		// Called with the peripherals, from inside DSP execution, for board logic that changes pins over time (a
+		// chip on a timer input that turns ready, for example). Returns the instructions until it wants to run again
+		using ExecCallback = std::function<uint32_t()>;
+		void setExecCallback(ExecCallback&& _cb) { m_execCallback = std::move(_cb); }
+
 	private:
+		ExecCallback m_execCallback;
 		Dma m_dma;
 		EsaiClock m_esaiClock;
 		Esai m_esai;
 		HDI08 m_hdi08;
+		SHI m_shi;
+		DAX m_dax;
 		Timers m_timers;
 		EsaiPortC m_portC;
 		bool m_disableTimers;
+		TWord m_deviceId;
+		Peripherals56367* m_peripherals56367 = nullptr;	// the second ESAI of a 56367, if the board has one
+
+	public:
+		Peripherals56367* getPeripherals56367() const { return m_peripherals56367; }
 	};
 
 	class Peripherals56367 final : public IPeripherals
@@ -276,6 +320,17 @@ namespace dsp56k
 		void reset() override;
 
 		Esai& getEsai() { return m_esai; }
+		EsaiPortC& getPortE() { return m_portE; }	// GPIO on the ESAI_1 pins, same layout as Port C on the ESAI
+
+		// Y I/O registers a derivative adds on top of the ones handled here. The read callback returns false
+		// for an address it does not handle, which then reads back what was last written to it
+		using IoRead = std::function<bool(TWord _addr, TWord& _value)>;
+		using IoWrite = std::function<bool(TWord _addr, TWord _value)>;
+		void setIoExtension(IoRead&& _read, IoWrite&& _write)
+		{
+			m_ioExtRead = std::move(_read);
+			m_ioExtWrite = std::move(_write);
+		}
 
 		void setSymbols(Disassembler& _disasm) const override;
 
@@ -290,5 +345,8 @@ namespace dsp56k
 	private:
 		std::array<TWord, XIO_Reserved_High_Last - XIO_Reserved_High_First + 1> m_mem;
 		Esai m_esai;
+		EsaiPortC m_portE;
+		IoRead m_ioExtRead;
+		IoWrite m_ioExtWrite;
 	};
 }

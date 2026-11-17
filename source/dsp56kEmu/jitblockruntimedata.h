@@ -70,6 +70,7 @@ namespace dsp56k
 
 		const TJitFunc& getFunc() const { return m_func; }
 
+		// while the block is generated, these are the counts of the instructions generated so far
 		TWord& getEncodedInstructionCount() { return m_encodedInstructionCount; }
 		TWord& getEncodedCycleCount() { return m_encodedCycles; }
 

@@ -145,8 +145,9 @@ namespace dsp56k
 
 		const auto dddddd = getFieldValue<Inst,Field_DDDDDD>(op);
 
-		// Reading SR materializes deferred flags. Do it before If releases the
-		// register pool, so those writes survive both the taken and untaken path.
+		// Read the operand before If(), as braIfBitTestDDDDDD does. Reading SR materialises deferred flags, and
+		// doing that inside the condition, after If() has released the register pool, made a bit test of SR
+		// straight after an ALU operation go the wrong way.
 		DspValue r(m_block);
 		decode_dddddd_read(r, dddddd);
 

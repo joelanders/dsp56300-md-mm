@@ -142,17 +142,20 @@ namespace dsp56k
 			// const auto offset = sr_val_noCache(SRB_S0) - sr_val_noCache(SRB_S1);
 			ShiftReg shift(m_block);
 			sr_getBitValue(shift, SRB_S0);
-			// Build the complete nonnegative shift before touching the operand.
-			// Shifting by 46 first loses bit 45 in scale-up mode (S0-S1=-1).
-			m_asm.add(shift.get(), shift.get(), asmjit::Imm(46 + g_aluBitOffset));
 			{
 				const RegGP s1(m_block);
 				sr_getBitValue(s1, SRB_S1);
 
 				m_asm.sub(shift.get(), s1.get());
 			}
+
+			// Add the base before shifting. S0 - S1 is -1 in Scale Up, and shifting by that on its own
+			// shifts by 63 - register shift amounts are taken modulo 64 - which left zero behind and set
+			// U regardless of the accumulator. The static mode path above folds the base in the same way.
+			m_asm.add(r64(shift.get()), r64(shift.get()), asmjit::Imm(46 + g_aluBitOffset));
+
 			const RegGP r(m_block);
-			m_asm.lsr(r, _alu, shift.get());
+			m_asm.lsr(r64(r), r64(_alu), r64(shift.get()));
 
 			shift.release();
 
@@ -258,10 +261,15 @@ namespace dsp56k
 		copyBitToCCR(_alu, 47 + g_aluBitOffset, CCRB_N);
 	}
 
-	void JitOps::ccr_n_update_raw24(const JitReg64& _alu)
+	void JitOps::ccr_n_update_by23(const JitReg64& _alu)
 	{
-		// The input is an extracted 24-bit field, not an aligned accumulator.
+		// Negative
 		// Set if the MSB of the result is set; otherwise, this bit is cleared.
+		//
+		// No g_aluBitOffset here: the only callers are ROL and ROR, and they pass the plain 24 bit
+		// A1/B1 from getALU1(), not a left-aligned accumulator. Adding the offset read bit 31 of a
+		// 24 bit value, so N came out clear on both back ends - the interpreter and the simulator
+		// set it from bit 23.
 		copyBitToCCR(_alu, 23, CCRB_N);
 	}
 
@@ -308,6 +316,43 @@ namespace dsp56k
 	{
 		ccr_update_ifNotZero(CCRB_V);
 		ccr_l_update_by_v();
+	}
+
+	void JitOps::ccr_vl_update(const JitRegGP& _zeroOrOne)
+	{
+		// V is overwritten and L is a sticky OR of it, so the same 0/1 value writes both: a BFI for V and an
+		// ORR for L. Neither touches NZCV.
+		ccr_update(_zeroOrOne, CCRB_V);
+
+		m_ccrWritten |= CCR_L;
+		ccr_clearDirty(CCR_L);
+
+		const auto sr = m_dspRegs.getSR(JitDspRegs::ReadWrite);
+		m_asm.orr(sr, sr, _zeroOrOne, asmjit::arm::lsl(CCRB_L));
+	}
+
+	void JitOps::ccr_vl_update_ifOverflow()
+	{
+		// The batch cleared V up front, so V and L only ever need setting.
+		assert(!m_ccr_update_clear && "needs a CcrBatchUpdate that clears V");
+
+		m_ccrWritten |= static_cast<CCRMask>(CCR_V | CCR_L);
+		ccr_clearDirty(static_cast<CCRMask>(CCR_V | CCR_L));
+
+		const auto sr = m_dspRegs.getSR(JitDspRegs::ReadWrite);
+		const auto overflow = m_asm.newLabel();
+		const auto done = m_asm.newLabel();
+
+		m_asm.b(asmjit::arm::CondCode::kVS, overflow);
+		m_asm.bind(done);
+
+		m_block.addColdCode([a = &m_asm, sr, overflow, done]()
+		{
+			a->bind(overflow);
+			a->orr(sr, sr, asmjit::Imm(CCR_V));
+			a->orr(sr, sr, asmjit::Imm(CCR_L));
+			a->jmp(done);
+		});
 	}
 
 	void JitOps::ccr_l_update_by_v()

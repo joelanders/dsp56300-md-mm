@@ -35,10 +35,9 @@ namespace dsp56k
 				// use dst as temp
 				replaceHigh(_dst, r64(regBase), r32(reg1));
 			}
-
-			// The partials stay marked as written: regBase is held read-only, so they are what stores the value when
-			// the block ends. Clearing them here lost a write to x0/x1 (y0/y1) followed by a read of all of x (y).
-
+			// Keep the partial registers marked as written: only they are stored back to the DSP state, the combined
+			// register is a read cache. Clearing the flags here (and storing immediately instead) loses the writes when
+			// this merge is emitted inside conditionally executed code such as IFcc and the condition is false.
 			asm_().mov(r64(_dst), r64(regBase));
 		}
 		// If the common reg is already loaded, use it
@@ -153,6 +152,31 @@ namespace dsp56k
 			m_pool.movDspReg(r64(_dst), dspReg());
 			asm_().shr(r64(_dst), asmjit::Imm(24));
 		}
+	}
+
+	// Stores the written halves for a debugger and leaves both the pool and their registers as they are: store0/store1
+	// clear the written flags and store1 destroys its source, as they run when a register is released
+	void JitRegPoolRegPair::debugStore() const
+	{
+		const auto w0 = m_pool.isWritten(m_reg0);
+		const auto w1 = m_pool.isWritten(m_reg1);
+
+		if(!w0 && !w1)
+			return;
+
+		const RegGP s(getBlock());
+		m_pool.movDspReg(r64(s), dspReg());
+
+		if(w0)
+			replaceLow(r64(s), r32(m_pool.get(m_reg0, true, false)));
+
+		if(w1)
+		{
+			const RegGP temp(getBlock());
+			replaceHigh(r64(temp), r64(s), r32(m_pool.get(m_reg1, true, false)));
+		}
+
+		m_pool.movDspReg(dspReg(), r64(s));
 	}
 
 	void JitRegPoolRegPair::store01(const JitReg32& _reg0, const JitReg32& _reg1) const

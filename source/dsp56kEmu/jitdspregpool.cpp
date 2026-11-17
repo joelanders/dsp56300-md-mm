@@ -322,19 +322,35 @@ namespace dsp56k
 		release(_reg);
 	}
 
+	// Runs inside a block, which goes on with the pool as it was: only what the block wrote so far is stored, and the
+	// halves of X and Y without store0/store1, see JitRegPoolRegPair::debugStore
 	void JitDspRegPool::debugStoreAll()
 	{
+		m_pairX.debugStore();
+		m_pairY.debugStore();
+
 		for(auto i=0; i<DspCount; ++i)
 		{
 			const auto r = static_cast<PoolReg>(i);
+
+			if(!isWritten(r) || r == DspX0 || r == DspX1 || r == DspY0 || r == DspY1)
+				continue;
 
 			JitRegGP gp;
 			SpillReg xm;
 
 			if(m_gpList.get(gp, r))
+			{
 				store(r, gp);
+			}
 			else if(m_xmList.get(xm, r))
+			{
 				store(r, xm);
+
+				// release() would remove the move that spilled the register to this XMM and store the GP there
+				// instead, and the store above would then write what the XMM held before
+				m_moveToXmmInstruction[r].reset();
+			}
 		}
 	}
 
@@ -381,9 +397,10 @@ namespace dsp56k
 		return true;
 	}
 
-	void JitDspRegPool::setIsParallelOp(const bool _isParallelOp)
+	void JitDspRegPool::setIsParallelOp(const bool _isParallelOp, const RegisterMask _moveRegs)
 	{
 		m_isParallelOp = _isParallelOp;
+		m_parallelMoveRegs = _moveRegs;
 	}
 
 	bool JitDspRegPool::move(const PoolReg _dst, const PoolReg _src)

@@ -27,3 +27,4 @@ target_sources(dsp56kAccumulatorTests PRIVATE accumulatorTests.cpp manualAccumul
 target_link_libraries(dsp56kAccumulatorTests PRIVATE dsp56kEmu)
 add_test(NAME dsp56300_accumulatorTests COMMAND dsp56kAccumulatorTests)
 set_tests_properties(dsp56300_accumulatorTests PROPERTIES LABELS "UnitTest;dsp56300" TIMEOUT 120)
+

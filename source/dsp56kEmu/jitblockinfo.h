@@ -31,7 +31,12 @@ namespace dsp56k
 			WritesSRbeforeRead	= 0x01,
 			ModeChange			= 0x02,
 			IsLoopBodyBegin		= 0x04,
-			PeripheralAccess	= 0x08,
+			IsLoopForever		= 0x08,	// the DO that opened this loop was a DO FOREVER
+			BranchAtLoopEnd		= 0x10,	// the loop's last instruction is an unconditional branch
+			WritesLA			= 0x20,	// writes LA other than through DO or ENDDO, see Jit::checkLoopEnd
+			LoopEndMoved		= 0x40,	// a DO whose loop end in the registry was moved away from its operand by an LA write
+			WritesPMemAtLoopEnd	= 0x80,	// ends a loop with an instruction that writes P memory, see Jit::updateRunFunc
+			PeripheralAccess	= 0x100,	// bounded dispatch: the block accesses a peripheral
 		};
 
 		auto hasFlag(const Flags _flag) const
@@ -52,13 +57,16 @@ namespace dsp56k
 			pc = 0;
 			memSize = 0;
 			instructionCount = 0;
-			cycleCount = 0;
 			readRegs = RegisterMask::None;
 			writtenRegs = RegisterMask::None;
 			branchTarget = g_invalidAddress;
 			branchIsConditional = false;
 			loopBegin = g_invalidAddress;
 			loopEnd = g_invalidAddress;
+
+			ccrRead = 0;
+			ccrWrite = 0;
+			ccrOverwrite = 0;
 		}
 
 		TerminationReason terminationReason = TerminationReason::None;
@@ -67,7 +75,6 @@ namespace dsp56k
 		TWord pc = 0;
 		TWord memSize = 0;
 		TWord instructionCount = 0;
-		TWord cycleCount = 0;
 		RegisterMask readRegs = RegisterMask::None;
 		RegisterMask writtenRegs = RegisterMask::None;
 		TWord branchTarget = g_invalidAddress;
