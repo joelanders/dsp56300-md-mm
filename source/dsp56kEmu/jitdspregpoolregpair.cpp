@@ -35,8 +35,9 @@ namespace dsp56k
 				// use dst as temp
 				replaceHigh(_dst, r64(regBase), r32(reg1));
 			}
-			m_pool.clearWritten(m_reg0);
-			m_pool.clearWritten(m_reg1);
+
+			// The partials stay marked as written: regBase is held read-only, so they are what stores the value when
+			// the block ends. Clearing them here lost a write to x0/x1 (y0/y1) followed by a read of all of x (y).
 
 			asm_().mov(r64(_dst), r64(regBase));
 		}
