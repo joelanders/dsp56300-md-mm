@@ -37,6 +37,7 @@ interpreterunittests.cpp interpreterunittests.h
 memory.cpp memory.h
 interrupts.h
 memorybuffer.cpp memorybuffer.h
+memorybuffertests.cpp memorybuffertests.h
 omfloader.cpp omfloader.h
 opcodes.cpp opcodes.h
 opcodeanalysis.h
