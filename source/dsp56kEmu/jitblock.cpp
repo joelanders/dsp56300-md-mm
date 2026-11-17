@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "dsp.h"
 #include "interrupts.h"
 #include "jitemitter.h"
@@ -214,6 +216,10 @@ namespace dsp56k
 				if(any(written, RegisterMask::LA | RegisterMask::LC))
 				{
 					terminationReason = JitBlockInfo::TerminationReason::WriteLoopRegs;
+					// a DO sets LA to the end it was registered with, only other writes can move a running loop
+					TWord doEnd;
+					if(!getLoopEndAddr(doEnd, instA, pc, opB))
+						_info.addFlag(JitBlockInfo::Flags::WritesLoopRegsDirectly);
 					break;
 				}
 
@@ -735,6 +741,30 @@ namespace dsp56k
 		const auto childrenEstablishPc = exitsOnlyToChildren
 			&& (!child || child->establishesPc())
 			&& (!nonBranchChild || nonBranchChild->establishesPc());
+
+		if(fastInterruptMode == JitOps::FastInterruptMode::Dynamic && info.terminationReason != JitBlockInfo::TerminationReason::PopPC && info.branchTarget == g_invalidAddress)
+		{
+			/*	Ordinary code that fell into the vector region (a plain jump into it, or an OS that
+				keeps code there) continues at the next address like anywhere else, so establish the
+				fall-through PC. Only when the DSP is not servicing a fast interrupt though: for a real
+				fast interrupt the PC is the interrupted program's, restored by DSP::execInterrupt, and
+				the block must leave it alone exactly as it always did.
+			*/
+			JitOps op(*this, _rt, fastInterruptMode);
+			const RegGP mode(*this);
+			op.getDspProcessingMode(r64(mode));
+			const SkipLabel skip(m_asm);
+			m_asm.cmp(r32(mode), asmjit::Imm(DSP::ProcessingMode::FastInterrupt));
+			m_asm.jz(skip);
+			// straight to memory, the pool must not touch the PC in a block that is usually a fast interrupt
+			m_asm.mov(r32(mode), asmjit::Imm(pcNext));
+			const auto pcPtr = m_dspRegPool.makeDspPtr(&m_dsp.regs().pc.var, sizeof(TWord));
+#ifdef HAVE_ARM64
+			m_asm.str(r32(mode), pcPtr);
+#else
+			m_asm.mov(pcPtr, r32(mode));
+#endif
+		}
 
 		const auto pcWritten = m_dspRegPool.isWritten(PoolReg::DspPC);
 

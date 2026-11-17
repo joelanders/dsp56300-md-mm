@@ -1027,9 +1027,14 @@ namespace dsp56k
 		case Movep_SXqq:
 		case Movep_SYqq:
 			{
+				// W set: the register is sent to the peripheral. W clear: the peripheral is read into the
+				// register, which the analysis used to miss - a "movep x:<<M_HRX,la" in a host command
+				// vector then never terminated its block as a loop register write.
 				const auto writePeriph = getFieldValue(_inst, Field_W, _op);
 				if (writePeriph)
 					readf(Field_dddddd);
+				else
+					writef(Field_dddddd);
 			}
 			break;
 		case Mpy_S1S2D:
@@ -1209,6 +1214,11 @@ namespace dsp56k
 		case Movem_ea:
 			{
 				const auto write = getFieldValue<Movem_ea, Field_W>(op);
+				return !write;
+			}
+		case Movem_aa:
+			{
+				const auto write = getFieldValue<Movem_aa, Field_W>(op);
 				return !write;
 			}
 		case Movep_eapp:

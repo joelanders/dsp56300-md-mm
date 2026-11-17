@@ -32,6 +32,7 @@ namespace dsp56k
 			ModeChange			= 0x02,
 			IsLoopBodyBegin		= 0x04,
 			PeripheralAccess	= 0x08,
+			WritesLoopRegsDirectly	= 0x10,	// LA/LC written by something other than a DO instruction
 		};
 
 		auto hasFlag(const Flags _flag) const
