@@ -76,6 +76,7 @@ namespace  dsp56k
 		void clr();
 		void cmp();
 		void cmpm();
+		void cmpm_accumulator();
 		void dec();
 		void div();
 
