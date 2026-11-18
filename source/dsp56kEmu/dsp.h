@@ -112,6 +112,9 @@ namespace dsp56k
 		uint64_t						m_instructions = 0;
 		uint64_t						m_maxWaitInstructions = 0;	// cooperative WAIT bound; 0 = blocking
 		uint64_t						m_cycles = 0;
+		uint64_t						m_nopLoopSkips = 0;
+		uint64_t						m_nopLoopSkippedIterations = 0;
+		uint64_t						m_runStopCycle = 0;			// stop cycle of the running execUntilCycles, 0 = not inside one
 		ProcessingMode					m_processingMode = Default;
 		TInterruptFunc					m_interruptFunc;
 
@@ -222,16 +225,21 @@ namespace dsp56k
 
 			if constexpr(g_useJIT)
 			{
+				// Code that skips whole iterations of a wait loop must not skip past the end of this run: the
+				// trampoline leaves at the first block boundary at or after the target
+				const auto previousStop = m_runStopCycle;
+				m_runStopCycle = _targetCycles;
 				while(m_cycles < _targetCycles)
 				{
 					const TWord invalidPC = m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
 					if(invalidPC == 0xffffffffu)
-						return;
+						break;
 
 					onInvalidPC(invalidPC);
 					if(invalidPC >= m_jitEntriesSize)
-						return;
+						break;
 				}
+				m_runStopCycle = previousStop;
 			}
 			else
 			{
@@ -370,6 +378,10 @@ namespace dsp56k
 
 		const uint64_t&		getInstructionCounter		() const	{ return m_instructions; }
 		const uint64_t&		getCycles					() const	{ return m_cycles; }
+		// stop cycle of the execUntilCycles that is running, 0 when the DSP runs any other way
+		uint64_t			getRunStopCycle				() const	{ return m_runStopCycle; }
+		// no interrupt is queued and no other processing mode is pending: the dispatcher only runs peripherals
+		bool				isInterruptFuncPlain		() const	{ return m_interruptFunc == m_execPeripheralsFunc; }
 
 		// Cooperative WAIT bound for a single-thread scheduler hosting multiple DSPs. When non-zero,
 		// op_Wait returns control after burning this many instructions without an interrupt, so a
@@ -513,6 +525,35 @@ namespace dsp56k
 				return _addr >= XIO_Reserved_High_First_16;
 			return _addr >= XIO_Reserved_High_First;
 		}
+
+		// see JitConfig::nopLoopSkip. Called on entry to the block of a DO loop body made of NOPs only, with what
+		// one iteration counts
+		void skipNopLoopIterations(const TWord _instructions, const TWord _cycles) noexcept
+		{
+			if(!m_runStopCycle || m_interruptFunc != m_execPeripheralsFunc)
+				return;
+			const TWord lc = reg.lc.var & 0xffffff;
+			if(lc <= 1)
+				return;
+			const auto* p = perif[0];
+			// every boundary passed lies at m_cycles + m * _cycles, m = 1..k, and must not be one at which the
+			// dispatcher acts
+			const uint64_t limitCycle = std::min(m_runStopCycle, *p->getTargetCyclePtr());
+			const uint64_t limitInstruction = p->getTargetClock();
+			if(limitCycle <= m_cycles + _cycles || limitInstruction <= m_instructions + _instructions)
+				return;
+			uint64_t k = std::min((limitCycle - 1 - m_cycles) / _cycles, (limitInstruction - 1 - m_instructions) / _instructions);
+			k = std::min<uint64_t>(k, lc - 1);
+			if(!k)
+				return;
+			reg.lc.var = lc - static_cast<TWord>(k);
+			m_instructions += k * _instructions;
+			m_cycles += k * _cycles;
+			++m_nopLoopSkips;
+			m_nopLoopSkippedIterations += k;
+		}
+		uint64_t getNopLoopSkips() const { return m_nopLoopSkips; }
+		uint64_t getNopLoopSkippedIterations() const { return m_nopLoopSkippedIterations; }
 
 		void fastForward(const TWord _instructions, const TWord _cycles)
 		{

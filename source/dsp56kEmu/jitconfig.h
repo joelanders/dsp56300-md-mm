@@ -51,6 +51,16 @@ namespace dsp56k
 		*/
 		bool doLoopExitOnPendingInterrupt = false;
 
+		/*	A DO loop whose body is nothing but NOPs changes nothing but LC and the counters. With maxDoIterations its
+			block returns to the dispatcher every so many iterations, and the dispatcher acts at such a boundary only
+			if an interrupt is queued, a peripheral is due or a bounded run (DSP::execUntilCycles) has reached its
+			stop cycle. With this, the block accounts on entry all the iterations before the first boundary at which
+			one of these could hold (DSP::skipNopLoopIterations), at most all but the last. Registers, counters and
+			the boundaries at which anything happens are the same as without it. Has no effect without
+			maxDoIterations, and only skips inside execUntilCycles.
+		*/
+		bool nopLoopSkip = false;
+
 		// needs to be true if there is code that executes code in interrupt regions as regular jumps
 		bool dynamicFastInterrupts = false;
 
