@@ -11,6 +11,14 @@
 
 namespace dsp56k
 {
+	namespace
+	{
+		void dspSkipNopLoopIterations(DSP* _dsp, const TWord _instructions, const TWord _cycles) noexcept
+		{
+			_dsp->skipNopLoopIterations(_instructions, _cycles);
+		}
+	}
+
 	JitBlock::JitBlock(JitEmitter& _a, DSP& _dsp, JitRuntimeData& _runtimeData, JitConfig&& _config)
 	: m_runtimeData(_runtimeData)
 	, m_asm(_a)
@@ -483,14 +491,44 @@ namespace dsp56k
 
 		PushAllUsed pm(*this);
 
+		getInfo(info, dsp(), _pc, m_config, _cache, _volatileP, _loopStarts, _loopEnds, &m_opCycles);
+
+		// JitConfig::nopLoopSkip: a DO loop body of NOPs only accounts the iterations that nothing can observe on entry
+		if(m_config.nopLoopSkip && m_config.maxDoIterations && !isFastInterrupt && info.memSize > 0
+			&& info.hasFlag(JitBlockInfo::Flags::IsLoopBodyBegin)
+			&& info.terminationReason == JitBlockInfo::TerminationReason::LoopEnd
+			&& !info.hasFlag(JitBlockInfo::Flags::IsLoopForever)
+			&& !info.hasFlag(JitBlockInfo::Flags::WritesPMemAtLoopEnd)
+			&& !info.hasFlag(JitBlockInfo::Flags::ModeChange)
+			&& m_opCycles.size() == info.memSize)
+		{
+			bool allNops = true;
+			TWord cycles = 0;
+			for(TWord i = 0; i < info.memSize && allNops; ++i)
+			{
+				TWord a, b;
+				m_dsp.memory().getOpcode(_pc + i, a, b);
+				allNops = a == 0;
+				cycles += m_opCycles[i];
+			}
+			if(allNops && cycles)
+			{
+				const FuncArg r0(*this, 0);
+				const FuncArg r1(*this, 1);
+				const FuncArg r2(*this, 2);
+				mem().makeDspPtr(r0);
+				m_asm.mov(r32(r1), asmjit::Imm(info.memSize));
+				m_asm.mov(r32(r2), asmjit::Imm(cycles));
+				stack().call(asmjit::func_as_ptr(&dspSkipNopLoopIterations));
+			}
+		}
+
 		auto loopBegin = m_asm.newNamedLabel("loopBegin");
 		m_asm.bind(loopBegin);
 
 		asmjit::BaseNode* cursorInsertIncreaseInstructionCount = m_asm.cursor();	// inserted later
 
 		uint32_t blockFlags = 0;
-
-		getInfo(info, dsp(), _pc, m_config, _cache, _volatileP, _loopStarts, _loopEnds, &m_opCycles);
 
 		const auto pcNext = _pc + info.memSize;
 
