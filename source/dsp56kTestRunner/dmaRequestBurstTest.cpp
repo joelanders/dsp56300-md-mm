@@ -1,7 +1,10 @@
 #include "dsp56kEmu/dsp.h"
+#include "dsp56kEmu/externalbusdevice.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -122,8 +125,9 @@ namespace
 		require(dma.previewRequests(g_channel, 4, words.data()) == 0, "a disabled channel stored a preview");
 	}
 
-	// A channel that moves a line or a block per request is not served: one call would be more than one word
-	void refused(const TWord _transferMode, const TWord _sourceMode, const TWord _destinationMode)
+	// A channel that moves a line or a block per request, or one in a reserved mode, is not served: one call would be
+	// more than one word, or the transfer is not defined
+	void refused(const TWord _transferMode, const TWord _sourceMode, const TWord _destinationMode, const bool _threeD = false)
 	{
 		Fixture f;
 		auto& rx = f.x.getEssi0();
@@ -136,7 +140,9 @@ namespace
 		dma.setDCO(g_channel, (3u << 12) | 31u);
 		dma.setDCR(g_channel, (_sourceMode << DmaChannel::Dam0) | (_destinationMode << DmaChannel::Dam3)
 			| (static_cast<TWord>(DmaChannel::RequestSource::Essi0ReceiveData) << DmaChannel::Drs0)
-			| (_transferMode << DmaChannel::Dtm0) | (1u << DmaChannel::Die) | (1u << DmaChannel::De));
+			| (_transferMode << DmaChannel::Dtm0) | (1u << DmaChannel::Die) | (1u << DmaChannel::De)
+			| (_threeD ? (1u << DmaChannel::D3d) : 0u));
+		require(!dma.servesRequests(g_channel), "a channel that moves more than a word per request, or in a reserved mode, is reported as served");
 
 		// eight words only: a line would be 32
 		const auto words = makeWords(8);
@@ -291,7 +297,11 @@ namespace
 		arm(f);
 		auto& dma = f.x.getDMA();
 		require(dma.servesRequests(channel), _name);
-		require(dma.execRequests(channel, requests + 5) == requests, _name);
+		require(dma.wordsLeftInBlock(channel) == requests, _name);
+		require(dma.execRequests(channel, 5) == 5, _name);
+		require(dma.wordsLeftInBlock(channel) == requests - 5, _name);
+		require(dma.execRequests(channel, requests) == requests - 5, _name);
+		require(dma.wordsLeftInBlock(channel) == 0, _name);
 		require(memoryDump(f) == memoryDump(reference), _name);
 		require(dma.getDSR(channel) == referenceDma.getDSR(channel) && dma.getDDR(channel) == referenceDma.getDDR(channel)
 			&& dma.getDCO(channel) == referenceDma.getDCO(channel), _name);
@@ -315,6 +325,77 @@ namespace
 		memoryBurst({(((5u << 3) | (1u << 2) | 1u) << DmaChannel::Dam0) | (1u << DmaChannel::D3d) | (1u << DmaChannel::Dtm0),
 				(1u << 12) | 15u, 0x800},
 			"a three-dimensional burst differs from the requests one by one");
+	}
+
+	// A preview in the middle of a block, across the end of a line, leaves the working counters as they were: the
+	// rest of the block is then served as without the preview
+	void partialPreview(const TWord _destinationMode, const TWord _counter, const uint32_t _count)
+	{
+		constexpr uint32_t first = 10;
+		const auto words = makeWords(_count);
+
+		Fixture reference;
+		armReceive(reference, _destinationMode, _counter, true);
+		auto& referenceDma = reference.x.getDMA();
+		require(referenceDma.wordsLeftInBlock(g_channel) == _count, "a channel just armed does not have its whole block left");
+		require(referenceDma.execRequests(g_channel, first, words.data()) == first, "the first part of a block was not served");
+		require(referenceDma.wordsLeftInBlock(g_channel) == _count - first, "the words left in the block do not count down");
+		require(referenceDma.execRequests(g_channel, _count, words.data() + first) == _count - first, "the rest of a block was not served");
+		require(referenceDma.wordsLeftInBlock(g_channel) == 0, "a channel at the end of its block has words left");
+
+		Fixture f;
+		armReceive(f, _destinationMode, _counter, true);
+		auto& dma = f.x.getDMA();
+		require(dma.execRequests(g_channel, first, words.data()) == first, "the first part of a block was not served");
+		const auto dsr = dma.getDSR(g_channel), ddr = dma.getDDR(g_channel), dco = dma.getDCO(g_channel);
+
+		// further than the end of the first line of a two-dimensional block (32 words)
+		const auto previewCount = std::min<uint32_t>(40, _count - first);
+		require(dma.previewRequests(g_channel, previewCount, words.data() + first) == previewCount, "a preview in the middle of a block stored the wrong number of words");
+		require(dma.getDSR(g_channel) == dsr && dma.getDDR(g_channel) == ddr && dma.getDCO(g_channel) == dco
+			&& dma.wordsLeftInBlock(g_channel) == _count - first, "a preview in the middle of a block changed the channel");
+		require(dma.execRequests(g_channel, _count, words.data() + first) == _count - first, "after a preview in the middle of a block the rest was served short or long");
+		require(dump(f) == dump(reference), "after a preview in the middle of a block memory differs");
+		require(dma.getDSR(g_channel) == referenceDma.getDSR(g_channel) && dma.getDDR(g_channel) == referenceDma.getDDR(g_channel)
+			&& dma.getDCO(g_channel) == referenceDma.getDCO(g_channel), "after a preview in the middle of a block the channel differs");
+	}
+
+	// A preview stops before a word for a device on the external bus, which would see it now and again when the
+	// transfer is served
+	void previewExternalBus()
+	{
+		struct Bus final : IExternalBusDevice
+		{
+			uint32_t writes = 0;
+			TWord read(TWord) override { return 0; }
+			void write(TWord, TWord) override { ++writes; }
+		};
+
+		constexpr TWord busBegin = 0x8000;
+		Fixture f;
+		Bus bus;
+		f.dsp.setExternalBusDevice(&bus);
+		auto config = f.dsp.getJit().getConfig();
+		config.externalBusBegin = busBegin;
+		config.externalBusEnd = busBegin + 0x1000;
+		f.dsp.getJit().setConfig(config);
+
+		// a post-increment destination that reaches the bus after three words
+		auto& rx = f.x.getEssi0();
+		auto& dma = f.x.getDMA();
+		rx.writeCRA(3u << Essi::CRA_WL0);
+		rx.writeCRB((1u << Essi::CRB_RE) | (1u << Essi::CRB_MOD));
+		dma.setDSR(g_channel, Essi::ESSI0_RX);
+		dma.setDDR(g_channel, busBegin - 3);
+		dma.setDCO(g_channel, 15);
+		dma.setDCR(g_channel, receiveControl(5, false));
+
+		const auto words = makeWords(16);
+		require(dma.previewRequests(g_channel, 16, words.data()) == 3, "a preview did not stop before the external bus");
+		require(bus.writes == 0, "a preview wrote to a device on the external bus");
+		for(TWord i = 0; i < 3; ++i)
+			require(f.memory.get(MemArea_X, busBegin - 3 + i) == words[i], "a preview did not store the words before the external bus");
+		require(dma.getDDR(g_channel) == busBegin - 3 && dma.wordsLeftInBlock(g_channel) == 16, "a preview that stopped at the external bus changed the channel");
 	}
 
 	// The alarm on a clock counting DSP cycles with exact deadlines, as the Machinedrum and Monomachine run it
@@ -345,23 +426,41 @@ namespace
 		f.x.exec();
 		require(fired == 1 && !clock.hasCycleAlarm(), "the alarm did not fire at its cycle");
 
-		// a disabled clock has no deadline of its own: the alarm still is one
+		// a disabled clock has no deadline of its own: the alarm still is one, also when it is further away than the
+		// last deadline of the enabled clock, and once it has fired no deadline is left
+		require(clock.getNextCycleDeadline() < 3000, "test setup: the enabled clock's last deadline is not below the alarm's");
 		clock.setEnabled(false);
-		clock.setCycleAlarm(clock.getDspInstructionCounter() + 300);
+		clock.setCycleAlarm(clock.getDspInstructionCounter() + 3000);
 		f.x.exec();
-		require(fired == 1 && clock.getNextCycleDeadline() == 300, "the alarm of a disabled clock is not a deadline");
-		f.dsp.fastForward(100, 300);
+		require(fired == 1 && clock.getNextCycleDeadline() == 3000, "the alarm of a disabled clock is not its deadline");
+		f.dsp.fastForward(1000, 2998);
+		f.x.exec();
+		require(fired == 1 && clock.getNextCycleDeadline() == 2, "the alarm of a disabled clock is not an exact deadline");
+		f.dsp.fastForward(1, 2);
 		f.x.exec();
 		require(fired == 2, "the alarm of a disabled clock did not fire at its cycle");
+		require(clock.getNextCycleDeadline() == std::numeric_limits<uint32_t>::max(), "a disabled clock kept a deadline after its alarm fired");
 		clock.setEnabled(true);
 
-		// a reset starts the counter over and clears the alarm
+		// the RESET instruction (DSP::resetSW) resets the peripherals but not the counter: the alarm stays
 		clock.setCycleAlarm(clock.getDspInstructionCounter() + 50);
+		f.dsp.resetSW();
+		require(clock.hasCycleAlarm(), "the RESET instruction cleared the alarm");
+		f.dsp.fastForward(20, 50);
+		f.x.exec();
+		require(fired == 3, "the alarm did not fire after the RESET instruction");
+
+		// a hardware reset starts the counter over and clears the alarm, also once the counter has passed the alarm's
+		// count again
+		const auto alarmCount = clock.getDspInstructionCounter() + 50;
+		clock.setCycleAlarm(alarmCount);
 		f.dsp.resetHW();
 		require(!clock.hasCycleAlarm(), "a reset did not clear the alarm");
-		f.dsp.fastForward(100, 100);
+		f.dsp.fastForward(10, 10);
 		f.x.exec();
-		require(fired == 2, "an alarm set before a reset fired after it");
+		f.dsp.fastForward(1000, static_cast<uint32_t>(alarmCount + 100));
+		f.x.exec();
+		require(fired == 3 && !clock.hasCycleAlarm(), "an alarm set before a reset fired after it");
 	}
 
 	void cycleAlarm()
@@ -421,7 +520,13 @@ int main() try
 	refused(2, 4, 2);						// a line per request
 	refused(0, 4, 2);						// the block per request
 	refused(1, 5, 5);						// word mode, but post-increment on both sides is moved as a block
+	refused(1, 6, 5);						// a reserved source address mode
+	refused(1, 1 | (1u << 2), 6, true);		// three-dimensional, the other side in a reserved address mode
+	refused(1, 3 | (1u << 2), 5, true);		// three-dimensional, the reserved counter mode
 	receiveKeepsEnabled();
+	partialPreview(2, (3u << 12) | 31u, 128);
+	partialPreview(5, 47, 48);
+	previewExternalBus();
 	memoryBursts();
 	transmit();
 	cycleAlarm();

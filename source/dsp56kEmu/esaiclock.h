@@ -103,14 +103,15 @@ namespace dsp56k
 			may set the next alarm. For an owner that carries a serial port's traffic itself and needs to act at the
 			time a transfer would have ended, without clocking the port slot by slot to get there.
 
-			The alarm is also a deadline while the clock is disabled. A reset of the peripherals (DSP::resetHW, which
-			starts the counter over) clears it. The callback runs inside exec(), which is noexcept: it must not
-			throw. The alarm is plain state: set it from the thread that runs this DSP, or while the DSP is paused.
+			The alarm is also a deadline while the clock is disabled. The counter starting over (DSP::resetHW) clears
+			it; the RESET instruction (DSP::resetSW) does not. The callback runs inside exec(), which is noexcept: it
+			must not throw. The alarm is plain state: set it from the thread that runs this DSP, or while the DSP is
+			paused.
 		*/
 		void setCycleAlarmCallback(std::function<void()> _callback) { m_cycleAlarmCallback = std::move(_callback); }
 		void setCycleAlarm(uint64_t _clock);
 		void clearCycleAlarm() { m_cycleAlarmArmed = false; }
-		bool hasCycleAlarm() const { return m_cycleAlarmArmed; }
+		bool hasCycleAlarm() const { return m_cycleAlarmArmed && !(m_dspInstructionCounter && *m_dspInstructionCounter < m_cycleAlarmLastSeen); }
 
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }
 		auto getLastClock() const { return m_lastClock; }
@@ -183,6 +184,7 @@ namespace dsp56k
 
 		bool m_cycleAlarmArmed = false;
 		uint64_t m_cycleAlarm = 0;
+		uint64_t m_cycleAlarmLastSeen = 0;		// the counter at the last pass while armed: a smaller one means it started over
 		std::function<void()> m_cycleAlarmCallback;
 	};
 

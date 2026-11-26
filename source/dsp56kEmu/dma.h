@@ -153,10 +153,17 @@ namespace dsp56k
 
 		/*	Whether execRequests and previewRequests serve the channel as it is configured, enabled or not: a word
 			transfer mode in which one request moves one word. Not a line or block mode, and not post-increment on
-			both sides outside three-dimensional mode, which execTransfer() moves as one block. Lets an owner tell
-			a refused channel from one that had nothing left to move.
+			both sides outside three-dimensional mode, which execTransfer() moves as one block. Reserved address or
+			counter modes are refused. Lets an owner tell a refused channel from one that had nothing left to move.
 		*/
 		bool servesRequests() const;
+
+		/*	The words the channel moves before the end of its current block: the whole block for a channel just
+			armed, fewer once it has moved some. 0 for a channel that is not enabled or not armed yet. In
+			three-dimensional and two-dimensional modes the progress is in the working counters, not in DCO, so
+			getDCO() alone cannot tell.
+		*/
+		uint32_t wordsLeftInBlock() const;
 
 		TransferMode getTransferMode() const;
 		TWord getPriority() const;
@@ -267,6 +274,7 @@ namespace dsp56k
 		uint32_t execRequests(const TWord _channel, const uint32_t _count, const TWord* _source = nullptr) { return m_channels[_channel].execRequests(_count, _source); }
 		uint32_t previewRequests(const TWord _channel, const uint32_t _count, const TWord* _source) { return m_channels[_channel].previewRequests(_count, _source); }
 		bool servesRequests(const TWord _channel) const { return m_channels[_channel].servesRequests(); }
+		uint32_t wordsLeftInBlock(const TWord _channel) const { return m_channels[_channel].wordsLeftInBlock(); }
 
 		uint32_t exec() noexcept;
 		void setActiveChannel(TWord _channel);

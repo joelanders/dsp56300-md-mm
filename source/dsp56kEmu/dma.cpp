@@ -361,9 +361,14 @@ namespace dsp56k
 		if(getSourceSpace() == MemArea_COUNT || getDestinationSpace() == MemArea_COUNT)
 			return false;
 
-		// three-dimensional: one word per call in a word mode, whatever DAM[5-3] says about the other side
+		// three-dimensional: one word per call in a word mode. DAM[5-3] is the address mode of the other side, where
+		// 110 and 111 are reserved (they would select an offset register that does not exist), and DAM[1-0] is the
+		// counter mode, where 11 is reserved (the counters would keep the previous configuration)
 		if(bitvalue(m_dcr, D3d))
-			return true;
+		{
+			const auto dam = getDAM();
+			return ((dam >> 3) & 7) < 6 && (dam & 3) != 3;
+		}
 
 		const auto agmS = getSourceAddressGenMode();
 		const auto agmD = getDestinationAddressGenMode();
@@ -374,6 +379,22 @@ namespace dsp56k
 		// execTransfer() has no word path for most combinations with a reserved address mode
 		const auto reserved = [](const AddressGenMode _m) { return _m == AddressGenMode::reserved110 || _m == AddressGenMode::reserved111; };
 		return !reserved(agmS) && !reserved(agmD);
+	}
+
+	uint32_t DmaChannel::wordsLeftInBlock() const
+	{
+		if(!bittest(m_dcr, De) || !m_armed)
+			return 0;
+
+		// the counters count down to the last word of the block, see execTransfer() and dualModeIncrement()
+		if(bitvalue(m_dcr, D3d))
+			return (m_dcoh * (m_dcomInit + 1) + m_dcom) * (m_dcolInit + 1) + m_dcol + 1;
+
+		if(getSourceAddressGenMode() <= AddressGenMode::DualCounterDOR3 || getDestinationAddressGenMode() <= AddressGenMode::DualCounterDOR3)
+			return m_dcoh * (m_dcolInit + 1) + m_dcol + 1;
+
+		// counter mode A counts DCO itself down
+		return m_dco + 1;
 	}
 
 	uint32_t DmaChannel::execRequests(const uint32_t _count, const TWord* _source)
