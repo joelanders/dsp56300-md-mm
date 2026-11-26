@@ -351,8 +351,24 @@ namespace dsp56k
 		finishTransfer();
 	}
 
+	bool DmaChannel::movesOneWordPerRequest() const
+	{
+		const auto tm = getTransferMode();
+		if(tm != TransferMode::WordTriggerRequest && tm != TransferMode::WordTriggerRequestClearDE)
+			return false;
+
+		// execTransfer() moves a whole block in one call when both sides post-increment, whatever the transfer mode
+		return getSourceAddressGenMode() != AddressGenMode::SingleCounterApostInc
+			|| getDestinationAddressGenMode() != AddressGenMode::SingleCounterApostInc;
+	}
+
 	uint32_t DmaChannel::execRequests(const uint32_t _count, const TWord* _source)
 	{
+		// One call of execTransfer() has to be one word: a line or a block per call would run past _count, and
+		// past the end of _source
+		if(!movesOneWordPerRequest())
+			return 0;
+
 		uint32_t moved = 0;
 
 		m_requestWords = _source;
@@ -372,7 +388,7 @@ namespace dsp56k
 
 	uint32_t DmaChannel::previewRequests(const uint32_t _count, const TWord* _source)
 	{
-		if(!_source || !bittest(m_dcr, De) || !m_dsrWritten || !m_ddrWritten)
+		if(!_source || !bittest(m_dcr, De) || !m_dsrWritten || !m_ddrWritten || !movesOneWordPerRequest())
 			return 0;
 
 		// execTransfer() only changes the addresses and the counters

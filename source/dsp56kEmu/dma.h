@@ -131,7 +131,8 @@ namespace dsp56k
 			source had raised them one after the other with nothing in between. With _source each word is taken
 			from there instead of being read from the channel's source address, for a receive channel whose words
 			did not come through the peripheral. Stops when the channel has cleared its enable bit at the end of
-			its block. Returns the number of words moved. For the word transfer modes only.
+			its block. Returns the number of words moved. Only for a channel that moves one word per request (a
+			word transfer mode, not post-increment on both sides); any other channel is left alone and 0 returned.
 
 			For an owner that carries a serial port's traffic itself (a burst handed over at one point in time
 			instead of slot by slot) and still wants the channel's addresses, counters, enable bit, interrupt and
@@ -143,7 +144,8 @@ namespace dsp56k
 			put them, and leaves the channel as it was: addresses, counters, enable bit, no interrupt. For an
 			owner that has a burst before the time its transfer ends on the wire: the data can be in place as
 			early as the first word would have arrived, while execRequests still ends the transfer at its time.
-			Stops at the end of the channel's block. Returns the number of words stored.
+			Stops at the end of the channel's block. Returns the number of words stored, 0 for a channel that
+			execRequests does not serve.
 		*/
 		uint32_t previewRequests(uint32_t _count, const TWord* _source);
 
@@ -171,6 +173,7 @@ namespace dsp56k
 
 	private:
 		void arm();
+		bool movesOneWordPerRequest() const;
 
 		void memCopy(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
 		void memFill(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;

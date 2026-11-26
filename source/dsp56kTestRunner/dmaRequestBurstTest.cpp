@@ -120,6 +120,35 @@ namespace
 		require(dma.previewRequests(g_channel, 4, words.data()) == 0, "a disabled channel stored a preview");
 	}
 
+	// A channel that moves a line or a block per request is not served: one call would be more than one word
+	void refused(const TWord _transferMode, const TWord _sourceMode, const TWord _destinationMode)
+	{
+		Fixture f;
+		auto& rx = f.x.getEssi0();
+		auto& dma = f.x.getDMA();
+		rx.writeCRA(3u << Essi::CRA_WL0);
+		rx.writeCRB((1u << Essi::CRB_RE) | (1u << Essi::CRB_MOD));
+		dma.setDOR(2, 0x21);
+		dma.setDSR(g_channel, _sourceMode == 4 ? static_cast<TWord>(Essi::ESSI0_RX) : 0x600);
+		dma.setDDR(g_channel, g_destination);
+		dma.setDCO(g_channel, (3u << 12) | 31u);
+		dma.setDCR(g_channel, (_sourceMode << DmaChannel::Dam0) | (_destinationMode << DmaChannel::Dam3)
+			| (static_cast<TWord>(DmaChannel::RequestSource::Essi0ReceiveData) << DmaChannel::Drs0)
+			| (_transferMode << DmaChannel::Dtm0) | (1u << DmaChannel::Die) | (1u << DmaChannel::De));
+
+		// eight words only: a line would be 32
+		const auto words = makeWords(8);
+		const auto before = dump(f);
+		const auto dsr = dma.getDSR(g_channel), ddr = dma.getDDR(g_channel), dco = dma.getDCO(g_channel), dcr = dma.getDCR(g_channel);
+		require(dma.previewRequests(g_channel, 8, words.data()) == 0, "a preview was stored on a channel that is not served");
+		require(dma.execRequests(g_channel, 8, words.data()) == 0, "a burst was served on a channel that moves more than a word per request");
+		require(dma.execRequests(g_channel, 8) == 0, "a burst without words was served on such a channel");
+		require(dump(f) == before, "a refused burst changed memory");
+		require(dma.getDSR(g_channel) == dsr && dma.getDDR(g_channel) == ddr && dma.getDCO(g_channel) == dco
+			&& dma.getDCR(g_channel) == dcr, "a refused burst changed the channel");
+		require(!f.dsp.hasPendingInterrupts(), "a refused burst raised an interrupt");
+	}
+
 	// a transmit channel run to its end without clocking the port: memory -> TX0
 	void transmit()
 	{
@@ -203,9 +232,12 @@ int main() try
 {
 	receive(2, (3u << 12) | 31u, 128);		// four lines of 32 words, lines 0x40 apart
 	receive(5, 47, 48);						// 48 words, one after the other
+	refused(2, 4, 2);						// a line per request
+	refused(0, 4, 2);						// the block per request
+	refused(1, 5, 5);						// word mode, but post-increment on both sides is moved as a block
 	transmit();
 	cycleAlarm();
-	std::cout << "PASS: DMA request bursts, previews and the serial clock's cycle alarm\n";
+	std::cout << "PASS: DMA request bursts, previews, refused transfer modes and the serial clock's cycle alarm\n";
 	return 0;
 }
 catch(const std::exception& e)
