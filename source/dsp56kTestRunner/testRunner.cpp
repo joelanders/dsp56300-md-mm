@@ -9,6 +9,7 @@
 #include "dsp56kEmu/jitunittests.h"
 #include "dsp56kEmu/jitoptimizertests.h"
 #include "dsp56kEmu/interpreterunittests.h"
+#include "dsp56kEmu/memorybuffertests.h"
 
 int main(int _argc, char* _argv[])
 {
@@ -22,6 +23,18 @@ int main(int _argc, char* _argv[])
 		_CrtSetReportFile(reportType, _CRTDBG_FILE_STDERR);
 	}
 #endif
+
+	std::cout << "Running Memory Buffer Tests..." << std::endl;
+	try
+	{
+		dsp56k::MemoryBufferTests memoryBufferTests;
+	}
+	catch(const std::string& _err)
+	{
+		std::cout << "Memory buffer test failed: " << _err << std::endl;
+		return -1;
+	}
+	std::cout << "Memory Buffer Tests finished." << std::endl;
 
 	std::cout << "Running Assembler Tests..." << std::endl;
 	try

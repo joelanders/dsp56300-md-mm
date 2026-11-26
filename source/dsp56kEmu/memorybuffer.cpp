@@ -212,6 +212,16 @@ namespace dsp56k
 		{
 			LOG("MMU based DSP memory setup successful");
 			m_isValid = true;
+
+			// the test words are no DSP memory contents: give the DSP zeroed memory, as the plain buffer does when the
+			// MMU setup is not available (a program reading these addresses would otherwise see values that depend on
+			// the host)
+			for(const auto a : {_externalMemAddress - 1, _externalMemAddress, _externalMemAddress + 1, _externalMemAddress + 2})
+			{
+				m_x[a] = 0;
+				m_y[a] = 0;
+				m_p[a] = 0;
+			}
 		}
 		else
 		{
