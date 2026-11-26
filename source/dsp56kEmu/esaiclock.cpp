@@ -29,13 +29,17 @@ namespace dsp56k
 
 		auto delay = execPorts();
 
-		// still armed, or armed again by the callback: the alarm is one more deadline of this clock
+		// still armed, or armed again by the callback: the alarm is one more deadline of this clock. A disabled clock
+		// returns without a deadline of its own and leaves m_nextCycleDeadline as it was
 		if(m_cycleAlarmArmed)
 		{
 			const auto now = *m_dspInstructionCounter;
 			const auto remaining = m_cycleAlarm > now ? m_cycleAlarm - now : 0;
-			if(remaining < m_nextCycleDeadline)
-				delay = std::min(delay, scheduleDelay(static_cast<uint32_t>(remaining)));
+			if(!m_enabled || remaining < m_nextCycleDeadline)
+			{
+				const auto cycles = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+				delay = std::min(delay, scheduleDelay(cycles));
+			}
 		}
 		return delay;
 	}

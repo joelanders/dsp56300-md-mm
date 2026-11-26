@@ -405,6 +405,8 @@ namespace dsp56k
 
 	void Peripherals56303::reset()
 	{
+		// DSP::resetHW starts the counter over: an alarm set before belongs to the time before the reset
+		m_essiClock.clearCycleAlarm();
 		m_essi0.reset();
 		m_essi1.reset();
 		m_hi08.reset();
@@ -770,6 +772,7 @@ namespace dsp56k
 
 	void Peripherals56362::reset()
 	{
+		m_esaiClock.clearCycleAlarm();
 		m_esai.reset();
 		m_hdi08.reset();
 		m_shi.reset();

@@ -38,15 +38,16 @@ namespace
 		return words;
 	}
 
-	// A receive channel on ESSI0: one word per request, enable cleared at the end of the block
-	TWord receiveControl(const TWord _destinationMode, const bool _interrupt)
+	// A receive channel on ESSI0: one word per request. Transfer mode 1 clears the enable bit at the end of the block,
+	// mode 5 keeps it
+	TWord receiveControl(const TWord _destinationMode, const bool _interrupt, const TWord _transferMode = 1)
 	{
 		return (4u << DmaChannel::Dam0) | (_destinationMode << DmaChannel::Dam3)
 			| (static_cast<TWord>(DmaChannel::RequestSource::Essi0ReceiveData) << DmaChannel::Drs0)
-			| (1u << DmaChannel::Dtm0) | (_interrupt ? (1u << DmaChannel::Die) : 0u) | (1u << DmaChannel::De);
+			| (_transferMode << DmaChannel::Dtm0) | (_interrupt ? (1u << DmaChannel::Die) : 0u) | (1u << DmaChannel::De);
 	}
 
-	void armReceive(Fixture& _f, const TWord _destinationMode, const TWord _counter, const bool _interrupt)
+	void armReceive(Fixture& _f, const TWord _destinationMode, const TWord _counter, const bool _interrupt, const TWord _transferMode = 1)
 	{
 		auto& rx = _f.x.getEssi0();
 		auto& dma = _f.x.getDMA();
@@ -56,7 +57,7 @@ namespace
 		dma.setDSR(g_channel, Essi::ESSI0_RX);
 		dma.setDDR(g_channel, g_destination);
 		dma.setDCO(g_channel, _counter);
-		dma.setDCR(g_channel, receiveControl(_destinationMode, _interrupt));
+		dma.setDCR(g_channel, receiveControl(_destinationMode, _interrupt, _transferMode));
 	}
 
 	std::vector<TWord> dump(const Fixture& _f)
@@ -70,7 +71,8 @@ namespace
 	// _destinationMode 2: two-dimensional with DOR2, _counter is lines-1 and words-1. 5: post-increment
 	void receive(const TWord _destinationMode, const TWord _counter, const uint32_t _count)
 	{
-		const auto words = makeWords(_count);
+		// five more than the block: the calls below that ask for more than the block read no further than this
+		const auto words = makeWords(_count + 5);
 
 		// the reference: every word arrives through the receiver and raises its own request
 		Fixture reference;
@@ -172,10 +174,194 @@ namespace
 			| (1u << DmaChannel::Dtm0) | (1u << DmaChannel::De));
 		require(dma.getDSR(1) == source, "the channel moved a word without a request");
 
+		// a preview into a peripheral register would hand it the words twice: not stored
+		require(dma.previewRequests(1, count, words.data()) == 0, "a preview was stored into a peripheral register");
+		require(tx.readTX(0) == 0x7f0000 && dma.getDSR(1) == source, "a refused preview changed the port or the channel");
+
 		require(dma.execRequests(1, count) == count, "the burst did not move every word");
 		require(dma.getDSR(1) == source + count, "source address wrong after the burst");
 		require(!(dma.getDCR(1) & (1u << DmaChannel::De)), "the burst did not clear the enable bit");
 		require(tx.readTX(0) == words.back(), "the transmit register does not hold the last word");
+	}
+
+	// Transfer mode 5 keeps the channel enabled at the end of its block. A burst still ends there, after the block's
+	// transfer done, and the next burst carries on into the next block as the requests one by one do
+	void receiveKeepsEnabled()
+	{
+		constexpr uint32_t block = 32;
+		const auto words = makeWords(2 * block + 8);
+
+		Fixture reference;
+		armReceive(reference, 5, block - 1, false, 5);
+		auto& referenceDma = reference.x.getDMA();
+		std::vector<TWord> afterFirst;
+		TWord ddrFirst = 0, dcoFirst = 0;
+		{
+			auto& rx = reference.x.getEssi0();
+			uint32_t next = 0;
+			rx.setReadRxCallback([&](uint64_t& _index, Audio::RxFrame& _frame)
+			{
+				_frame.resize(1);
+				_frame[0] = Audio::RxSlot{words[next++]};
+				++_index;
+			});
+			for(uint32_t i = 0; i < 2 * block; ++i)
+			{
+				rx.execRX();
+				if(next == block)
+				{
+					afterFirst = dump(reference);
+					ddrFirst = referenceDma.getDDR(g_channel);
+					dcoFirst = referenceDma.getDCO(g_channel);
+				}
+			}
+			require(next == 2 * block, "the reference did not take every word");
+		}
+		require(referenceDma.getDCR(g_channel) & (1u << DmaChannel::De), "the reference channel did not stay enabled");
+
+		Fixture f;
+		armReceive(f, 5, block - 1, true, 5);
+		auto& dma = f.x.getDMA();
+		require(dma.servesRequests(g_channel), "a word channel that stays enabled is not served");
+
+		require(dma.previewRequests(g_channel, block + 8, words.data()) == block, "the preview did not stop at the end of the block");
+
+		require(dma.execRequests(g_channel, block + 8, words.data()) == block, "the burst ran past the end of the block");
+		require(dump(f) == afterFirst, "the first block differs from the requests one by one");
+		require(dma.getDDR(g_channel) == ddrFirst && dma.getDCO(g_channel) == dcoFirst, "the channel differs after the first block");
+		require(dma.getDCR(g_channel) & (1u << DmaChannel::De), "the burst cleared the enable bit of a channel that stays enabled");
+		require(f.dsp.hasPendingInterrupts(), "the burst did not raise the block's interrupt");
+
+		require(dma.execRequests(g_channel, block + 8, words.data() + block) == block, "the second burst did not move the second block");
+		require(dump(f) == dump(reference), "the second block differs from the requests one by one");
+		require(dma.getDDR(g_channel) == referenceDma.getDDR(g_channel) && dma.getDCO(g_channel) == referenceDma.getDCO(g_channel),
+			"the channel differs after the second block");
+	}
+
+	// A memory to memory (or memory to port) channel against the same transfer served one request at a time through
+	// Dma::trigger
+	struct MemoryChannel
+	{
+		TWord dcr;
+		TWord dco;
+		TWord destination;
+		bool peripheralDestination = false;
+	};
+
+	void memoryBurst(const MemoryChannel& _c, const char* _name)
+	{
+		constexpr TWord channel = 2;
+		constexpr TWord source = 0x2000;
+		constexpr TWord sourceWords = 0x800;
+		constexpr auto request = DmaChannel::RequestSource::Essi1TransmitData;
+		const auto words = makeWords(sourceWords);
+
+		auto arm = [&](Fixture& _f)
+		{
+			for(TWord i = 0; i < sourceWords; ++i)
+				_f.memory.set(MemArea_X, source + i, words[i]);
+			auto& dma = _f.x.getDMA();
+			dma.setDOR(1, 0x11);		// two-dimensional: lines of 16 words 0x20 apart
+			dma.setDSR(channel, source);
+			dma.setDDR(channel, _c.destination);
+			dma.setDCO(channel, _c.dco);
+			dma.setDCR(channel, _c.dcr | (static_cast<TWord>(request) << DmaChannel::Drs0) | (1u << DmaChannel::De));
+		};
+
+		auto memoryDump = [](const Fixture& _f)
+		{
+			std::vector<TWord> result;
+			for(TWord a = 0x800; a < 0x1000; ++a)
+				result.push_back(_f.memory.get(MemArea_X, a));
+			return result;
+		};
+
+		Fixture reference;
+		arm(reference);
+		auto& referenceDma = reference.x.getDMA();
+		uint32_t requests = 0;
+		while((referenceDma.getDCR(channel) & (1u << DmaChannel::De)) && requests < 4096)
+		{
+			referenceDma.trigger(request);
+			++requests;
+		}
+		require(requests > 1 && requests < 4096, _name);
+
+		Fixture f;
+		arm(f);
+		auto& dma = f.x.getDMA();
+		require(dma.servesRequests(channel), _name);
+		require(dma.execRequests(channel, requests + 5) == requests, _name);
+		require(memoryDump(f) == memoryDump(reference), _name);
+		require(dma.getDSR(channel) == referenceDma.getDSR(channel) && dma.getDDR(channel) == referenceDma.getDDR(channel)
+			&& dma.getDCO(channel) == referenceDma.getDCO(channel), _name);
+		require(!(dma.getDCR(channel) & (1u << DmaChannel::De)), _name);
+		if(_c.peripheralDestination)
+			require(f.x.getEssi0().readTX(0) == reference.x.getEssi0().readTX(0), _name);
+	}
+
+	void memoryBursts()
+	{
+		// two-dimensional source (DOR1) into post-increment memory: 4 lines of 16 words
+		memoryBurst({(1u << DmaChannel::Dam0) | (5u << DmaChannel::Dam3) | (1u << DmaChannel::Dtm0), (3u << 12) | 15u, 0x800},
+			"a two-dimensional source burst differs from the requests one by one");
+
+		// the same source into the serial transmit register: the shape of the Monomachine's 128-word link send
+		memoryBurst({(1u << DmaChannel::Dam0) | (4u << DmaChannel::Dam3) | (1u << DmaChannel::Dtm0), (3u << 12) | 15u, Essi::ESSI0_TX0, true},
+			"a two-dimensional source burst into the transmit register differs from the requests one by one");
+
+		// three-dimensional destination (DAM[2] = 1), counter mode 01, post-increment source (DAM[5-3] = 5): one word per
+		// request, although DAM[2-0] = 5 would read as post-increment on both sides outside three-dimensional mode
+		memoryBurst({(((5u << 3) | (1u << 2) | 1u) << DmaChannel::Dam0) | (1u << DmaChannel::D3d) | (1u << DmaChannel::Dtm0),
+				(1u << 12) | 15u, 0x800},
+			"a three-dimensional burst differs from the requests one by one");
+	}
+
+	// The alarm on a clock counting DSP cycles with exact deadlines, as the Machinedrum and Monomachine run it
+	void cycleAlarmExact()
+	{
+		Fixture f;
+		auto& clock = f.x.getEssiClock();
+		clock.setClockSource(EsxiClock::ClockSource::Cycles);
+		clock.setCyclesPerSample(1152);
+		clock.setExactCycleDeadlineEnabled(true);
+		clock.setExactBaseTickDeadline(true);
+		unsigned fired = 0;
+		clock.setCycleAlarmCallback([&] { ++fired; });
+
+		f.x.exec();
+		const auto start = clock.getDspInstructionCounter();
+		require(start == f.dsp.getCycles(), "the clock does not count cycles");
+
+		clock.setCycleAlarm(start + 100);
+		f.x.exec();
+		require(fired == 0 && clock.getNextCycleDeadline() == 100, "the alarm is not the exact cycle deadline");
+
+		f.dsp.fastForward(40, 99);
+		f.x.exec();
+		require(fired == 0 && clock.getNextCycleDeadline() == 1, "the alarm fired a cycle early or its deadline is not exact");
+
+		f.dsp.fastForward(1, 1);
+		f.x.exec();
+		require(fired == 1 && !clock.hasCycleAlarm(), "the alarm did not fire at its cycle");
+
+		// a disabled clock has no deadline of its own: the alarm still is one
+		clock.setEnabled(false);
+		clock.setCycleAlarm(clock.getDspInstructionCounter() + 300);
+		f.x.exec();
+		require(fired == 1 && clock.getNextCycleDeadline() == 300, "the alarm of a disabled clock is not a deadline");
+		f.dsp.fastForward(100, 300);
+		f.x.exec();
+		require(fired == 2, "the alarm of a disabled clock did not fire at its cycle");
+		clock.setEnabled(true);
+
+		// a reset starts the counter over and clears the alarm
+		clock.setCycleAlarm(clock.getDspInstructionCounter() + 50);
+		f.dsp.resetHW();
+		require(!clock.hasCycleAlarm(), "a reset did not clear the alarm");
+		f.dsp.fastForward(100, 100);
+		f.x.exec();
+		require(fired == 2, "an alarm set before a reset fired after it");
 	}
 
 	void cycleAlarm()
@@ -235,8 +421,11 @@ int main() try
 	refused(2, 4, 2);						// a line per request
 	refused(0, 4, 2);						// the block per request
 	refused(1, 5, 5);						// word mode, but post-increment on both sides is moved as a block
+	receiveKeepsEnabled();
+	memoryBursts();
 	transmit();
 	cycleAlarm();
+	cycleAlarmExact();
 	std::cout << "PASS: DMA request bursts, previews, refused transfer modes and the serial clock's cycle alarm\n";
 	return 0;
 }
