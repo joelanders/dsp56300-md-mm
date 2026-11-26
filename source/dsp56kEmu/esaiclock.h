@@ -98,6 +98,16 @@ namespace dsp56k
 		using TickCallback = std::function<void()>;
 		void setTickCallback(TickCallback _callback) { m_tickCallback = std::move(_callback); }
 
+		/*	A one-shot alarm on the clock's own counter (cycles when the clock source is cycles). The callback runs
+			inside the peripheral pass in which the counter has reached the alarm, before the ports are served, and
+			may set the next alarm. For an owner that carries a serial port's traffic itself and needs to act at the
+			time a transfer would have ended, without clocking the port slot by slot to get there.
+		*/
+		void setCycleAlarmCallback(std::function<void()>&& _callback) { m_cycleAlarmCallback = std::move(_callback); }
+		void setCycleAlarm(uint64_t _clock);
+		void clearCycleAlarm() { m_cycleAlarmArmed = false; }
+		bool hasCycleAlarm() const { return m_cycleAlarmArmed; }
+
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }
 		auto getLastClock() const { return m_lastClock; }
 
@@ -106,6 +116,7 @@ namespace dsp56k
 		const auto& getPeripherals() const { return m_periph; }
 
 	private:
+		uint32_t execPorts() noexcept;
 		uint32_t instructionsForCycles(uint32_t _cycles) noexcept;
 		uint32_t scheduleDelay(uint32_t _cycles) noexcept;	// records the cycle deadline, returns it in instructions
 		void setClockSource(const DSP* _dsp, ClockSource _clockSource);
@@ -165,6 +176,10 @@ namespace dsp56k
 		bool m_exactBaseTickDeadline = false;
 
 		TickCallback m_tickCallback;
+
+		bool m_cycleAlarmArmed = false;
+		uint64_t m_cycleAlarm = 0;
+		std::function<void()> m_cycleAlarmCallback;
 	};
 
 	class EsaiClock : public EsxiClock

@@ -16,6 +16,11 @@ target_link_libraries(dsp56kEssiOnDemandTests PRIVATE dsp56kEmu)
 add_test(NAME dsp56300_essiOnDemandTests COMMAND dsp56kEssiOnDemandTests)
 set_tests_properties(dsp56300_essiOnDemandTests PROPERTIES LABELS "UnitTest;dsp56300")
 
+add_executable(dsp56kDmaRequestBurstTests dmaRequestBurstTest.cpp)
+target_link_libraries(dsp56kDmaRequestBurstTests PRIVATE dsp56kEmu)
+add_test(NAME dsp56300_dmaRequestBurstTests COMMAND dsp56kDmaRequestBurstTests)
+set_tests_properties(dsp56300_dmaRequestBurstTests PROPERTIES LABELS "UnitTest;dsp56300")
+
 add_executable(dsp56kJitXyPairWriteTest jitXyPairWriteTest.cpp)
 target_link_libraries(dsp56kJitXyPairWriteTest PRIVATE dsp56kEmu)
 add_test(NAME dsp56300_jitXyPairWriteTest COMMAND dsp56kJitXyPairWriteTest)

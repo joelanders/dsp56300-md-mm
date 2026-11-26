@@ -351,6 +351,58 @@ namespace dsp56k
 		finishTransfer();
 	}
 
+	uint32_t DmaChannel::execRequests(const uint32_t _count, const TWord* _source)
+	{
+		uint32_t moved = 0;
+
+		m_requestWords = _source;
+
+		while(moved < _count && bittest(m_dcr, De) && m_dsrWritten && m_ddrWritten)
+		{
+			++moved;
+
+			if(execTransfer())
+				finishTransfer();
+		}
+
+		m_requestWords = nullptr;
+
+		return moved;
+	}
+
+	uint32_t DmaChannel::previewRequests(const uint32_t _count, const TWord* _source)
+	{
+		if(!_source || !bittest(m_dcr, De) || !m_dsrWritten || !m_ddrWritten)
+			return 0;
+
+		// execTransfer() only changes the addresses and the counters
+		const auto dsr = m_dsr, ddr = m_ddr, dco = m_dco;
+		const auto dcoh = m_dcoh, dcom = m_dcom, dcol = m_dcol;
+
+		uint32_t stored = 0;
+
+		m_requestWords = _source;
+
+		while(stored < _count)
+		{
+			++stored;
+
+			if(execTransfer())
+				break;
+		}
+
+		m_requestWords = nullptr;
+
+		m_dsr = dsr;
+		m_ddr = ddr;
+		m_dco = dco;
+		m_dcoh = dcoh;
+		m_dcom = dcom;
+		m_dcol = dcol;
+
+		return stored;
+	}
+
 	DmaChannel::TransferMode DmaChannel::getTransferMode() const
 	{
 		return static_cast<TransferMode>((m_dcr >> 19) & 7);
@@ -620,6 +672,9 @@ namespace dsp56k
 
 	TWord DmaChannel::memRead(EMemArea _area, TWord _addr) const
 	{
+		if(m_requestWords)
+			return *m_requestWords++;
+
 		auto& dsp = m_peripherals.getDSP();
 		if (isPeripheralAddr(_area, _addr))
 		{

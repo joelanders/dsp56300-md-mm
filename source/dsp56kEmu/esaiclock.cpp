@@ -17,6 +17,40 @@ namespace dsp56k
 
 	uint32_t EsxiClock::exec() noexcept
 	{
+		if(!m_cycleAlarmArmed)
+			return execPorts();
+
+		if(*m_dspInstructionCounter >= m_cycleAlarm)
+		{
+			m_cycleAlarmArmed = false;
+			if(m_cycleAlarmCallback)
+				m_cycleAlarmCallback();
+		}
+
+		auto delay = execPorts();
+
+		// still armed, or armed again by the callback: the alarm is one more deadline of this clock
+		if(m_cycleAlarmArmed)
+		{
+			const auto now = *m_dspInstructionCounter;
+			const auto remaining = m_cycleAlarm > now ? m_cycleAlarm - now : 0;
+			if(remaining < m_nextCycleDeadline)
+				delay = std::min(delay, scheduleDelay(static_cast<uint32_t>(remaining)));
+		}
+		return delay;
+	}
+
+	void EsxiClock::setCycleAlarm(const uint64_t _clock)
+	{
+		m_cycleAlarm = _clock;
+		m_cycleAlarmArmed = true;
+		// the pass that is scheduled now does not know about the alarm
+		if(m_periph.hasDSP())
+			m_periph.setDelayCycles(0);
+	}
+
+	uint32_t EsxiClock::execPorts() noexcept
+	{
 		if(!m_enabled)
 			return std::numeric_limits<uint32_t>::max();
 
