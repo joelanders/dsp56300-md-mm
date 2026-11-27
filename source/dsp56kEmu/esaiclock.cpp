@@ -17,8 +17,62 @@ namespace dsp56k
 
 	uint32_t EsxiClock::exec() noexcept
 	{
+		if(!m_cycleAlarmArmed)
+			return execPorts();
+
+		// DSP::resetHW starts the counter over: an alarm set against the count before belongs to the time before the
+		// reset. The RESET instruction (DSP::resetSW) resets the peripherals but not the counter and keeps the alarm
+		const auto counter = *m_dspInstructionCounter;
+		if(counter < m_cycleAlarmLastSeen)
+		{
+			m_cycleAlarmArmed = false;
+			return execPorts();
+		}
+		m_cycleAlarmLastSeen = counter;
+
+		if(counter >= m_cycleAlarm)
+		{
+			m_cycleAlarmArmed = false;
+			if(m_cycleAlarmCallback)
+				m_cycleAlarmCallback();
+		}
+
+		auto delay = execPorts();
+
+		// still armed, or armed again by the callback: the alarm is one more deadline of this clock (a disabled clock
+		// has none of its own, execPorts() leaves the deadline at its maximum then)
+		if(m_cycleAlarmArmed)
+		{
+			const auto now = *m_dspInstructionCounter;
+			const auto remaining = m_cycleAlarm > now ? m_cycleAlarm - now : 0;
+			if(remaining < m_nextCycleDeadline)
+			{
+				const auto cycles = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+				delay = std::min(delay, scheduleDelay(cycles));
+			}
+		}
+		return delay;
+	}
+
+	void EsxiClock::setCycleAlarm(const uint64_t _clock)
+	{
+		m_cycleAlarm = _clock;
+		m_cycleAlarmArmed = true;
+		m_cycleAlarmLastSeen = m_dspInstructionCounter ? *m_dspInstructionCounter : 0;
+		// the pass that is scheduled now does not know about the alarm
+		if(m_periph.hasDSP())
+			m_periph.setDelayCycles(0);
+	}
+
+	uint32_t EsxiClock::execPorts() noexcept
+	{
 		if(!m_enabled)
+		{
+			// no deadline: the last one of the enabled clock would otherwise stay and bring the peripherals back
+			// that often for as long as the clock is disabled
+			m_nextCycleDeadline = std::numeric_limits<uint32_t>::max();
 			return std::numeric_limits<uint32_t>::max();
+		}
 
 		// DSP::resetHW starts the counter over. The time since the last slot would come out negative, a huge unsigned
 		// number, and serving every slot that is "due" by then would never end. The clock starts over with the counter

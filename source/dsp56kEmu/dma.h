@@ -127,6 +127,44 @@ namespace dsp56k
 
 		void triggerByRequest();
 
+		/*	Serves up to _count requests of the channel's request source back to back, one word each, as if the
+			source had raised them one after the other with nothing in between. With _source each word is taken
+			from there instead of being read from the channel's source address, for a receive channel whose words
+			did not come through the peripheral. Stops at the end of the channel's block, after its transfer done
+			(interrupt, enable bit, transfer-done request of other channels), also in the mode that keeps the channel
+			enabled for the next block, and stops when the channel is not enabled. Returns the number of words moved.
+			Only for a channel that servesRequests(); any other channel is left alone and 0 returned.
+
+			For an owner that carries a serial port's traffic itself (a burst handed over at one point in time
+			instead of slot by slot) and still wants the channel's addresses, counters, enable bit, interrupt and
+			transfer-done request to end up exactly as the DMA code leaves them.
+		*/
+		uint32_t execRequests(uint32_t _count, const TWord* _source = nullptr);
+
+		/*	Stores the words that the next _count requests are going to move, at the addresses the channel will
+			put them, and leaves the channel as it was: addresses, counters, enable bit, no interrupt. For an
+			owner that has a burst before the time its transfer ends on the wire: the data can be in place as
+			early as the first word would have arrived, while execRequests still ends the transfer at its time.
+			Stops at the end of the channel's block. Memory destinations only: stops before a word that would go to
+			a peripheral register or a device on the external bus, which would otherwise see it twice. Returns the
+			number of words stored, 0 for a channel that is not enabled or not servesRequests().
+		*/
+		uint32_t previewRequests(uint32_t _count, const TWord* _source);
+
+		/*	Whether execRequests and previewRequests serve the channel as it is configured, enabled or not: a word
+			transfer mode in which one request moves one word. Not a line or block mode, and not post-increment on
+			both sides outside three-dimensional mode, which execTransfer() moves as one block. Reserved address or
+			counter modes are refused. Lets an owner tell a refused channel from one that had nothing left to move.
+		*/
+		bool servesRequests() const;
+
+		/*	The words the channel moves before the end of its current block: the whole block for a channel just
+			armed, fewer once it has moved some. 0 for a channel that is not enabled or not armed yet. In
+			three-dimensional and two-dimensional modes the progress is in the working counters, not in DCO, so
+			getDCO() alone cannot tell.
+		*/
+		uint32_t wordsLeftInBlock() const;
+
 		TransferMode getTransferMode() const;
 		TWord getPriority() const;
 		RequestSource getRequestSource() const;
@@ -151,6 +189,11 @@ namespace dsp56k
 
 	private:
 		void arm();
+		// execTransfer() moves a whole block in one call when both sides post-increment (outside three-dimensional mode)
+		static bool movesBlockPerCall(const AddressGenMode _source, const AddressGenMode _destination)
+		{
+			return _source == AddressGenMode::SingleCounterApostInc && _destination == AddressGenMode::SingleCounterApostInc;
+		}
 
 		void memCopy(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
 		void memFill(EMemArea _dstArea, TWord _dstAddr, EMemArea _srcArea, TWord _srcAddr, TWord _count) const;
@@ -191,6 +234,8 @@ namespace dsp56k
 		int32_t m_pendingTransfer = 0;
 		bool m_dataTransferred = false;
 		uint64_t m_lastClock = 0;
+
+		mutable const TWord* m_requestWords = nullptr;	// execRequests/previewRequests: where the next word comes from, set only while execTransfer() runs
 	};
 
 	class Dma
@@ -225,6 +270,11 @@ namespace dsp56k
 		const TWord& getDDR(const TWord _channel) const { return m_channels[_channel].getDDR(); }
 		const TWord& getDCO(const TWord _channel) const { return m_channels[_channel].getDCO(); }
 		const TWord& getDCR(const TWord _channel) const { return m_channels[_channel].getDCR(); }
+
+		uint32_t execRequests(const TWord _channel, const uint32_t _count, const TWord* _source = nullptr) { return m_channels[_channel].execRequests(_count, _source); }
+		uint32_t previewRequests(const TWord _channel, const uint32_t _count, const TWord* _source) { return m_channels[_channel].previewRequests(_count, _source); }
+		bool servesRequests(const TWord _channel) const { return m_channels[_channel].servesRequests(); }
+		uint32_t wordsLeftInBlock(const TWord _channel) const { return m_channels[_channel].wordsLeftInBlock(); }
 
 		uint32_t exec() noexcept;
 		void setActiveChannel(TWord _channel);

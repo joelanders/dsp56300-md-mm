@@ -351,6 +351,127 @@ namespace dsp56k
 		finishTransfer();
 	}
 
+	bool DmaChannel::servesRequests() const
+	{
+		const auto tm = getTransferMode();
+		if(tm != TransferMode::WordTriggerRequest && tm != TransferMode::WordTriggerRequestClearDE)
+			return false;
+
+		// a reserved memory space: execTransfer() ends the block without moving anything
+		if(getSourceSpace() == MemArea_COUNT || getDestinationSpace() == MemArea_COUNT)
+			return false;
+
+		// three-dimensional: one word per call in a word mode. DAM[5-3] is the address mode of the other side, where
+		// 110 and 111 are reserved (they would select an offset register that does not exist), and DAM[1-0] is the
+		// counter mode, where 11 is reserved (the counters would keep the previous configuration)
+		if(bitvalue(m_dcr, D3d))
+		{
+			const auto dam = getDAM();
+			return ((dam >> 3) & 7) < 6 && (dam & 3) != 3;
+		}
+
+		const auto agmS = getSourceAddressGenMode();
+		const auto agmD = getDestinationAddressGenMode();
+
+		if(movesBlockPerCall(agmS, agmD))
+			return false;
+
+		// execTransfer() has no word path for most combinations with a reserved address mode
+		const auto reserved = [](const AddressGenMode _m) { return _m == AddressGenMode::reserved110 || _m == AddressGenMode::reserved111; };
+		return !reserved(agmS) && !reserved(agmD);
+	}
+
+	uint32_t DmaChannel::wordsLeftInBlock() const
+	{
+		if(!bittest(m_dcr, De) || !m_armed)
+			return 0;
+
+		// the counters count down to the last word of the block, see execTransfer() and dualModeIncrement()
+		if(bitvalue(m_dcr, D3d))
+			return (m_dcoh * (m_dcomInit + 1) + m_dcom) * (m_dcolInit + 1) + m_dcol + 1;
+
+		if(getSourceAddressGenMode() <= AddressGenMode::DualCounterDOR3 || getDestinationAddressGenMode() <= AddressGenMode::DualCounterDOR3)
+			return m_dcoh * (m_dcolInit + 1) + m_dcol + 1;
+
+		// counter mode A counts DCO itself down
+		return m_dco + 1;
+	}
+
+	uint32_t DmaChannel::execRequests(const uint32_t _count, const TWord* _source)
+	{
+		// One call of execTransfer() has to be one word: a line or a block per call would run past _count, and
+		// past the end of _source
+		if(!servesRequests())
+			return 0;
+
+		uint32_t moved = 0;
+		const TWord* next = _source;
+
+		while(moved < _count && bittest(m_dcr, De) && m_dsrWritten && m_ddrWritten)
+		{
+			++moved;
+
+			// The supplied words are in use only while this channel moves its word. finishTransfer() is the request of
+			// every channel that waits for this one's transfer done, and a channel started from there reads its own source
+			m_requestWords = next;
+			const auto blockDone = execTransfer();
+			next = m_requestWords;
+			m_requestWords = nullptr;
+
+			if(blockDone)
+			{
+				// The end of the block ends the burst, also in the mode that keeps the channel enabled: the owner sees the
+				// channel as the transfer done of this block leaves it, and one burst raises one interrupt
+				finishTransfer();
+				break;
+			}
+		}
+
+		return moved;
+	}
+
+	uint32_t DmaChannel::previewRequests(const uint32_t _count, const TWord* _source)
+	{
+		if(!_source || !bittest(m_dcr, De) || !m_dsrWritten || !m_ddrWritten || !servesRequests())
+			return 0;
+
+		const auto areaD = getDestinationSpace();
+
+		// execTransfer() only changes the addresses and the counters
+		const auto dsr = m_dsr, ddr = m_ddr, dco = m_dco;
+		const auto dcoh = m_dcoh, dcom = m_dcom, dcol = m_dcol;
+
+		uint32_t stored = 0;
+		const TWord* next = _source;
+
+		while(stored < _count)
+		{
+			// Memory only. Every transfer path writes its next word to DDR: a peripheral register or a device on the external
+			// bus there would take the word now and again when the transfer is served (the same tests as memWrite)
+			if(isPeripheralAddr(areaD, m_ddr) || (areaD != MemArea_P && externalBusOverlap(areaD, m_ddr, 1)))
+				break;
+
+			++stored;
+
+			m_requestWords = next;
+			const auto blockDone = execTransfer();
+			next = m_requestWords;
+			m_requestWords = nullptr;
+
+			if(blockDone)
+				break;
+		}
+
+		m_dsr = dsr;
+		m_ddr = ddr;
+		m_dco = dco;
+		m_dcoh = dcoh;
+		m_dcom = dcom;
+		m_dcol = dcol;
+
+		return stored;
+	}
+
 	DmaChannel::TransferMode DmaChannel::getTransferMode() const
 	{
 		return static_cast<TransferMode>((m_dcr >> 19) & 7);
@@ -620,6 +741,9 @@ namespace dsp56k
 
 	TWord DmaChannel::memRead(EMemArea _area, TWord _addr) const
 	{
+		if(m_requestWords)
+			return *m_requestWords++;
+
 		auto& dsp = m_peripherals.getDSP();
 		if (isPeripheralAddr(_area, _addr))
 		{
@@ -764,7 +888,7 @@ namespace dsp56k
 		const auto agmS = getSourceAddressGenMode();
 		const auto agmD = getDestinationAddressGenMode();
 
-		if (agmS == AddressGenMode::SingleCounterApostInc && agmD == AddressGenMode::SingleCounterApostInc)
+		if (movesBlockPerCall(agmS, agmD))
 		{
 			assert((!isRequestTrigger() || getTransferMode() == TransferMode::BlockTriggerRequestClearDE) && "not supported yet, needs to be transfer one word at a time");
 			memCopy(areaD, m_ddr, areaS, m_dsr, m_dco + 1);
